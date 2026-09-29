@@ -77,8 +77,8 @@ python -m app.server
 #      ★ 页首会显示当前版本，例如「T18 · v0.16.0」—— 用来确认你跑的是哪一版
 
 # 3) 自检（离线层不连目标机；完整层会在目标机上真跑若干只读动作）
-python tools\selftest.py --offline     # 596 项
-python tools\selftest.py               # 672 项（约 2~3 分钟）
+python tools\selftest.py --offline     # 752 项
+python tools\selftest.py               # 834 项（约 3 分钟；需要 4 台在册机可达）
 ```
 
 **依赖**：Python ≥ 3.11 + 项目内嵌 PyYAML（`vendor\`）+ 系统 `ssh` 客户端（`ssh` / `scp`）。
