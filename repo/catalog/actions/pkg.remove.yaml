@@ -1,0 +1,97 @@
+id: pkg.remove
+title: 卸载软件包
+summary: 卸载指定包（🔴 先列出依赖它的包再动手），完成后自证包确实没了
+domain: H
+risk: red
+priority: P1
+tags: [变更, 包管理, 破坏性]
+
+note: |
+  ★ 卸载是红线级，理由不是"命令危险"，而是**影响面看不见**：
+  一个看起来无关的包，可能是别的服务的依赖。所以本动作的第一步就是
+  `rpm -q --whatrequires <包>` —— **先把"谁需要它"摆在你面前**。
+  （探针实测：无依赖者时该命令返回 **1** 且 stdout 为空；有依赖者时列出包名。）
+
+confirm:
+  title: 确认卸载软件包
+  body: |
+    即将在「{host.name}」（{host.address}）上**卸载**包「{package}」。
+
+    会发生什么：
+      · 该包及其不再被需要的依赖可能被一并移除
+      · 如果别的服务依赖它，那个服务会**立刻坏掉**（第一步会列出可能的依赖者）
+
+    能不能撤回：`dnf history undo <事务号>` 通常能装回来，
+      但**服务在卸载期间的故障时间恢复不了**。
+
+    提示：如果你只是想换版本，用「更新指定软件包」而不是卸载重装。
+  confirm_text: 我已确认要卸载
+
+params:
+  - name: package
+    label: 包名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9._+-]+$'
+    default: bc
+    placeholder: bc
+    help: '只填包名；不接受通配符（一次只处理一个包）'
+
+precheck:
+  - name: must_installed
+    title: 确认该包当前已安装（避免"卸载一个本来就没有的东西"）
+    run: [rpm, -q, "{{ package }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    note: 探针实测 rpm -q 未安装返回 1；这里只接受 0，于是"包不存在"会在预检就被拦下
+
+steps:
+  - name: dependents
+    title: 列出依赖它的包（★ 影响面：先看谁需要它）
+    run: [rpm, -q, --whatrequires, "{{ package }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1]
+    note: |
+      无依赖者时返回 1 且**输出为空** —— 这是正常结论（"没有任何包依赖它"），
+      所以这一步标 optional 且接受 0/1；结论里会把输出（可能是空）如实摆出来。
+
+  - name: remove
+    title: 卸载（可能较慢）
+    run: [dnf, remove, -y, "{{ package }}"]
+    parser: lines
+    timeout: 300
+
+  - name: isgone
+    title: 自证：包已不存在（★ 只接受 rpm -q 返回 1）
+    run: [rpm, -q, "{{ package }}"]
+    parser: raw
+    ok_exit_codes: [1]
+    note: |
+      探针实测：未安装 → 1。把 1 声明为"正常报告"，于是"包还在（返回 0）"就变成失败。
+      **"某物不存在"必须由退出码承担**，不能写成 verify 的非空断言（规范 §9.6）。
+
+  - name: history
+    title: 取最近的事务记录（回退依据）
+    run: [dnf, history]
+    parser: head_lines
+    optional: true
+
+verify:
+  - name: 卸载步骤有输出（否则无法判断 dnf 做了什么）
+    from: remove
+    on_missing: dnf 没有任何输出，卸载过程不可信
+  - name: 事务记录可读（回退依据不能丢）
+    from: history
+    on_missing: 读不到 dnf 事务记录 —— 回退将失去依据
+
+conclusion: |
+  「{package}」卸载结果（{host.name}）
+  · 依赖它的包（可能为空=没有依赖者）：{dependents}
+  · 当前查询：{isgone}（应为"package … is not installed"）
+  · 最近事务（回退依据）：
+  {history}
+
+  判读：
+    · 回退：`dnf history undo <ID>`（能把包装回来，但服务故障时间回不来）；
+    · 若上面列出的依赖者里有在用的服务，请立刻检查它是否已经受影响。

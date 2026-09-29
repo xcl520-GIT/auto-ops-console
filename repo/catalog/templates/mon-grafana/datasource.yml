@@ -1,0 +1,18 @@
+# ============================================================
+# managed by auto-ops-console (T10) —— 请勿手工编辑
+# 落点：/opt/aoc-monitoring/etc/grafana-provisioning/datasources/prometheus.yml
+# 作用：把 Prometheus 数据源**声明式**装进 Grafana（不靠人在界面里点）
+# ★ 数据源指向 127.0.0.1:9090 —— Prometheus 只绑本机，Grafana 与它同机。
+# ============================================================
+apiVersion: 1
+
+datasources:
+  - name: AOC-Prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST

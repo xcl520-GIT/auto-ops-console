@@ -1,0 +1,174 @@
+# ============================================================
+# 动作：监控栈总览（T10）
+# 来源：开题单 §6（只读动作「一次给全结论」）＋ §7 验收 #1 / #11
+# 形态：版本 + 单元 + **监听面审计** + 存储占用 + 保留期 —— 一屏看完
+# 风险：green
+# ============================================================
+
+id: mon.overview
+title: 监控栈总览（版本 / 单元 / 监听面 / 存储）
+summary: 一次给全：四个组件的版本号、systemd 单元状态、有没有哪一处监听了 0.0.0.0、时序数据占多大
+domain: J
+risk: green
+priority: P0
+tags: [只读, 监控, 一屏结论, 判据, T10]
+
+note: |
+  ★★ 验收 #1 要求"装机结论里必须有**版本号**"—— 本动作念的是各组件 `--version` 的**真输出**，不是抄的。
+  ★★ 验收 #11 要求"三件套**没有一处**监听 0.0.0.0"。判据不是"看配置文件"，
+    而是**读内核自己的套接字表** `/proc/net/tcp`：
+      · 通配绑定在它里面长这样 —— `00000000:<端口hex>`
+      · 本机回环绑定长这样 —— `0100007F:<端口hex>`
+      · 内网地址绑定长这样 —— 小端序的 `<IP>`
+    ⇒ `assert_no_wildcard` 那一步**只要在 `/proc/net/tcp` 里命中 `00000000` + 我们的四个端口之一，就判红**。
+    ★ 这条判据**读的是内核**，不是我们的配置 —— 配置抄错了、组件自己改了默认，它一样抓得到。
+  ★ 端口十六进制：9090=2382 ｜ 9093=2385 ｜ 3000=0BB8 ｜ 9100=238C。
+
+params:
+  - name: root
+    label: 监控栈根目录
+    type: str
+    required: true
+    default: /opt/aoc-monitoring
+    pattern: '^/opt/aoc-monitoring$'
+
+steps:
+  - name: stack_guard
+    title: ★★ 判据：这台机器上到底有没有监控栈
+    run: [ls, -d, /opt/aoc-monitoring]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: >
+      ★★★ 这一步是 **T10·S8 界面真走当场抓到的真缺陷 ⑧** 的修补。
+      现场：在「监控告警」页签上点「一键取结论」，而**顶栏的目标机是 `node-01`**
+      （它不是显式选错的 —— 那是下拉框的默认项）⇒ 11 步里 6 步失败（版本 ×4 + 落盘），
+      ★★ **任务却报「成功」**，结论里全是「（无）」。
+      ⇒ 那份报告读起来像「**监控装了但没起来**」，而真相是「**这台机器上压根没有监控栈**」。
+      **这是本话题最不能容忍的一类假话。**
+      ★ 修法两条一起（缺一不可）：
+        ① **这条判据步**（`ls -d /opt/aoc-monitoring`，只接受 rc=0）——
+           不在 ⇒ 整条动作 `failed`，而**结论照样会渲染出来**（引擎在步骤失败后仍会生成结论）
+           ⇒ 读者拿到的是"没有监控栈"，不是"（无）"；
+        ② 界面侧：页首的「目标机」**不再写死**，并且当前不是 `node-03` 时**当面提醒**。
+      ★ 与 §12.45.3「『没有』与『没取到』必须分得开」同族：
+        **「这台机器没装」必须能被表达出来**，不能混进一堆「（无）」里。
+
+  - name: v_prometheus
+    title: Prometheus 版本
+    run: [/opt/aoc-monitoring/prometheus/prometheus, --version]
+    parser: lines
+    optional: true
+    timeout: 30
+  - name: v_alertmanager
+    title: Alertmanager 版本
+    run: [/opt/aoc-monitoring/alertmanager/alertmanager, --version]
+    parser: lines
+    optional: true
+    timeout: 30
+  - name: v_node_exporter
+    title: node_exporter 版本
+    run: [/opt/aoc-monitoring/node_exporter/node_exporter, --version]
+    parser: lines
+    optional: true
+    timeout: 30
+  - name: v_grafana
+    title: Grafana 版本
+    run: [/opt/aoc-monitoring/grafana/bin/grafana, --version]
+    parser: lines
+    optional: true
+    timeout: 30
+
+  - name: units
+    title: 四个单元的活性
+    run: [systemctl, is-active, aoc-prometheus.service, aoc-alertmanager.service, aoc-mon-webhook.service, aoc-grafana.service, aoc-node-exporter.service]
+    parser: lines
+    ok_exit_codes: [0, 1, 2, 3, 4, 5]
+    timeout: 30
+    note: ★ `is-active` 多单元时**逐行给状态**，退出码非 0 是常态（有 inactive 的）—— 所以 0~5 都接受，状态由输出行自己说。
+
+  - name: listen_detail
+    title: 我们四个端口的监听原件（内核视图）
+    run: [grep, -e, ":2382 ", -e, ":2385 ", -e, ":0BB8 ", -e, ":238C ", /proc/net/tcp]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    timeout: 20
+    note: ★ 这里只**陈列**；判据在下一步。★ 用多个 `-e` 而不是 `-E 'a|b'` —— 平台禁止 argv 里出现 `|`（规范 §4）。
+
+  - name: assert_no_wildcard
+    title: ★★ 判据：四个端口一处都不许通配绑定
+    run: [grep, -q, -e, "00000000:2382", -e, "00000000:2385", -e, "00000000:0BB8", -e, "00000000:238C", /proc/net/tcp]
+    parser: raw
+    ok_exit_codes: [1]
+    timeout: 20
+    note: >
+      ★ 只接受 rc=1（一条都没命中）。命中 ⇒ 有组件绑了 `0.0.0.0` ⇒ 判红（验收 #11）。
+      ★ 它成功时没有输出，所以**不进 verify**（规范 §12.49：假红的来源）。
+      ★ 覆盖范围：`/proc/net/tcp` 是 **IPv4** 那张表；IPv6 是 `/proc/net/tcp6`。
+        本栈四件套都按 IPv4 地址显式绑定，所以 IPv4 表就是判据的家（IPv6 表另见结论里的说明）。
+
+  - name: storage
+    title: 时序数据与落盘占用
+    run: [du, -sh, /opt/aoc-monitoring/data/prometheus]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    optional: true
+    timeout: 120
+    note: ★★ rc=1 = 那个目录还不存在（Prometheus 还没落过盘）—— **是结论，不是出错**（规范 §12.64 ⑥）。
+  - name: storage_am
+    title: Alertmanager 落盘
+    run: [du, -sh, /opt/aoc-monitoring/data/alertmanager]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    optional: true
+    timeout: 60
+  - name: storage_sink
+    title: 收端落盘
+    run: [du, -sh, /opt/aoc-monitoring/data/webhook]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    optional: true
+    timeout: 60
+
+  - name: unit_files
+    title: 四个 unit 文件里的关键行（保留期与监听地址的真出处）
+    run: [grep, -e, "retention", -e, "listen-address", -e, "ExecStart", /etc/systemd/system/aoc-prometheus.service, /etc/systemd/system/aoc-alertmanager.service, /etc/systemd/system/aoc-mon-webhook.service, /etc/systemd/system/aoc-grafana.service, /etc/systemd/system/aoc-node-exporter.service]
+    parser: lines
+    ok_exit_codes: [0, 1, 2]
+    timeout: 20
+
+verify:
+  - name: 必须读到单元状态
+    from: units
+    on_missing: systemctl 一个状态都没给出 —— systemd 异常？
+
+conclusion: |
+  【{host.name}】监控栈总览
+  ★★ 监控栈根目录：{stack_guard}
+     （这一行**不是摆设**：它不是 `/opt/aoc-monitoring` 就说明**这台机器上没装监控栈** ——
+      那时下面每一条「（无）」的含义都是「**这台机器上没有**」，不是「装了但没起来」。
+      ★ 本环境的监控栈装在 **node-03** 上：请把顶栏的「目标机」切过去再看。）
+  ── 版本（★ 真跑 `--version` 的输出）──
+    Prometheus   ：{v_prometheus}
+    Alertmanager ：{v_alertmanager}
+    node_exporter：{v_node_exporter}
+    Grafana      ：{v_grafana}
+  ── 单元 ──
+  {units}
+  ── 监听面（内核 /proc/net/tcp，端口 9090/9093/3000/9100）──
+  {listen_detail}
+  ★ 判据：**四处都不许出现 `00000000`（通配 0.0.0.0）** —— 命中即判红（验收 #11）。
+  ── 落盘 ──
+    时序数据 {storage} ｜ Alertmanager {storage_am} ｜ 收端 {storage_sink}
+  ── unit 文件里的关键行（保留期与监听地址的真出处）──
+  {unit_files}
+
+  判读：
+  · ★★ **先看第一行**：`{stack_guard}` 不是 `/opt/aoc-monitoring` ⇒ **这台机器上就没有监控栈**，
+    下面所有「（无）」的意思都是「**没有**」，不是「装了但没起来」（§12.45.3）；
+  · 版本行是**结论的一部分**：装机报告里没有版本号 ⇒ 验收 #1 不合格；
+  · 监听面：`0100007F` = 127.0.0.1（只本机）｜ 内网地址 = 小端序（如 `0D10A8C0` = 192.0.2.13）；
+    **`00000000` = 通配** —— 那是我们**绝不允许**的形态；
+  · 保留期以 **unit 文件**为准（`retention.time` 与 `retention.size` **两个都要有**）；
+    进程命令行那条只作旁证；
+  · 本动作只读：不启停、不改配置、不清数据。

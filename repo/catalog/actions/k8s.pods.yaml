@@ -1,0 +1,148 @@
+# ============================================================
+# 动作：Pod 总览
+# 来源：T9·S2 —— 规范 §12.37.1 ②（**不许枚举"坏状态"**）、§12.37.2
+# 形态：**只读**（green）
+# ============================================================
+
+id: k8s.pods
+title: Pod 总览
+summary: 全部 Pod 一屏取全 ＋ ★ 重启次数排行 ＋ 非 Running 的单独一段；判读用"状态白名单"而不是"坏状态黑名单"
+domain: J
+risk: green
+priority: P0
+tags: [只读, K8s, Pod, 排障]
+
+note: |
+  ★★ **本动作的判读口径是本话题的一条宪法**（规范 §12.37.1 ②）：
+  判"这个 Pod 好不好"**不许**枚举坏状态（`CrashLoopBackOff` / `ImagePullBackOff` / `Pending` / …），
+  因为**那个清单永远列不全**（kubectl 每加一个状态就漏一个），而漏判的后果是
+  **"坏的被当成好的"**（假绿）。⇒ 本动作的判读写成**正向白名单**：
+  **`STATUS` 不在 {`Running`, `Completed`} 里就值得看一眼**；过渡态（`ContainerCreating` / `Init:x/y`）
+  单独念出来，说明"还在起"。
+
+  ★★ **一条必须写出来的反常识**：**`CrashLoopBackOff` 的 Pod，`phase` 仍然是 `Running`** ——
+  所以 `--field-selector=status.phase!=Running` **抓不到它**。本动作因此两段都要：
+  ① 表格（人看 `STATUS` 列）② `-o json` 的 `containerStatuses`（机器判 `lastState` / `restartCount`）——
+  ★ 后者正是 `k8s.diagnose` 的输入（规范 §12.37.1 ③：`OOMKilled` **压根不在那一列**）。
+
+  ★ 判据挂 `api_alive`（§12.37.2）：其余各段为空都是**正常现状**。
+
+params:
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+
+steps:
+  - name: api_alive
+    title: ★★ 中枢判据：集群 API 在应答（**这一步必然有输出**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: pods
+    title: 全部 Pod（`-o wide`：含所在节点与 Pod IP）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - "-o"
+      - wide
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: restarts
+    title: ★ 重启次数与最近一次终止原因（**`OOMKilled` 只在这里看得见**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - --no-headers
+      - "-o"
+      - "custom-columns=NS:.metadata.namespace,POD:.metadata.name,CONTAINER:.spec.containers[*].name,RESTARTS:.status.containerStatuses[*].restartCount,LASTEXIT:.status.containerStatuses[*].lastState.terminated.exitCode,REASON:.status.containerStatuses[*].lastState.terminated.reason"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ 这一段的唯一理由：`STATUS` 列**看不见**"被杀过多少次、为什么被杀"。
+      `lastState.terminated.reason` = `OOMKilled` / `Error` / `Completed`，
+      连同 `exitCode`（`137` = 被 SIGKILL，内存超限的典型）才是**可复核的证据**。
+      ★ 容器**重启之后** STATUS 会显示 `Running` ⇒ 只看那一列会以为"好得很"（规范 §12.37.1 ③）。
+
+  - name: not_running
+    title: 非 Running 的 Pod（服务端 `--field-selector`，另行一段）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - --field-selector=status.phase!=Running
+      - --no-headers
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ **它的局限必须写在结论里**（不许让人以为"这段为空 = 没问题"）：
+      `CrashLoopBackOff` 的 Pod `phase` **仍然是 `Running`** ⇒ 这一段**抓不到它**。
+      ★ 另外 `Succeeded`（`Completed`）**会被这一段选出来**，那属于**正常终态**。
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: >
+      `kubectl get namespaces` 没有给出任何一行 —— API server 没在应答，或这把 kubeconfig 不对。
+
+conclusion: |
+  【{host.name}】Pod 总览（只读）
+  kubeconfig：{kubeconfig}
+
+  ── 全部 Pod（-o wide）──
+  {pods}
+  ── ★ 重启与最近一次终止（OOMKilled 只在这里看得见）──
+  {restarts}
+  ── 非 Running（★ 抓不到 CrashLoopBackOff，见判读）──
+  {not_running}
+  ── 原文结束 ──
+
+  判读：
+    · ★★ **判据是"状态白名单"，不是"坏状态黑名单"**（规范 §12.37.1 ②）：
+      `STATUS` 不在 {`Running`, `Completed`} 里就值得看一眼 ——
+      ★ **不许**去背 `CrashLoopBackOff` / `ImagePullBackOff` 那一串名字，**它永远列不全**；
+    · ★ **过渡态不是病**：`ContainerCreating` / `PodInitializing` / `Init:x/y` = "还在起"，
+      等一会儿再看（★ 一直停在那里才有问题）；
+    · ★★ **`CrashLoopBackOff` 的 `phase` 仍是 `Running`** ⇒ 下面那段"非 Running"**抓不到它** ——
+      要抓它请看 `STATUS` 列与"重启次数"那一段；
+    · ★★ **`OOMKilled` 不在 `STATUS` 列里**：容器被杀之后**重启成功**，那一列会显示 `Running`；
+      只有 `lastState.terminated.reason` 记得这件事（`exitCode 137` = 被 SIGKILL）；
+    · ★ `Completed` / `Succeeded` 是**正常终态**（Job 跑完了），不要当成故障；
+    · ★ 想知道"**为什么**"：下一步用 `k8s.diagnose`（它给成因清单），而不是自己翻 `describe`；
+    · ★ 本动作**只读**：`changed` 恒 false。

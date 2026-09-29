@@ -1,0 +1,44 @@
+# ============================================================
+# T9 · 故障靶子 **v2**：把 `t9-pending` 的成因**换一种**（规范 §12.39.3 的命门）
+#
+#   v1 的成因：**没有匹配的节点**（`nodeSelector` 指向一个不存在的标签）
+#   v2 的成因：**资源不足**（`requests.cpu: 1000` —— 一个节点拿不出的量）
+#
+# ★★ 用法（"换成因 ⇒ 清单必须跟着换"的对照）：
+#   ① 先 apply v1 → 跑 `k8s.diagnose` → 清单里必须点「没有匹配的节点」
+#   ② 再 apply**本文件**（同一份名单里就没有 nodeSelector 了，apply 会把它删掉）
+#      → 再跑 `k8s.diagnose` → 清单里必须**换成**「资源不足」，且**不再出现**"没有匹配的节点"
+#   ★ 若把成因写死成一段文案，第②步**立刻红**。
+#
+# ★ 只声明**一个**对象（外加命名空间，保证单独 apply 也成立）：
+#   `kubectl apply` **不会**删掉别处未声明的对象（没有 prune）——
+#   ⇒ 另外三个靶子**原样留着**，对照的变量只有一个。
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aoc-t9
+  labels:
+    aoc-owned-by: t9
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t9-pending
+  namespace: aoc-t9
+  labels: {aoc-t9: fault}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {aoc-t9: t9-pending}
+  template:
+    metadata:
+      labels: {aoc-t9: t9-pending}
+    spec:
+      containers:
+        - name: web
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]
+          resources:
+            requests:
+              cpu: "1000"

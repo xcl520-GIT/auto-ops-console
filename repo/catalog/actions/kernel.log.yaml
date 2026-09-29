@@ -1,0 +1,101 @@
+# ============================================================
+# 动作：内核日志与 OOM
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 I（P0 · 只读）
+# 形态：一次给全结论（内核版本 + dmesg 错误/告警 + 本轮错误级日志 + OOM 检索）
+# 风险：green
+# ============================================================
+
+id: kernel.log
+title: 内核日志与 OOM
+summary: 内核错误/告警、本轮错误级日志与 OOM（内存被杀进程）检索
+domain: I
+risk: green
+priority: P0
+tags: [只读, 性能, 内核, OOM]
+note: |
+  OOM（内存不足被杀进程）最容易被误判成"服务自己崩了" —— 应用日志里只看到进程消失，
+  真正的原因在内核日志里（`Out of memory: Killed process ...`）。
+  三路数据：dmesg（内核环形缓冲，最快）、journalctl -p err（本轮所有错误级）、
+  journalctl -k -g oom（跨轮次检索 OOM 关键字，历史掉线也能查到）。
+
+params:
+  - name: lines
+    label: 每个列表显示条数
+    type: int
+    min: 5
+    max: 200
+    default: 60
+    help: dmesg 与错误日志的显示条数上限（取最近 N 条）。
+
+steps:
+  - name: kver
+    title: 内核版本
+    run: ["uname", "-r"]
+    parser: raw
+
+  - name: errors
+    title: 内核错误与告警（dmesg）
+    run: ["dmesg", "-T", "--level=err,warn"]
+    parser: lines
+    optional: true
+    timeout: 30
+    note: -T 把内核时间戳转成可读时间；--level=err,warn 只取错误与告警级别。需要 root 权限（本通道即 root）。
+
+  - name: boot_errs
+    title: 本轮错误级日志
+    run: ["journalctl", "-p", "err", "-b", "--no-pager", "-n", "{{ lines }}"]
+    parser: lines
+    optional: true
+    note: -b 限定本次开机以来；-p err 只取错误级及以上。范围比 dmesg 广（含服务日志）。
+
+  - name: oom
+    title: OOM 检索
+    run: ["journalctl", "-k", "-g", "oom", "--no-pager", "-n", "{{ lines }}"]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    note: >
+      -k 只看内核消息，-g oom 按关键字过滤。★ 实测：**过滤无匹配时 journalctl 退出码为 1**
+      （和 grep 一样），并打印 "-- No entries --" —— 那是"没有 OOM"的结论，不是执行失败，
+      所以声明 ok_exit_codes: [0, 1]（T2 探针时因为 rc 取的是管道尾 head 的退出码，误判成 0）。
+      这里**不加** -b：跨轮次检索才能看到历史 OOM。
+
+  - name: killed
+    title: 被杀进程检索
+    run: ["journalctl", "-k", "-g", "Killed process", "--no-pager", "-n", "20"]
+    parser: lines
+    optional: true
+    ok_exit_codes: [0, 1]
+    note: 与上一步交叉验证：OOM 的最终动作就是 Killed process（同样存在"无匹配 = 退出码 1"）。
+
+verify:
+  - name: 必须读出内核版本
+    from: kver
+    on_missing: uname -r 无输出 —— 无法确定内核版本，本结论不可用
+  - name: OOM 检索有结果（★ 无匹配时为空是**正常结论**）
+    from: oom
+    severity: warn
+    on_missing: >
+      该范围内没有 OOM 记录 —— 这**通常是好结论**，不是失败
+      （journalctl 曾用一行 "-- No entries --" 把它伪装成"有结果"，T4 已修，见规范 §10.6.2）。
+      只有当你确信这台机器发生过 OOM、却在这里看不到任何记录时，才需要怀疑 journal 被裁剪。
+
+conclusion: |
+  【{host.name}】内核日志与 OOM
+  内核版本 {kver} ｜ dmesg 错误与告警 {errors.count} 条 ｜ 本轮错误级日志 {boot_errs.count} 条
+  内核错误与告警（dmesg -T --level=err,warn）：
+  {errors}
+  OOM 检索（跨轮次，"-- No entries --" 表示没有）：
+  {oom}
+  被杀进程检索：
+  {killed}
+  本轮错误级日志（journalctl -p err -b，最近 {lines} 条）：
+  {boot_errs}
+
+  判读：
+  · 出现 `Out of memory: Killed process <PID> (<进程名>)` → 内存不足杀进程，不是应用 bug：
+    先看「进程总览」按内存排序找吃内存的进程，再看是否该加内存/限制服务内存
+    （systemd 单元的 MemoryMax）、或调小缓存；
+  · dmesg 里反复出现网卡/磁盘错误（nvme、I/O error、link down）→ 硬件或存储链路问题，不是软件配置；
+  · 只看到应用进程"莫名消失"却找不到 OOM → 一定要在本动作的 OOM 两栏里确认（这是最常见的漏判点）；
+  · 显示（无）或 "-- No entries --" → 对应范围内没有记录（正常）；
+  · 本动作只读：不清理日志、不调整任何内核参数。

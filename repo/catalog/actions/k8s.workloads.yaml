@@ -1,0 +1,131 @@
+# ============================================================
+# 动作：工作负载总览
+# 来源：T9·S2 —— 规范 §12.37（管理类动作的总口径）、§12.37.2（"必然有输出"那一步）
+# 形态：**只读**（green）
+# 一句话：期望 vs 就绪 —— 一屏看出"哪个 Deployment 没到齐、差几个"
+# ============================================================
+
+id: k8s.workloads
+title: 工作负载总览
+summary: Deployment / StatefulSet / DaemonSet / Job / CronJob 一次取全 —— ★ 期望与就绪逐行对照，差在哪一眼看出
+domain: J
+risk: green
+priority: P0
+tags: [只读, K8s, 工作负载]
+
+note: |
+  ★★ **判据挂在哪**（规范 §12.37.2）：只读动作也必须有一条"**结构上必然非空**"的判据 ——
+  本动作把它挂在 `api_alive` 上（`kubectl get namespaces --no-headers`）。
+  任何一个**活着的**集群至少有一个命名空间（`default` / `kube-system`）⇒
+  这一步为空**只可能**意味着"API 没应答 / kubeconfig 不对"，那是**结论**，不是"没查到东西"。
+
+  ★ **其余各段一律 `optional: true`、不参与自证**：一个刚建好的集群里
+  "没有 Job / 没有 CronJob"是**正常现状**，把它判红就是**假红**（清单 80 / 101）。
+
+  ★★ **为什么"期望 vs 就绪"要用 `-o custom-columns` 单独取一段**（规范 §12.37.1 ①）：
+  `kubectl get deployments -o wide` 的表格是**给人看的**；要判"到齐了没有"，
+  必须能**逐行**拿到 `DESIRED` 与 `READY` —— 它们对应
+  `.spec.replicas` 与 `.status.readyReplicas`（**K8s 的稳定结构化契约**）。
+  ⇒ ★ 这也是"管理类动作的判据问**被管的那一方**"的落点：数字从 API server 来，不是我们算的。
+
+  ★ `READY` 列显示 `<none>` 是**结论**：那个 Deployment 的 Pod **一个都没就绪**
+  （`readyReplicas` 字段缺失），不是"读不到"。
+
+params:
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+    help: '★ 白名单只放行 `/etc/kubernetes/*.conf`（`admin.conf` / `super-admin.conf`）。工作节点上没有它 —— 那是**结论**，会明确报出来。'
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl（缺它就说清"缺工具"，不是"集群没起来"）
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在（★ 工作节点上"没有"是**结论**，不是故障）
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+
+steps:
+  - name: api_alive
+    title: ★★ 中枢判据：集群 API 在应答（**这一步必然有输出**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★ 它同时是"**这台机器上这把 kubeconfig 能不能读集群**"的判据 ——
+      比让后面每一条命令各报一次 `connection refused` 干净得多。
+
+  - name: replicas
+    title: ★ 期望 vs 就绪（Deployment 逐行：DESIRED / READY / UPDATED / AVAILABLE）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - deployments
+      - --all-namespaces
+      - --no-headers
+      - "-o"
+      - "custom-columns=NS:.metadata.namespace,NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AVAILABLE:.status.availableReplicas"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ 这一段是"**到齐了没有**"的判据来源：`DESIRED` 与 `READY` **不相等**的行就是没到齐的。
+      ★ `<none>` = `readyReplicas` 字段**缺失**（一个都没就绪）—— 那是结论，不是读不到。
+
+  - name: overview
+    title: 工作负载总览（Deployment / StatefulSet / DaemonSet / Job / CronJob，`-o wide`）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - deployment,statefulset,daemonset,job,cronjob
+      - --all-namespaces
+      - "-o"
+      - wide
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答（拿不到命名空间 = 集群不可用，这是判据不是"没查到"）
+    from: api_alive
+    on_missing: >
+      `kubectl get namespaces` 没有给出任何一行 —— 说明 API server 没在应答，或这把 kubeconfig 不对。
+      ★ 这时**不要**去看 `systemd`：`kubelet` 是 active 与"集群可用"是两件事（规范 §12.31.4 同族）。
+
+conclusion: |
+  【{host.name}】工作负载总览（只读）
+  kubeconfig：{kubeconfig}
+
+  ── ★ 期望 vs 就绪（Deployment）──
+  {replicas}
+  ── 全部工作负载（-o wide）──
+  {overview}
+  ── 命名空间（API 应答的判据）──
+  {api_alive}
+  ── 原文结束 ──
+
+  判读：
+    · ★★ **看 `DESIRED` 与 `READY` 两列**：不相等就是"没到齐"——★ 那才是要动手的地方（先看 Pod 为什么起不来，
+      用 `k8s.diagnose` 给成因，而不是先 `scale`）；
+    · ★ `READY` 显示 `<none>` = `readyReplicas` **字段缺失**（一个都没就绪）——**结论**，不是读不到；
+    · ★ `Job` / `CronJob` **为空是正常的**（这个集群里现在就没有）；
+    · · `DaemonSet` 的"期望"受**节点数与污点**影响：节点 `SchedulingDisabled` 时它的 `DESIRED` 会变小 ——
+      那是**正确行为**，不是缺陷（`k8s.node-drain` 跑完之后就会看到这一幕）；
+    · ★ 本动作**只读**：不创建、不修改、不删除任何对象（`changed` 恒 false）。

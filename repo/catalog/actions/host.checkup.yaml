@@ -1,0 +1,245 @@
+# ============================================================
+# 动作：一键体检（checkup）
+# 来源：覆盖地图账本 entries: checkup（域 L · P0 · 计划 T4）
+# 形态：**采集层**。12 个体检项的只读命令一次跑完；
+#       判定 / 阈值 / 总判 / 下一步 由平台层 app/checkup.py 负责（规范 §10.2.1）。
+# 风险：green（全部只读，不改动目标机任何东西）
+# ============================================================
+#
+# ★ 为什么判定不在这个文件里（规范 §10.2.1）：
+#   「根分区 92% > 95% 所以红」这件事需要**运算**，而结论模板不能做运算（§8.7 #1）。
+#   所以：采集走 YAML（本文件），判定走 app/checkup.py（读 config.yaml 的 checkup.thresholds）。
+#
+# ★ 本文件所有命令的退出码都是**探针实测**出来的（§8.8 第 11 条：先探针、再写 YAML）。
+#   2026-09-25 在 node-01 与 docker-01 上实测，三个最容易写错的地方：
+#     ① `firewall-cmd --state` 未运行时 rc=**252**，且 "not running" 打在 **stderr**、stdout 为空；
+#        （running 时 rc=0 且 stdout="running"）→ 判定层用 rc 而不是 stdout 来判断。
+#     ② `systemctl is-active kubelet` 在**没有这个单元**的机器上 rc=**4**（stdout="inactive"）
+#        → docker-01 会走到这个分支，故 ok_exit_codes 含 4。
+#     ③ `journalctl -g` 无匹配时 rc=**1** 并打印 "-- No entries --"（T2 已知），
+#        判定层必须把这一行过滤掉，否则会把"没有 OOM"当成"有 OOM"。
+
+id: host.checkup
+title: 一键体检
+summary: 12 项体检一次跑完，给「总判 + 每项判定 + 下一步」的结论式报告（只读）
+domain: A
+risk: green
+priority: P0
+tags: [只读, 体检, 收口, 结论式]
+note: |
+  ★ id 命名的由来（T4 修正）：账本里原来登记的是裸 id `checkup`，而规范 §1 要求
+  `域.动作名`（正则 ^[a-z][a-z0-9]*\.[a-z][a-z0-9-]*$）—— 也就是说那条登记项**按原名永远无法被实现**
+  （文件名不可能同时等于 id 又合规）。T4 把它正名为 `host.checkup`，归入域 A（系统与主机），
+  账本 entries 里的 id 与 domain 同步改掉。
+
+  单机跑一次 = 一份体检报告；4 台并排用「批量」页签（同一动作铺 4 台，失败隔离）。
+  ★ 它不是"把只读动作串一遍"—— 串一遍只是批量执行的马甲。
+  它输出的是：总判（几红几黄几绿）→ 每一项的判定与依据 → **先去查什么**（指向具体动作）。
+  体检是**只读**的：不清理磁盘、不改配置、不重启任何服务。
+
+params: []
+
+steps:
+  # ── 基础事实（同时是 verify 的落点）
+  - name: os_release
+    title: 系统标识
+    run: ["cat", "/etc/os-release"]
+    parser: shell_kv
+    note: 报告抬头要写清"这是哪台、什么系统"。也是 fail 级自证的落点之一。
+
+  # ── 体检项 1：时间同步
+  - name: ntp
+    title: 时间同步状态
+    run: ["timedatectl", "show", "-p", "NTPSynchronized", "-p", "NTP", "-p", "Timezone"]
+    parser: shell_kv
+    note: |
+      用 `timedatectl show -p KEY`（结构化 KEY=VALUE），不解析人读的 timedatectl status
+      —— 后者字段名会被 locale 影响（已由 transport 强制 C locale 兜底，但结构化源更稳）。
+      实测 4 台均为 NTPSynchronized=yes。
+
+  # ── 体检项 2 / 3：磁盘与 inode 水位
+  - name: disk
+    title: 各挂载点容量水位
+    run: ["df", "-P"]
+    parser: df_rows
+    note: -P 是 POSIX 固定 6 列格式，不会为长设备名折行。
+
+  - name: inode
+    title: 各挂载点 inode 水位
+    run: ["df", "-P", "-i"]
+    parser: df_rows
+    note: 容量没满但 inode 满了是"海量小文件"的经典故障，必须单独看。
+
+  # ── 体检项 4：服务失败项
+  - name: failed_units
+    title: 失败的系统服务
+    run: ["systemctl", "list-units", "--type=service", "--state=failed", "--no-legend", "--plain"]
+    parser: lines
+    note: |
+      ★ 输出**为空就是好结论**（没有失败的服务）—— 所以这一项**不能**写成 verify 的非空断言
+      （规范 §9.6：某物"不存在"必须由退出码承担，拿必然为空的东西断言非空必然误报）。
+
+  - name: core_sshd
+    title: 核心服务 sshd 是否在运行
+    run: ["systemctl", "is-active", "sshd"]
+    parser: raw
+    ok_exit_codes: [0, 3]
+    note: |
+      核心服务失败 → 判红。is-active 在 inactive/failed 时 rc=3（T2 已实测），
+      它本身就是要看的结论，故声明 ok_exit_codes: [0, 3]。
+
+  # ── 体检项 5：内核报错与 OOM
+  - name: kernel_errs
+    title: 内核错误与告警
+    run: ["journalctl", "-k", "-p", "err", "-b", "--no-pager", "-n", "30"]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    timeout: 30
+    note: -b 限定本次开机以来；-k 只看内核消息。-p err 无匹配时 rc=1。
+
+  - name: oom
+    title: OOM（内存不足杀进程）检索
+    run: ["journalctl", "-k", "-g", "Out of memory", "--no-pager", "-n", "20"]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    timeout: 30
+    note: |
+      不加 -b：跨轮次检索才能发现历史 OOM。
+      实测无匹配时 rc=1 且**打印 "-- No entries --"** → 判定层必须过滤这一行，
+      否则"没有 OOM"会被误读成"有 OOM"（这是本项最容易错的地方）。
+
+  # ── 体检项 6：SELinux 模式
+  - name: selinux
+    title: SELinux 当前模式
+    run: ["getenforce"]
+    parser: raw
+    note: Enforcing 绿；Permissive / Disabled 黄（两者都弱于强制模式）。
+
+  # ── 体检项 7：防火墙
+  - name: firewalld
+    title: firewalld 是否在运行
+    run: ["firewall-cmd", "--state"]
+    parser: raw
+    ok_exit_codes: [0, 252]
+    note: |
+      ★ 实测：未运行时 rc=**252**，且 "not running" 打在 **stderr**、stdout 为空；
+      运行中时 rc=0、stdout="running"。→ 判定层按 **rc** 判定，不按 stdout。
+
+  - name: fw_ports
+    title: 已放行的端口
+    run: ["firewall-cmd", "--list-ports"]
+    parser: raw
+    ok_exit_codes: [0, 252]
+    optional: true
+    note: 只在 firewalld 运行时有意义；未运行时 rc=252（stderr 提示 FirewallD is not running）。
+
+  - name: listeners
+    title: 实际在监听的端口
+    run: ["ss", "-H", "-tulnp"]
+    parser: ss_rows
+    note: 与上一步对照，找"防火墙有意放行、但根本没人监听"的无主规则（体检项 7 的另一半）。
+
+  # ── 体检项 8：证书工具链
+  - name: openssl
+    title: openssl 是否可用
+    run: ["openssl", "version"]
+    parser: raw
+    optional: true
+    note: |
+      ★ 实测本批 4 台**都没装 openssl** → rc=127 → 引擎识别为 TOOL_MISSING。
+      这一项因此**必然**走到"⚠️ 无法判定"分支 —— 这正是开题单验收 #5 要的分支：
+      **缺工具不拖垮整份报告**，只把这一项标成无法判定 + 给建议。
+
+  - name: ca_certs
+    title: 系统 CA 证书包
+    run: ["rpm", "-q", "ca-certificates"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    note: rc=1 表示包没装（rpm -q 的"缺包"语义，T2 已实测）。
+
+  # ── 体检项 9：包管理可用性（诊断能力的地基）
+  - name: rpm_db
+    title: rpm 数据库可读
+    run: ["rpm", "-q", "rpm"]
+    parser: raw
+    note: 读不出 rpm 库，后面所有"装了什么包"的判断都不可信 —— 所以它自己是一项体检。
+
+  # ── 体检项 10：容器运行状态
+  - name: docker_state
+    title: docker 运行状态
+    run: ["systemctl", "show", "-p", "ActiveState", "docker"]
+    parser: shell_kv
+    ok_exit_codes: [0, 1]
+    note: 用 `systemctl show -p ActiveState`（结构化）而不是 `systemctl is-active`（要处理多种退出码）。
+
+  - name: containerd_state
+    title: containerd 运行状态
+    run: ["systemctl", "show", "-p", "ActiveState", "containerd"]
+    parser: shell_kv
+    ok_exit_codes: [0, 1]
+
+  - name: containers
+    title: 容器状态清单
+    run: ["docker", "ps", "-a", "--format", "{{.Status}}"]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    optional: true
+    timeout: 30
+    note: |
+      只看 Status 一列（每行一条），判定层数其中的 Restarting / Exited。
+      实测：daemon 没跑时 rc=1（连不上 /var/run/docker.sock）→ 由 docker_state 那一步判定，
+      所以这里把它当"正常的空报告"（ok_exit_codes 含 1）。
+      `{{.Status}}` 是本动作要传给 docker 的**字面量**，不是模板占位符
+      （占位符正则要求小写字母开头，`.Status` 不匹配，不会被渲染）。
+
+  # ── 体检项 11：K8s 节点状态（只读，一根手指都不碰）
+  - name: kubelet
+    title: kubelet 状态
+    run: ["systemctl", "is-active", "kubelet"]
+    parser: raw
+    ok_exit_codes: [0, 3, 4]
+    note: |
+      ★ 实测：没有 kubelet 单元的机器（docker-01）rc=**4**（stdout="inactive"），
+      所以 ok_exit_codes 必须含 4，否则非 K8s 机器会把这步记成失败。
+      是否 K8s 节点由判定层按 hosts.yaml 的 role 决定（不是 K8s 节点就直接标"不适用"）。
+
+  - name: k8s_nodes
+    title: K8s 节点清单
+    run: ["kubectl", "get", "nodes", "--no-headers"]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    optional: true
+    timeout: 30
+    note: |
+      只读查询。实测两种失败：装不了 kubectl（rc=127 → TOOL_MISSING）、
+      控制面 API 不可达（rc=1）。两者都只是"查不到"，不该拖垮整份报告。
+
+verify:
+  - name: 必须读出系统标识
+    from: os_release
+    field: PRETTY_NAME
+    on_missing: /etc/os-release 里没有 PRETTY_NAME —— 这台机器可能不是标准发行版，体检结论的适用范围要打问号
+  - name: 必须解析出挂载点
+    from: disk
+    on_missing: df -P 没有给出任何文件系统（输出格式可能已变）—— 磁盘水位无法判定
+  - name: 必须读出核心服务状态
+    from: core_sshd
+    on_missing: systemctl is-active sshd 无输出 —— 无法确认登录服务是否在运行
+  - name: 包数据库必须可读
+    from: rpm_db
+    on_missing: rpm -q rpm 无输出 —— 包数据库异常，本次体检里所有"装了什么"的判断都不可信
+
+conclusion: |
+  【{host.name}】一键体检 · 采集结果
+  系统 {os_release.PRETTY_NAME} ｜ 时区 {ntp.Timezone} ｜ 时间同步 {ntp.NTPSynchronized}
+  磁盘：{disk.count} 个挂载点 ｜ inode：{inode.count} 个挂载点
+  失败服务 {failed_units.count} 个 ｜ 核心服务 sshd：{core_sshd}
+  内核错误 {kernel_errs.count} 条 ｜ OOM 检索：{oom}
+  SELinux {selinux} ｜ firewalld {firewalld}（未运行时此处为空，判定看判定层） ｜ openssl {openssl}
+  包数据库 {rpm_db} ｜ docker {docker_state.ActiveState} ｜ kubelet {kubelet}
+
+  判读：
+  · 本动作只做**采集**；「总判 / 每项判定 / 先去查什么」由工作台按 config.yaml 的 checkup 阈值算出，
+    在界面的「体检」页展示（规范 §10.2）。
+  · 看到（无）或 "-- No entries --" 表示对应范围内没有记录 —— 对"失败服务 / OOM"这两项来说那是**好结论**。
+  · 本动作只读：不清理磁盘、不改配置、不重启任何服务。

@@ -1,0 +1,58 @@
+# ============================================================
+# 动作：虚拟机快照链
+# 来源：设计\05-虚拟化层-架构设计.md §3/§4（护栏四件套）· 总纲 §4.2 T16
+# 形态：这台虚拟机的快照链（名字 + 条数）
+# 风险：green ｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.snapshot-list
+title: 虚拟机快照链
+summary: 列出这台虚拟机的全部快照（★ 名字是逐字匹配的，含空格与中文）
+domain: M
+risk: green
+priority: P0
+channel: local
+tags: [只读, 虚拟化, 快照]
+note: |
+  ★ 快照是**护栏四件套**的第 4 件（规范 §12.118）：它比文件级备份更强 —— 整机回滚。
+  ★★ 但**回滚是 `red`**（`vm.snapshot-revert`：手输确认词 + 禁批量），
+    因为回滚会**丢掉当前状态**（可能把"其实没坏"的现场一起覆盖掉）。
+  ★ 快照名**逐字匹配**：实测链上就有 `k8s集群搭建完成` / `快照 2` 这类含中文与空格的名字，
+    所以"名字写错一个字符"= 找不到 —— 先读链，再回滚。
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名
+
+steps:
+  - name: snaps
+    title: 读快照链
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "snapshots", "--vmx", "{{ vm_vmx }}"]
+    parser: json
+    timeout: 60
+    note: |
+      ★ 这条查询**对已关机的 VM 也有效**（实测：关机的原型机照样能列出它的快照链）——
+      所以"要回滚到某个快照"这件事**不需要先把机器开起来**。
+
+verify:
+  - name: 必须拿到快照条数
+    from: snaps
+    field: count
+    on_missing: 读不到快照链（vmrun 不可用，或 vmx 路径不对）
+
+conclusion: |
+  【{vm_name}】快照链：{snaps.count} 条
+  {snaps.table}
+
+  判据来源：{snaps.checked}
+
+  判读：
+  · 快照链是**整机回滚**的落点 —— 与"改动前文件备份"并列，不互相替代（规范 §12.118）；
+  · 要新建一条：`vm.snapshot-create`（yellow，占磁盘空间，可删）；
+  · ★ 要回滚：`vm.snapshot-revert` 是 **red** —— 会**丢掉当前状态**，必须手输确认词、且不许批量；
+  · 名字**逐字**照抄上面的（含空格与中文），差一个字符就会"找不到"。

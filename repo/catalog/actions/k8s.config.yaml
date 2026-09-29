@@ -1,0 +1,180 @@
+# ============================================================
+# 动作：配置与存储
+# 来源：T9·S2 —— ★★ 规范 §12.43（**Secret 只给键名，不给值**）
+# 形态：**只读**（green）
+# ============================================================
+
+id: k8s.config
+title: 配置与存储
+summary: ConfigMap / Secret / PVC / PV / StorageClass 一次取全 —— ★ Secret 只给键名与条数，值一个字节都不读
+domain: J
+risk: green
+priority: P1
+tags: [只读, K8s, 配置, 存储]
+
+note: |
+  ★★ **本动作的宪法级约束**（规范 §12.43）：**Secret 的值绝不出现在结论 / 证据 / 界面里**。
+  两条实现纪律：① 列表那一步用 `kubectl get secrets` 的**默认列**
+  （`NAME TYPE DATA AGE` —— `DATA` 是**键的条数**，不是值）；
+  ② 要看**键名**时用 `kubectl describe secret`（它的输出只给 `键名: N bytes`，**不给值**），
+  ★ 而且**只在人显式填了 Secret 名字时**才跑（`{when: secret_name}` 条件段）。
+  ★★ **不用** `-o yaml|json`、**不用** `jsonpath` 取 `data` —— 那两条路都会把值打出来。
+  ★ 逃生口 `k8s.kubectl` 也遵守同一条（它的 `flags` 白名单**不放行** `-o yaml|json`，§12.40.3）。
+
+  ★ 判据挂 `api_alive`（§12.37.2）；其余各段 `optional`（"还没有 ConfigMap"是**正常现状**）。
+
+  ★★ **存储那一段为什么重要**：`PVC` 停在 `Pending` 是 `Pending` Pod 的三大成因之一
+  （规范 §12.39.2 成因③：卷没绑上 / `WaitForFirstConsumer`）⇒ 本动作是那条成因的**证据来源**。
+
+params:
+  - name: secret_name
+    label: 看哪个 Secret 的键名（可留空）
+    type: str
+    required: false
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: （留空 = 只看清单）
+    help: '★ 填了它才会跑 `describe secret` —— ★★ 它**只列出键名与每个键的字节数，不打印值**（规范 §12.43）。'
+  - name: secret_namespace
+    label: 上面那个 Secret 在哪个命名空间
+    type: str
+    required: false
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+
+steps:
+  - name: api_alive
+    title: ★★ 中枢判据：集群 API 在应答（**这一步必然有输出**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: configmaps
+    title: ConfigMap 清单（命名空间 / 名字 / 键的条数）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - configmaps
+      - --all-namespaces
+      - --no-headers
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: secrets
+    title: ★ Secret 清单（**只给默认列：TYPE 与 DATA 的条数 —— 值一个字节都不读**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - secrets
+      - --all-namespaces
+      - --no-headers
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ 默认列是 `NAMESPACE NAME TYPE DATA AGE`，其中 `DATA` 是**这个 Secret 有几个键**（数字），
+      **不是内容**。★ **不许**改成 `-o yaml` / `-o json` / `jsonpath .data`
+      —— 那三条路都会把凭据打到报告里（规范 §12.43 / 检查清单 113）。
+
+  - name: secret_keys
+    title: ★ 某个 Secret 的**键名**（仅当填了 `secret_name` 时才跑；只给键名与字节数）
+    run:
+      # ★★ §12.51（T9·S8 抓到的**真缺陷 ⑫**）：这一步要表达的是「**这整条命令**要不要跑」
+      #   ⇒ `when` 必须挂在**每一个**元素上。原先只挂了下面 `-n` 那两个，于是
+      #   `secret_name` 为空时命令**照样执行**（`kubectl describe secret ""`）⇒ 必然报错
+      #   ⇒ 在一个**只读**动作里凭空造出一条"步骤失败"（**假警报**，会让用户忽略报告里的红字）。
+      #   挂满之后：`secret_name` 为空 ⇒ **所有元素被判掉 ⇒ 渲染出空 argv ⇒ 整步 `skipped`**
+      #   （引擎 §8.3 的语义：「未提供参数 → 本步未执行」，**不是失败**；本步已标 `optional: true`）。
+      # ★ 定这条的判据：`when` 说的是"可选开关要不要加"（挂一半对）还是"整条命令要不要跑"（必须挂满）。
+      # ★★ §12.51.1（**第二版补丁才修对**）：光"挂满"还不够 —— **必须挂的是同一个条件**。
+      #   第一版只给前 5 个元素挂了 `when: secret_name`、保留了 `when: secret_namespace` 那两个：
+      #   而 `secret_namespace` **有默认值 `default`（非空）** ⇒ 那两个元素**永远被保留** ⇒
+      #   **argv 永远不为空** ⇒ "整步跳过"这条路径**根本走不到**（复跑时 `步骤失败 1/7` 原样不动）。
+      #   ⇒ 七个元素**统统挂 `when: secret_name`**（namespace 只在真的要跑时才用得上）。
+      - { when: secret_name, value: kubectl }
+      - { when: secret_name, value: "--kubeconfig={{ kubeconfig }}" }
+      - { when: secret_name, value: describe }
+      - { when: secret_name, value: secret }
+      - { when: secret_name, value: "{{ secret_name }}" }
+      - { when: secret_name, value: -n }
+      - { when: secret_name, value: "{{ secret_namespace }}" }
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ `kubectl describe secret` 的输出形如 `token: 24 bytes` —— **只有键名与长度，没有值**。
+      这是"要看键名"这条需求的**唯一**正确做法（规范 §12.43）。
+
+  - name: storage
+    title: 存储（StorageClass / PV / PVC —— 含 `Bound` / `Pending` 状态）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - storageclass,persistentvolume,persistentvolumeclaim
+      - --all-namespaces
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: >
+      `kubectl get namespaces` 没有给出任何一行 —— API server 没在应答，或这把 kubeconfig 不对。
+
+conclusion: |
+  【{host.name}】配置与存储（只读）
+  kubeconfig：{kubeconfig}
+
+  ── ConfigMap（只给键的条数，不给内容）──
+  {configmaps}
+  ── ★ Secret 清单（默认列：TYPE ＋ DATA 条数；**值一个字节都不读**）──
+  {secrets}
+  ── ★ 指定 Secret 的键名与长度（只给键名）──
+  {secret_keys}
+  ── 存储（StorageClass / PV / PVC）──
+  {storage}
+  ── 原文结束 ──
+
+  判读：
+    · ★★ **Secret 的值不在这里，也不该在这里**（规范 §12.43）：想确认"某个键在不在"，
+      看 `DATA` 列的数字与 `describe` 的键名列表就够了；**要看值请到目标机上按最小权限取** ——
+      让它进报告就等于让它进 Git 的邻居（总纲红线 2）；
+    · ★ `DATA` 列 = **键的条数**（例如 `3` 表示 3 个键），不是"3 字节"；
+    · ★★ **PVC 停在 `Pending` 是 `Pending` Pod 的三大成因之一**（规范 §12.39.2 成因③）：
+      看 `STATUS` 列 —— `Bound` 才是绑上了；`Pending` 常见两种原因
+      （**没有可匹配的 PV** / `WaitForFirstConsumer` 在等第一个 Pod 出现）；
+    · ★ `StorageClass` 的 `VOLUMEBINDINGMODE` 决定了上面那条：`WaitForFirstConsumer` 时
+      PVC 在**没有 Pod 用它之前**一直是 `Pending` —— 那是**设计如此**，不是故障；
+    · ★ 本动作**只读**：`changed` 恒 false。

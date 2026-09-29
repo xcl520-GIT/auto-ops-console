@@ -1,0 +1,156 @@
+# ============================================================
+# T9 · 排障结论化的**真故障靶子**（v1）—— 规范 §12.44
+#
+# ★★ 为什么要造靶子：§12.39.3 那条"**把成因换一种 ⇒ 清单必须跟着换**"
+#    **没有真故障就永远验不出来**。这是 T8 那句"判据写对了没有，
+#    只有遇到'它本该红'的场景时才验得出来"的第二次落地。
+#
+# ★ 纪律（§12.44）：
+#   · 命名空间**固定** `aoc-t9`、对象一律 `t9-*` 前缀；
+#   · 只在自己这个命名空间里造，**不碰** default / kube-system / T8 的 aoc-net-probe；
+#   · 镜像只用**已经在本地**的（`docker.io/library/busybox:1.36`），
+#     "拉不动"这一类**故意用一个不存在的 ref**（不需要网络）；
+#   · 收尾判据是 `kubectl get ns aoc-t9` **退出码非 0**（不是"我发了删除命令"）。
+#
+# ★★ 为什么四个靶子都用 **Deployment** 而不是裸 Pod：
+#   **Pod 的 spec 几乎不可变**（改 resources/selector 会被 API 拒绝）⇒
+#   那样就没法做"**同一个对象、换成因**"的对照（§12.39.3 的命门）。
+#   Deployment 的 `spec.template` **可变** ⇒ 改一次就换一批新 Pod、成因跟着换。
+#   ★ 而且它更接近真实：运维现场见到的 Pending / CrashLoop 多半是"某个工作负载"的。
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aoc-t9
+  labels:
+    aoc-owned-by: t9
+---
+# 靶子 1：Pending —— 成因「**没有匹配的节点**」（nodeSelector 指向一个不存在的标签）
+#   v2（t9-targets-pending-v2.yaml）会把它换成「**资源不足**」⇒ 用于"换成因 ⇒ 清单跟着换"的对照
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t9-pending
+  namespace: aoc-t9
+  labels: {aoc-t9: fault}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {aoc-t9: t9-pending}
+  template:
+    metadata:
+      labels: {aoc-t9: t9-pending}
+    spec:
+      nodeSelector:
+        aoc-t9-does-not-exist: "yes"
+      containers:
+        - name: web
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "sleep 3600"]
+---
+# 靶子 2：CrashLoopBackOff —— 成因「**容器自己退出**」（exit 1）
+#   ★ 它的 command 会先往 stdout 打一行 → 好让 `--previous` 那份日志**真的有条目**
+#     （否则"上一份日志是空的"，§12.39.2 的成因①就演示不出来）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t9-crashloop
+  namespace: aoc-t9
+  labels: {aoc-t9: fault}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {aoc-t9: t9-crashloop}
+  template:
+    metadata:
+      labels: {aoc-t9: t9-crashloop}
+    spec:
+      containers:
+        - name: web
+          image: docker.io/library/busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "aoc-t9 crashloop: 这一行就是 --previous 能看到的那一行"
+              exit 1
+---
+# 靶子 3：ImagePullBackOff —— 成因「**镜像名/标签不存在**」
+#   ★ 故意用一个仓库里**不存在**的 ref（不需要网络就能复现"拉不到"）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t9-imagepull
+  namespace: aoc-t9
+  labels: {aoc-t9: fault}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {aoc-t9: t9-imagepull}
+  template:
+    metadata:
+      labels: {aoc-t9: t9-imagepull}
+    spec:
+      containers:
+        - name: web
+          image: docker.io/library/aoc-t9-does-not-exist:999
+          command: ["sh", "-c", "sleep 3600"]
+---
+# 靶子 4：OOMKilled —— 成因「**限额太小**」（16Mi 的口子去装一个不断长大的字符串）
+#   ★★ 它的价值：`OOMKilled` **不在 `get pods` 的 STATUS 列里**（规范 §12.37.1 ③）——
+#      只有一个"从 -o json 里读 lastState"的判据才抓得到它。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t9-oom
+  namespace: aoc-t9
+  labels: {aoc-t9: fault}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {aoc-t9: t9-oom}
+  template:
+    metadata:
+      labels: {aoc-t9: t9-oom}
+    spec:
+      containers:
+        - name: web
+          image: docker.io/library/busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              s=x
+              while : ; do s="$s-0123456789-0123456789-0123456789-0123456789"; done
+          resources:
+            limits:
+              memory: 16Mi
+---
+# 正常靶子（**不是故障**）：给 S4 的变更动作当作业对象（scale / 换镜像 / 回滚 / drain）
+#   ★ 它同时是 `k8s.diagnose` 的**正样本**：它**不许**出现在成因清单里
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t9-web
+  namespace: aoc-t9
+  labels: {aoc-t9: healthy}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {aoc-t9: t9-web}
+  template:
+    metadata:
+      labels: {aoc-t9: t9-web}
+    spec:
+      containers:
+        - name: web
+          image: docker.io/library/busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /www
+              echo "aoc-t9-web-ok-from-$(hostname)" > /www/index.html
+              exec httpd -f -p 8080 -h /www
+          ports:
+            - containerPort: 8080

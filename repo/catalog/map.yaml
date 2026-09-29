@@ -1,0 +1,1187 @@
+# auto-ops-console · 覆盖地图账本
+#
+# 设计口径（来自 设计\03-Linux运维命令覆盖地图.md §2.2「地图即账本」）：
+#   本文件登记「应该有什么」；catalog/actions/*.yaml 是「已经有什么」。
+#   程序启动时自动对账，算出每一层/每一域/每个优先级/每个风险等级的实现率与缺口清单。
+#
+# ★ 对账只看 id 是否存在（app/catalog.py 的 reconcile）：
+#     登记项 id 与某个动作文件同名 → 计为"已实现"，否则进"缺口清单"。
+#   因此：**能实现成一个动作的，才登记进 entries**；
+#   不是动作的平台能力（执行历史与回放、改动前自动备份）放到文件末尾的 platform: 段，
+#   避免污染覆盖率分母（与 demos: 同一个思路）。
+#
+# 字段说明：
+#   id / domain / label / commands / risk / priority  —— 参与对账与界面展示
+#   stage   —— 计划在哪个话题做（T1/T2 已做，T3/T4 待做）
+#   status  —— **人类可读的说明，不参与对账**（写清"没做的为什么没做"）
+#
+# 备注：域 G 的「登录审计」条目由域 B 的 host.logins 一并覆盖（同一份数据、同一个动作），
+#       为免把同一个动作算两遍，这里只在域 B 登记一次。
+#
+# T2 阶段说明：
+#   T2 已完成 P0 只读条目的铺量（23 个只读动作），本文件同时补登记了 T1 遗留的 P1 项
+#   与后续话题（T3/T4）的条目，让"缺口"一眼可见。
+
+version: 2
+updated: 2026-09-27
+# ★★ T10·S9：页首时点对账（口径见下面的"时点对账"注释块）。
+#   本次从 T9 推到 T10 —— 与 `stage_scope` 一起改，**两处必须同步**（T7 收尾时立过的规矩）。
+#   ★ T10 的四处回填：① `entries` 段 —— **不动**（52 条全部已实现，无新增项）；
+#     ② `platform` 段 —— 新增 **1 条**（`monitoring-stack`）；
+#     ③ `weights` —— 新增 **1 条**（w=5，`src: infer`，`why` 写出三处点名出处）；
+#     ④ 页首时点对账 —— `stage_scope` 由 **T9 → T10**，`updated` → 2026-09-27。
+#   ★★ 口径提醒（与 T8/T9 同）：**分母不变不代表没干活** —— T10 交付的是 10 个 `mon.*` 动作
+#     ＋ 两份配方（`monitoring-stack` / `monitoring-agent`）＋ 五个配置模板目录 ＋ 一张界面页签，
+#     全部属于"接入监控告警"这一类能力 ⇒ **按 §10.2 #3 拍板记 1 条**（判据是"**用户能不能不看终端
+#     做完一件事**"：接入监控告警**是一件**，从"机器上什么都没有"到"能收到告警"）。
+#     ⇒ **条数口径的分母纹丝不动（仍是 52）**；两个口径各自在回答不同的问题。
+#   ★ 记账口径为什么是 1 条而不是 3 条（三件套）：拆成三条会让"装了一半"与"装完了"看起来一样。
+# ★★ T16·S3：页首时点对账（口径见下面的"时点对账"注释块）。
+#   本次从 **T10 直接推到 T16** —— ★ 实话实说：**中间几站（T11~T15）没有改动本文件**
+#   （它们交付的是交付包 / 文档 / AI 助手面，没有新增"能力条目"）。
+#   ★ T16 的四处回填：① `domains` —— **新增 `M: 虚拟化与快照`**
+#     （★ 必需：动作的 domain 必须能在账本里找到，vm.* 的 domain 就是 M）；
+#     ② `entries` 段 —— **不动**（那 52 条是"Linux 运维命令覆盖地图"的口径，
+#        ★ 虚拟化层不属于那张地图 —— 与 T8 的 `k8s.*` 同一口径处理）；
+#     ③ `platform` 段 —— 新增 **2 条**（`vm-lifecycle` / `vm-snapshot-guard`）；
+#     ④ `weights` —— 新增 **2 条**（各 w=5，`src: infer`，`why` 写出点名出处）。
+#   ★★ 为什么是 2 条而不是 10 条（10 个动作）：判据仍是"**用户能不能不看终端做完一件事**" ——
+#     「让一台关机的靶子机开起来、干完事、关回去」是**一件事**；
+#     「变更前打快照」是**另一件事**（护栏，与文件级备份并列）。
+#     ★ 拆成 10 条会让"动作铺得多"冒充"事情做得成"——那正是覆盖率最该防的假象（T10 同源）。
+#   ★ 分母怎么变的：**条数口径的分母纹丝不动（仍 52）**；加权口径 +10（两条 w=5）；
+#     platform 段 18 → 20。★ **不靠改口径凑数**（T7 立的规矩：分母也要钉住）。
+stage_scope: T16
+
+domains:
+  A: 系统与主机
+  B: 用户与权限
+  C: 文件与目录
+  D: 磁盘与存储
+  E: 进程与服务
+  F: 网络
+  G: 安全面
+  H: 包管理
+  I: 性能与排障
+  J: 容器基础
+  K: 批量与自动化
+  L: 备份与恢复
+  # ★★ T16（六·虚拟化层）：宿主机与 VM 生命周期。★ 它**不是**"Linux 运维命令"那一类 ——
+  #    它的动作执行在**宿主机**上（本机 vmrun.exe，不走 ssh，规范 §12.115），
+  #    管的是"机器的开关"（电源 / 快照 / 就绪），所以单独立一个域。
+  M: 虚拟化与快照
+
+# 风险等级说明（与 YAML 中 risk 字段一致）
+risk_levels:
+  green: 只读，不改动目标机
+  yellow: 可恢复的变更，执行前需二次确认
+  red: 破坏性，执行前需二次确认 + 影响面提示
+
+entries:
+  # ================= 域 A · 系统与主机 =================
+  - id: host.overview
+    domain: A
+    label: 主机概览卡片（一屏给全）
+    commands: ["hostnamectl", "uname -r", "cat /etc/os-release", "uptime", "lscpu", "free -h"]
+    risk: green
+    priority: P0
+    stage: T1
+    status: 已实现
+
+  - id: host.datetime
+    domain: A
+    label: 时间与时区（含同步状态红灯提示）
+    commands: ["timedatectl", "chronyc tracking", "chronyc sources"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现（三重交叉验证：timedatectl / sestatus 式属性 + /etc/localtime 链接）
+
+  - id: host.kernelparams
+    domain: A
+    label: 内核参数与模块查看
+    commands: ["sysctl -n", "lsmod"]
+    risk: green
+    priority: P1
+    stage: T3
+    status: 已实现（T7·S7）：★★ **这是一笔从 T2 起就挂着的账**（T2 的 20 项清单里没有它，开题单 §2.3 列为缓冲项，一直顺延）。① 参数用 `sysctl <键>…`（**不加 `-a`**，只取要判读的那几个）⇒ 输出是 `KEY = VALUE`，走 `shell_kv`，再用 `pick` 把带点的键名改成短名字（★ 结论模板的 `{core.ip_forward}` 是"点号取字段"，键名再带点必歧义）；② **参数总条数**走 `sysctl -a` + `line_count`（动作层禁止管道 ⇒ `| wc -l` 写不了，"数行数"只能由解析器做）；③ ★ **模块计数**走 `/proc/modules`（一行一个、**没有表头**）、**显示**走 `lsmod`（给人看的形态）—— 这样"数行数"拿到的才是精确条数。真跑对照：node-03 = **1087 条参数 / 77 个模块**（nfsd/sunrpc/rpcrdma 那几个是 NFS 配方的痕迹）；docker-01 = **2456 条 / 79 个**（veth/bridge/nf_nat/xt_MASQUERADE —— 容器网络那一套）。同一份代码在同一屏里给出这两台"被谁调过"的差别，正是"一次给全结论"要的效果
+
+  # ================= 域 B · 用户与权限 =================
+  - id: host.logins
+    domain: B
+    label: 登录情况与用户画像（含失败登录识别）
+    commands: ["who", "w", "last", "lastb", "lastlog", "loginctl"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现 —— 同时覆盖域 G 的「登录审计」条目（不重复登记）
+
+  # ================= 域 C · 文件与目录 =================
+  - id: disk.usage
+    domain: C
+    label: 磁盘用量总览（df + inode）
+    commands: ["df -P", "df -P -i"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现
+
+  - id: disk.topdir
+    domain: C
+    label: 目录体积排行
+    commands: ["du -x -m --max-depth", "du --threshold"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现（排序在解析器内做，见规范 v1.1 §8.1）
+
+  - id: disk.bigfiles
+    domain: C
+    label: 大文件查找
+    commands: ["find -xdev -type f -size", "find -printf"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现
+
+  - id: file.grep
+    domain: C
+    label: 文件内容检索（关键字 + 上下文 + 高亮）
+    commands: ["grep -n -C", "tail", "head"]
+    risk: green
+    priority: P0
+    stage: T3
+    status: 未做 —— P0 只读条目，但不在用户确认的 T2 清单内（记入 T2 的动作清单勾选表）
+
+  # ================= 域 D · 磁盘与存储 =================
+  - id: block.overview
+    domain: D
+    label: 磁盘与分区总览
+    commands: ["lsblk -J", "blkid", "df"]
+    risk: green
+    priority: P0
+    stage: T3
+    status: 未做 —— T2 缓冲项（开题单 §2.3），信息展示价值低于诊断类，顺延
+
+  # ================= 域 E · 进程与服务 =================
+  - id: svc.list
+    domain: E
+    label: 服务总览（谁在跑 / 谁失败 / 失败原因）
+    commands: ["systemctl status", "systemctl is-failed", "systemctl list-units"]
+    risk: green
+    priority: P0
+    stage: T1
+    status: 已实现
+
+  - id: log.view
+    domain: E
+    label: 日志查看器（unit / 时间范围 / 级别 / 关键字）
+    commands: ["journalctl -u", "journalctl --since", "journalctl -p"]
+    risk: green
+    priority: P0
+    stage: T1
+    status: 已实现（结论是否收窄 → T1 遗留 #8，顺延 T3/T4 讨论）
+
+  - id: proc.overview
+    domain: E
+    label: 进程总览（CPU/内存排序、进程树、按用户/名称过滤）
+    commands: ["ps --sort", "pgrep -a", "pstree -p", "/proc/loadavg", "nproc"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现（TOP 20 由 head_lines 截断，条数不可调，见规范 v1.1 §8.6）
+
+  - id: timer.list
+    domain: E
+    label: 定时任务查看（crontab + systemd timer，可读化）
+    commands: ["crontab -l", "systemctl list-timers", "systemctl list-units --type=timer"]
+    risk: green
+    priority: P1
+    stage: T2
+    status: 已实现（只读；增删属 T3）
+
+  # ↓ T3（2026-09-25）：原来的单一入口 svc.control 拆成 5 个动作。
+  #   拆分的理由（不是洁癖）：**风险分级是动作级静态字段**，而"启动"与"停止"的风险
+  #   差着一个数量级（停止不可 undo），自证期望也相反（is-active 期望 0 / 3）。
+  #   合成一个动作就只能取最保守的分级与最弱的自证 —— 那才是真正的偷懒。
+  - id: svc.start
+    domain: E
+    label: 启动服务（自证 ActiveState=active）
+    commands: ["systemctl start", "systemctl is-active", "systemctl show -p ActiveEnterTimestamp"]
+    risk: yellow
+    priority: P0
+    stage: T3
+    status: 已实现（T3 · 2026-09-25，真跑验证：aoc-lab.service）
+
+  - id: svc.stop
+    domain: E
+    label: 停止服务（red：不可 undo，须手输确认词）
+    commands: ["systemctl stop", "systemctl is-active"]
+    risk: red
+    priority: P0
+    stage: T3
+    status: 已实现（T3 · 真跑 + 正面/反面确认词验证）
+
+  - id: svc.restart
+    domain: E
+    label: 重启服务（用启停时间戳自证"真的重启了"）
+    commands: ["systemctl restart", "systemctl is-active", "systemctl show -p ActiveEnterTimestamp"]
+    risk: yellow
+    priority: P0
+    stage: T3
+    status: 已实现（T3 · 真跑验证：PID 与时间戳均变化）
+
+  - id: svc.enable
+    domain: E
+    label: 设置服务开机自启
+    commands: ["systemctl enable", "systemctl is-enabled", "systemctl show -p UnitFileState"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（T3 · 装载校验通过；真跑留待与 enable/disable 配对演练）
+
+  - id: svc.disable
+    domain: E
+    label: 取消服务开机自启
+    commands: ["systemctl disable", "systemctl is-enabled"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（T3 · 退出码期望与 enable 相反：is-enabled 只接受 1）
+
+  - id: cron.upsert
+    domain: E
+    label: 新增/更新定时任务（只写 /etc/cron.d/aoc-*，不碰 crontab）
+    commands: ["写 /etc/cron.d/aoc-<名字>", "cat 读回"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（T3 · 真跑验证 + 触发改动前自动备份）
+
+  - id: cron.remove
+    domain: E
+    label: 删除定时任务（参数白名单锁死在被管理文件上）
+    commands: ["rm -f /etc/cron.d/aoc-<名字>", "ls 确认已消失"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（T3 · 真跑验证：备份 → 删除 → 恢复演练闭环）
+
+  # ================= 域 F · 网络 =================
+  - id: net.addr
+    domain: F
+    label: 网卡与地址总览
+    commands: ["ip -j addr", "ip -j route show default", "nmcli device show"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现
+
+  - id: net.route
+    domain: F
+    label: 路由表与邻居（ARP）表
+    commands: ["ip -j route", "ip -j neigh", "ip -j rule"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现
+
+  - id: net.dns
+    domain: F
+    label: DNS 解析链路诊断
+    commands: ["cat /etc/resolv.conf", "getent hosts", "getent ahosts"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现 —— RHEL 10 无 dig/nslookup，改走 glibc 解析链路（getent）
+
+  - id: net.ping
+    domain: F
+    label: 连通性与路径诊断
+    commands: ["ping -c -W", "traceroute -n"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现 —— traceroute 缺失时给 TOOL_MISSING（原因 + 安装建议）
+
+  - id: net.port
+    domain: F
+    label: 端口占用查询（端口 → 进程 → 归属服务）
+    commands: ["ss -H -tulnp", "ps -o unit= -p"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现（foreach 反查归属 systemd 单元）
+
+  - id: net.http
+    domain: F
+    label: HTTP 探测（响应码 / 耗时 / TLS）
+    commands: ["curl -w", "curl -I"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现
+
+  - id: net.firewall
+    domain: F
+    label: 防火墙规则查看
+    commands: ["firewall-cmd --list-all", "firewall-cmd --permanent --list-all"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现 —— 特意对比"运行时 vs 持久化"，暴露"改了没 --permanent"
+
+  # ================= 域 G · 安全面 =================
+  - id: sec.selinux
+    domain: G
+    label: SELinux 状态
+    commands: ["getenforce", "sestatus", "cat /etc/selinux/config"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现（三重交叉验证，暴露"改了没生效"）
+
+  - id: sec.avc
+    domain: G
+    label: 近期 AVC 拒绝记录
+    commands: ["ausearch -m avc -ts --input"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现 —— 需显式 --input + 传输层关 stdin，见规范 v1.1 §8.5
+
+  - id: sec.cert
+    domain: G
+    label: 证书到期检查
+    commands: ["openssl x509 -enddate", "openssl x509 -checkend"]
+    risk: green
+    priority: P1
+    stage: T2
+    status: 已实现（用 -checkend 让 openssl 自己判 30 天 / 7 天）
+
+  - id: sec.ssh-harden
+    domain: G
+    label: SSH 加固与密钥管理查看
+    commands: ["sshd -T", "ls authorized_keys", "ssh-keygen -l -f"]
+    risk: green
+    priority: P1
+    stage: T3
+    status: 已实现（T7·S7）：★ 判加固取**最终生效值**（`sshd -T` = OpenSSH 默认值 + `Include` 进来的文件合并后的结果），不是"配置文件里写没写"—— 与规范 §12.13.5「找服务自己留的钩子」同一个道理，只是这次站在**只读侧**：判"生效了什么"要用服务自己的入口，别去猜它读了哪些文件。★ 为它的输出（**指令名 值**，空格分隔）新增解析器 **`space_kv`**（规范 §12.23）—— §5 的三条判定同时成立才加的。★ 公钥只给**数量 + 指纹 + 注释**，**不打印公钥本身**；权限也看（`600` + root 是期望值）。★★ **真跑核到一条环境事实**：RHEL 10 的 `sshd -T`（104 行）**不打印 `challengeresponseauthentication`**（已是 `kbdinteractiveauthentication` 的别名）⇒ 本动作**不再取它**（取一个永远取不到的键只会多一个假「（无）」）。真跑：node-03 与 docker-01 两台一致 —— `PermitRootLogin=yes` / `PasswordAuthentication=yes` / `X11Forwarding=yes` / `MaxAuthTries=6` / `LoginGraceTime=120` / **`ClientAliveInterval=0`（没开保活）**；root 授权公钥 **2 把**，其中 `SHA256:qJoghe9Y80S19NtbuVAoa0eskzNXBiCwGNJB4N6Xbp4` 与 `hosts.yaml` 里记的纳管公钥指纹**逐字相同**（= 这套动作能验"钥匙是不是当时那把"）
+
+  # ================= 域 H · 包管理 =================
+  - id: pkg.installed
+    domain: H
+    label: 已装软件与文件归属
+    commands: ["rpm -qa", "rpm -qi", "rpm -qf", "rpm -ql"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现
+
+  - id: pkg.search
+    domain: H
+    label: 包搜索 / 哪个包提供这个命令
+    commands: ["dnf search", "dnf provides", "rpm -q"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现（含"常用诊断工具装了没"的盘点）
+
+  # ================= 域 I · 性能与排障 =================
+  - id: kernel.log
+    domain: I
+    label: 内核日志与 OOM 检索
+    commands: ["dmesg -T --level", "journalctl -k -g oom", "journalctl -p err -b"]
+    risk: green
+    priority: P0
+    stage: T2
+    status: 已实现
+
+  - id: perf.overview
+    domain: I
+    label: 负载与资源概览（CPU/内存/IO/负载 一屏）
+    commands: ["uptime", "vmstat", "mpstat", "pidstat"]
+    risk: green
+    priority: P0
+    stage: T3
+    status: 未做 —— T2 缓冲项（开题单 §2.3），顺延
+
+  # ================= 域 J · 容器基础 =================
+  - id: container.overview
+    domain: J
+    label: 容器/镜像/卷/网络总览（docker/podman）
+    commands: ["docker ps", "podman ps", "images", "volume ls"]
+    risk: green
+    priority: P1
+    stage: T6
+    status: 已具备（T6 · 真机跑过）· ★ 拍板原文是"只做**查看现状**、不加配方，用 docker-01 做只读观察对象"（开题单 §10.2 #3）—— 本动作就是那个"查看现状"：引擎版本 + 容器（含已停止）+ 镜像 + 卷 + 网络一屏给全。两个引擎同一个动作（`run_by` 选段：`docker …` / `podman …`）。★ 没有引擎时**预检不通过、明确说清**，不硬造"ok 但内容为空"（§10.6.3「空结果 ≠ 空数据」）
+
+  # ================= 域 K · 批量与自动化 =================
+  # ★ T3 说明：批量执行**不是"一个动作"**，而是平台能力 —— 所以不登记在这里占覆盖率分母，
+  #   改登记在文件末尾的 platform: 段（id: batch-exec）。同一个理由适用于域 L 的备份/恢复。
+
+  # ================= 域 L · 备份与恢复 =================
+  # ★ T3 说明：改动前自动备份与备份恢复同样是平台能力，见 platform: 段的
+  #   file-backup-before-change / backup-restore。
+
+  # ★ T4 修正：原登记 id 是裸 `checkup`（domain L），而规范 §1 要求 id 形如 `域.动作名` ——
+  #   按原名永远无法被实现（文件名不可能同时等于 id 又合规）。T4 正名为 host.checkup，
+  #   归入域 A（体检回答的是"这台机器现在好不好"，属系统与主机）。
+  - id: host.checkup
+    domain: A
+    label: 一键体检（把只读项打包成结论式报告）
+    commands: ["（编排上面若干只读动作）"]
+    risk: green
+    priority: P0
+    stage: T4
+    status: 已实现（T4 · 采集走 catalog/actions/host.checkup.yaml，判定走 app/checkup.py，规范 §10.2）
+
+  # ================= T3 新增：变更类动作（2026-09-25） =================
+  - id: fw.port-open
+    domain: F
+    label: 防火墙放行端口（永久/仅运行时，自证 runtime 生效）
+    commands: ["firewall-cmd --add-port", "firewall-cmd --query-port", "firewall-cmd --reload"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（装载校验通过）。★ 真机验证受限：本工作台 4 台靶机的 firewalld 均为 inactive，已在预检给出可操作建议（252 → SERVICE_NOT_RUNNING）；"真放行"验证需要一台 firewalld 运行中的机器
+
+  - id: fw.port-close
+    domain: F
+    label: 防火墙撤销端口放行（自证 query 返回 1）
+    commands: ["firewall-cmd --remove-port", "firewall-cmd --query-port"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（装载校验通过）；真机验证受 firewalld 未运行限制，同上
+
+  - id: pkg.install
+    domain: H
+    label: 安装软件包（装完 rpm -q 自证，并给出可回退的事务号）
+    commands: ["dnf install -y", "rpm -q", "dnf history"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（装载校验通过；单步 timeout 放宽到 300s —— dnf 是最慢的一类动作）
+
+  - id: pkg.update
+    domain: H
+    label: 更新指定软件包（刻意不做全量更新）
+    commands: ["dnf update -y", "rpm -q", "dnf history"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（只更新指定包；全量 dnf update 刻意不提供 —— 那等于一次性释放所有风险）
+
+  - id: pkg.remove
+    domain: H
+    label: 卸载软件包（red：先列出依赖它的包，再动手）
+    commands: ["rpm -q --whatrequires", "dnf remove -y", "rpm -q"]
+    risk: red
+    priority: P1
+    stage: T3
+    status: 已实现（装载校验通过）
+
+  - id: file.push
+    domain: C
+    label: 上传文件到目标机（覆盖前自动备份 + sha256 双向校验）
+    commands: ["scp 上传", "sha256sum", "stat"]
+    risk: yellow
+    priority: P1
+    stage: T3
+    status: 已实现（真跑验证：覆盖靶子配置，自动备份 115B 旧文件，上传后管理机/目标机指纹双向一致）
+
+  - id: file.pull
+    domain: C
+    label: 从目标机取回文件（取证 / 对比 / 留档）
+    commands: ["stat", "scp 下载"]
+    risk: green
+    priority: P1
+    stage: T3
+    status: 已实现（装载校验通过）
+
+  # ================= T5 新增：配方引擎缺的那两只手（2026-09-25） =================
+  # ★ 它们不是覆盖率地图原本登记过的条目 —— 是 T5 做配方时发现**真的缺**的能力：
+  #   开题单 §3.6 先立项 → 规范 §12.8 补约定 → 最后才写 YAML（先规范后代码）。
+  - id: svc.configtest
+    domain: E
+    label: 配置语法校验（nginx -t / sshd -t，只校验、不改状态）
+    commands: ["/usr/sbin/<binary> -t"]
+    risk: green
+    priority: P1
+    stage: T5
+    status: 已实现（T5 · 真机真跑正反例）：装着好配置 → 通过；被 file.push 写坏 → 判失败并带上远端原文（unknown directive …）；机器上没这个程序 → 预检拦下、给"先确认这个服务装没装"的建议。★ 命令是**枚举**（只允许 nginx / sshd），不接受任意命令 —— 安全契约 §4 的落点
+
+  - id: file.remove
+    domain: C
+    label: 受限删除（路径白名单 · red · 禁止批量）
+    commands: ["ls -ld（确认存在）", "du -sh", "rm -rf", "ls -ld（退出码 2 自证已删）"]
+    risk: red
+    priority: P1
+    stage: T5
+    status: 已实现（T5 · 真机真跑 + 10 条越界负例）：配方「卸载·全删」缺的那只手。四道锁：① red（手输确认词）② 路径白名单（只允许 /etc|/var/lib|/var/log|/opt|/var/www 下的 <名>，且每段不得以点开头 → `/`、`/etc`、任何位置的 `..` 在**参数校验阶段**就被拒）③ 禁止批量 ④ 改动前自动备份。负例见 证据\T5-file.remove越界负例-*.md
+
+  # ================= T6 新增：`responds` 判据的三个探活动作（2026-09-26） =================
+  # ★ 它们不是覆盖率地图原本登记过的条目 —— 是 T6 做服务铺量时发现**真的缺**的能力：
+  #   开题单 §3.3 先立项 → 规范 v1.7 §12.11 补约定（"命令类判据"）→ 最后才写 YAML（先规范后代码）。
+  #   验收口径：≥2 个服务能"真问一句它活着吗"，而不是只看"单元在跑 / 端口在听"那种旁证。
+  #   ★ 三个都是 green（只读）：`changed` 恒 false（规范 §12.3），不参与幂等验收的"变更"一侧。
+  - id: db.mariadb-ping
+    domain: E
+    label: MariaDB 探活（真问一句它活着吗：mariadb-admin ping）
+    commands: ["mariadb-admin ping（本机 socket + unix_socket 认证，不需要密码）"]
+    risk: green
+    priority: P1
+    stage: T6
+    status: 已实现（T6·S1）：`expect.responds` 的采集来源之一（规范 §12.11.3）。★ 命令形态以**真机实测**为准（T6·S2 确认；走 TCP 会撞"root 不许无密码远程登录"，那是认证问题、不是服务问题）
+
+  - id: db.valkey-ping
+    domain: E
+    label: Valkey 探活（真问一句它活着吗：valkey-cli PING → PONG）
+    commands: ["valkey-cli -h 127.0.0.1 -p <port> PING"]
+    risk: green
+    priority: P1
+    stage: T6
+    status: 已实现（T6·S1）：★ Rocky/RHEL 10 是 Valkey 取代 Redis，实测**没有** `redis-cli` 兼容名（写错就是 rc=127）。命令与端口以真机实测为准（T6·S3 确认）
+
+  - id: nfs.export-check
+    domain: F
+    label: NFS 导出清单（问本机 mountd：导出到底生效了没有）
+    commands: ["showmount -e 127.0.0.1"]
+    risk: green
+    priority: P1
+    stage: T6
+    status: 已实现（T6·S1）：判"写了 /etc/exports.d 但没生效"这一类假成功。★ 空输出（什么都没导出）→ 动作 verify 判红 → 期望判 fail（服务在跑但没导出，本来就不该算健康）
+
+  # ================= T7 新增：升级与回退缺的三只眼睛/手（2026-09-26） =================
+  # ★ 同样不是覆盖率地图原本登记过的条目 —— 是 T7 做「服务治理」时发现**真的缺**的能力：
+  #   开题单 §3.2 / §3.3 / §3.7 先立项 → 规范 v1.8 §12.15 / §12.16 补约定 → 最后才写 YAML。
+  - id: pkg.outdated
+    domain: H
+    label: 可升级清单（升级预检：哪些包装了版本可升）
+    commands: ["dnf repolist", "dnf check-update"]
+    risk: green
+    priority: P1
+    stage: T7
+    status: 已实现（T7·S1 · 真跑三台）：★★ **退出码语义是本条目的核心** —— `dnf check-update` 的 **100 = 有更新、0 = 无更新**，★ **100 不是失败**（与 `pkg.search` 里 `rpm -q` 的"rc = 缺几个包"同族）：**命令的退出码不是错误码，是它的一句话结论**（规范 §12.15.2）。★ **源不可达 ⇒ 判"无法判定"，绝不判"没有可升级的"**：docker-01 的 BaseOS 源失效（指向已不存在的 ISO）**当场成为这条规矩的反例**（如实失败 + 否定横幅）；node-02/node02 实测有大量可升级包（kernel 6.12.0-211.58.1 / docker-ce 3:29.8.1 / kubeadm·kubectl·kubelet 1.34.12 等）
+
+  - id: pkg.rollback
+    domain: H
+    label: 按事务号回退软件包变更（把"承诺的回退"变成能执行的动作）
+    commands: ["dnf history", "rpm -q", "dnf history undo <事务号>"]
+    risk: red
+    priority: P1
+    stage: T7
+    status: 已实现（T7·S1）：★★ **它补的是一笔欠账**：`pkg.install` / `pkg.update` / `pkg.remove` 的结论模板一直在承诺"回退：`dnf history undo <事务号>`"，**而全库 48 个动作里没有任何一个能做它** ⇒ 我们承诺了一条"得让人自己 ssh 上去敲"的回退路径（检查清单 47 同族：**承诺兑现不了比不承诺更坏**）。规矩：**列事务（只读）→ 回退 → 自证**；事务号必须来自"先看历史"那一步、**不许凭记忆填**；★ **自证是"版本回到变更前"（rpm -q 逐字对照），不是"命令返回 0"**；🔴 手输确认词 + 禁止批量（规范 §12.15.3）
+
+  - id: file.stat
+    domain: C
+    label: 路径状态（它在不在：ls -ld，退出码 2 = 不存在）
+    commands: ["ls -ld（0=在 / 2=不在）", "du -sh"]
+    risk: green
+    priority: P1
+    stage: T7
+    status: 已实现（T7·S1）：★ 补的是**全删收敛检查的路径那一半**（规范 §12.16 规矩 3）—— 在此之前没有任何只读动作能回答"这个目录还在不在"，于是"配置/数据目录真的删掉了吗"只能看删除命令是否返回 0（**假绿**）。它同时是 `expect.absent` 的存在性来源之一（`PRESENCE_SOURCES`），**参数白名单与 `file.remove` 逐字相同**：删得掉的路径一定查得着，收敛检查没有盲区。★ 与 `pkg.outdated` 同一个坑：**rc=2 是结论不是错误**（`ok_exit_codes=[0,2]`）
+
+# ------------------------------------------------------------------ 非动作能力
+#
+# 与 demos: 同一个思路：**不是"一个动作"的能力**单独登记，避免污染覆盖率分母。
+platform:
+  # ★ T4 新增字段 done（显式布尔，规范 §10.3.4）：
+  #   entries 段的完成度由"动作文件是否存在"自动判定；platform 段没有动作文件可比，
+  #   所以必须给一个**结构化**字段 —— 不能靠中文 status 文本里有没有"已具备"来匹配（那太脆）。
+  - id: task-replay
+    label: 执行历史与回放（每条命令原文 / 输出 / 退出码可查可复现）
+    since: T1
+    done: true
+    status: 已具备（平台能力，不是动作）—— 见界面「历史」页与 var/ops.db
+
+  - id: file-backup-before-change
+    label: 关键文件"改动前自动备份"（目标机 + 管理机双份，含 sha256）
+    since: T3
+    done: true
+    risk: yellow
+    status: 已具备（T3 · 真跑验证）：动作声明 backup 段 → 引擎在**任何变更步骤之前**备份；备份失败即中止动作；两侧落点 /var/backups/aoc/<任务ID>/ 与 repo/var/backups/<任务ID>/ —— 见 docs/动作规范.md §9.1
+
+  - id: backup-restore
+    label: 备份恢复（一键回到变更前，恢复后逐字节自证）
+    since: T3
+    done: true
+    risk: red
+    status: 已具备（T3 · 恢复演练通过）：需手输确认词「确认恢复」；恢复后 sha256 与备份逐字节比对 —— 规范 §9.2。★ 明确**不做自动回滚**：自动还原可能把"其实没坏"的现场也覆盖掉
+
+  - id: batch-exec
+    label: 多机批量执行 + 横向对比（失败隔离）
+    since: T3
+    done: true
+    risk: yellow
+    status: 已具备（T3 · 真跑验证）：4 台同参数 4/4 成功；制造差异后 3 成功 + 1 中止（失败隔离成立）；**red 动作禁止批量**是硬规矩（不提供配置开关）；横向对比按"任务状态 + 自证结果"判定 —— 规范 §9.3
+
+  - id: host-enroll
+    label: 主机纳管（填 IP/账号 → 自动铺公钥、验证、登记、体检）
+    since: T4
+    done: true
+    risk: yellow
+    status: 已具备（T4 · 正反例都真跑过）：★ 由用户在 T3 期间提出的真实痛点（原话："以后为了用你这个平台工具，还要自己去改公钥，不是本末倒置吗"）。T4 走零依赖路径 A（一次性内网分发点：绑管理机内网 IP + 随机路径 + 一次性 token + 用完即停 + 120s 兜底），6 步全过 —— 预检 / 发公钥 / **真登录校验**（hostname=docker-01）/ 关停分发点 / 写 hosts.yaml（写前备份）/ 自动体检 4281ms，规范 §10.1；反例（坏公钥）4 秒即判失败且 hosts.yaml 逐字节未变。★ 诚实标注：消灭的是"改公钥"，还没消灭"去控制台粘一条"
+
+  - id: report-export
+    label: 结果可导出（任务报告 txt / md）
+    since: T2
+    done: true
+    status: 已具备 —— T2 验收 #4；界面「导出（.txt）/ 复制为 Markdown」，归档到 var/artifacts/exports/
+
+  - id: recipe-engine
+    label: 配方引擎 + 服务目录（填 5~8 个参数 → 一次点击跑完一件事；幂等可断言；可卸载）
+    since: T5
+    done: true
+    risk: yellow
+    status: 已具备（T5 · 真机与界面都跑过）：配方 = 磁盘上的 YAML（catalog/recipes/*.yaml）+ 模板（catalog/templates/），★ **加一个服务只写 YAML、不改 app 代码**（验收 #8 用假配方验过：装载 / 计划 / 执行全通）。三条宪法落地点：① 只声明"要什么"（expect 白名单），判定一律走平台 —— 配方里没有一处命令/表达式；② 平台统一采集 changed → 变更清单 → **幂等验收 = 第二次该清单为空**（实跑：改参数 → 变了 3 项；原样再跑 → **0 项**，且受管文件 sha256 前后一致、条件步骤未被唤起）；③ 每个正向操作都有反向操作（停止 / 保留数据 / 全删，三个按钮都真跑过，闸门强度按模式取）。模板走 {{ }} 纯替换 + sha256 相同不写盘（不引 Jinja2）；覆盖既有文件前自动备份并登记检查点（失败报告里可一键恢复，恢复后逐字节自证）。规范 §12
+
+  # ================= T6 新增：配方本身也入账（每个配方一条） =================
+  # ★ 口径（T6 定，规范 §12.1）：配方**不是动作**（放不进 entries），但按 map.yaml 自己的登记口径，
+  #   它属于"不是动作的能力" → **platform: 段每个配方单独一条**，权重 = platform 基准 4（不再 +1）。
+  # ★ T5 的账在这一步补上：T5 交付 nginx 配方时只登记了 recipe-engine（引擎能力），
+  #   **漏了配方本身的入账** —— 与 T4 漏 platform.done、T5 两次漏 weights 是同一条纪律的第 4 次现形。
+  - id: recipe-nginx
+    label: 服务配方 · Nginx（一键部署 + 配置校验 + HTTP 健康检查 + 幂等 + 可卸载）
+    since: T5
+    done: true
+    risk: yellow
+    status: 已具备（T5 · 真机与界面都跑过）· ★ **本条目是 T6 补的账**：nginx.yaml 全篇只有 expect；实跑"改参数→变 3 项 / 原样再跑→0 项"；三个反向按钮与检查点恢复都真跑过（含 T5 收尾抓到的 5 个真缺陷）
+
+  - id: recipe-mariadb
+    label: 服务配方 · MariaDB（代 MySQL：装 server+client + 配置校验 + 真探活 + 幂等 + 可卸载）
+    since: T6
+    done: true
+    risk: yellow
+    status: 已具备（T6·S2 · 真机端到端）：★ 名字必须是 mariadb —— Rocky/RHEL 10 里**没有 mysql-server 包**。部署 37.7s / 变更 5 项；**第二次跑 changed = []**、条件步骤未被唤起；健康检查三层（state active + `responds`(mariadb-admin ping→`mysqld is alive`) + **`port_open`**）；`svc.configtest` 的 mariadbd 预设**正反例都真跑过**（写坏配置 rc=7 判红）；本配方**故意不写 preflight**（Rocky 10 上没有像 httpd 那样的天然冲突项，宁可不写也不写假闸门）
+
+  - id: recipe-valkey
+    label: 服务配方 · Valkey（代 Redis：站点定制 + 真探活 + 幂等 + 可卸载）
+    since: T6
+    done: true
+    risk: yellow
+    status: 已具备（T6·S3 · 真机端到端）· ★ **"第二个服务"这一问的答案**：加它时**引擎零改动**（只写 YAML + 模板），清单站得住。名字必须是 valkey —— Rocky/RHEL 10 里**没有 redis 包**、且只有 `valkey-*` 命令名（没有 `redis-*` 兼容名）。配置写在 `/etc/sysconfig/valkey`（**单元自己留的钩子** `EnvironmentFile=-…` + `$OPTIONS`）：包**没有** drop-in 目录，而写包自带的 `valkey.conf` 会让 `remove_config` 复原不了。★ 负例真跑：把 OPTIONS 写坏 → `valkey-server` **真的起不来**（`svc.restart` 判 failed、探针 3/3 判红）⇒ 这条配置写法**可被证伪**。健康检查 = state active + `responds`(valkey-cli PING→**全等** `PONG`) + `port_open`；第二次跑 changed = []；三个反向按钮真跑（全删：删 `/etc/sysconfig/valkey` + `/var/lib/valkey`、卸包、**收敛检查通过**）
+
+  - id: recipe-nfs
+    label: 服务配方 · NFS 服务端（独立导出文件 + 真导出检查 + 幂等 + 可卸载）
+    since: T6
+    done: true
+    risk: yellow
+    status: 已具备（T6·S4 · 真机端到端）· ★ **"第三个服务"这一问的答案**：同样**引擎零改动**。它是本话题**唯一"非 systemd 生效"的真用例** —— ★ 靠的是单元自己的 `ExecStartPre=-/usr/sbin/exportfs -r` ⇒ **`svc.restart nfs-server` 就等于"让导出生效"，不新增动作**（规范 §12.12 实测确认）。导出写独立文件 `/etc/exports.d/aoc-<名>.exports`（与系统自带的 `/etc/exports` 并列被读，**不动别人那条**）；导出点 `/opt/aoc-nfs/<名>`（`file.remove` 白名单内 ⇒ 全删删得掉）。健康检查 = state active + `responds`(showmount -e 127.0.0.1，`first_field` **按字段全等**我们的导出点) + **三个端口整组**（2049/20048/111，实测坐实）；第二次跑 changed = []；负例真跑：停掉服务 → 探针 4 项判红（111 属 rpcbind，正确地仍通过）；三个反向按钮真跑（全删：删导出配置 + 导出目录、卸 nfs-utils、收敛检查通过）
+
+  # ================= T7 新增：平台能力（2026-09-26） =================
+  - id: recipe-hot-reload
+    label: 配方热装载（改完磁盘上的 YAML 就生效，不用重启控制台）
+    since: T7
+    done: true
+    risk: green
+    status: 已具备（T7·S1）：`POST /api/recipes/reload` + 服务目录里的「重新装载配方」入口。★ 它拆的是"用户自己写配方"（`设计\02` 坑 #10）上最大的一道坎 —— 原先改一行 YAML 要**重启控制台**。四条规矩（规范 §12.17）：① **不合规就不装载**（走与启动时**同一套**装载期校验，重载**不是绕过宪法 1 的后门**）；② **不影响已装载的**（整体替换；★ 刻意**不保留**某份配方上次装载的旧版本 —— 磁盘上那份已经不合法了、界面上还挂着一个能跑的旧版，用户会以为在部署刚改过的东西，那是**比报错更坏的假绿**）；③ **不打断正在执行的**（一次执行在开始时就把自己那份定义拿在手里，重载只影响之后的新执行）；④ ★ **不许静默少装载**（装载报告随 `GET /api/recipes` 一起给出去：装了几份 / 哪几份没装 / 为什么；启动横幅也打印）。★ 启动行为随之变更：**一份坏配方不再让整个控制台起不来**（否则用户连看错误的界面都没有），但 `--check` 与自检断言仍然会红
+
+  - id: recipe-batch
+    label: 配方批量（同一配方 + 同一参数铺到 N 台：每台独立执行 · 失败隔离 · 红档禁止）
+    since: T7
+    done: true
+    risk: yellow
+    status: 已具备（T7·S6）：`POST /api/recipes/<id>/batch-plan`（**只读**预检）/`batch-run` + 服务目录里的「批量执行（多选机器）」入口。★ **三层闸门、一层都不省**（规范 §12.18 / §12.22）：`red` **直接拒**（`BATCH_FORBIDDEN`，**不提供开关** —— 沿 T3 硬规矩）· `yellow` 要二次确认 · 「停止 / 全删」照样要**手输确认词**（服务端逐字校验）；三层都在**铺出去之前**判 ⇒ 被拒时**一台都没跑**。★★ **失败隔离**：一台出问题（连不上 / 参数被拒 / 执行失败 / 健康不过）**只记在它自己那一行**，循环继续；★ 失败台**没有执行号就写 `None`**（不许编一个来"看起来整齐"）。★★ **留证单元 = 每台那一次配方执行**（步骤 / 健康检查 / 检查点永久可回放、**可单独回退到它自己那次部署前**）⇒ 本批**不落地批次快照**（再存一层就是**两份真相**，§12.20 同源理由），这条边界**接口与界面都明说**。★ **横向对照**按「**执行状态 + 收敛检查结果**」判 —— ★ "跑完了" ≠ "事情成了"，而**变更步数不算差异**（两台初始现状不同时它天生不同；多机治理不在本话题），返回结构与 `engine.batch_diff` **刻意同形**。★ 界面上 red 配方的批量按钮**直接禁用**并说明为什么，服务端再拦一道
+
+  # ================= ★ T8 新增：集群引导（2026-09-26 · S6+S7）=================
+  # ★ 口径（T8·S9）：**七个新动作 + 幂等守卫 + 清单应用**是本话题交付的**一类能力**
+  #   （它们互相依赖、单独一只都建不出集群）⇒ 在 platform 段记 **1 条**，
+  #   两份配方各记 1 条（与 T6 的"每个配方单独一条"同口径）。
+  - id: k8s-bootstrap
+    label: K8s 集群引导（七只手：reset / init / kubeconfig / join / nodes / apply / wait + ★★ 幂等守卫）
+    since: T8
+    done: true
+    risk: red
+    status: 已具备（T8·S6+S7 · **真机端到端 + 正反例都跑过**）· ★★ **本项目第一次把手伸到"改错了会锁住自己"的地方**（内核参数 / 容器运行时 / 集群引导），所以三条口径是本条目的本体：① ★★ **引导类的"成功"必须是终态**（规范 §12.32.2）—— `kubeadm init` 失败会**留下半个集群**，判据一律换成**退出码 / 条数**（清单条数 · `cmp` · `/livez` · `wait --for=condition=Ready`），**没有一条**是"命令返回 0"；实测：`kubeadm init` 后 `kubectl get --raw /livez` 为 0、三节点 `kubectl wait --for=condition=Ready nodes --all` 为 0。② ★★ **幂等守卫（§12.33）**："预检**不成立** = **已达终态**" —— 一次性引导动作的预检问的正是"目标是不是还没做成"，第二次跑必然不成立；按老规矩它会**中止整条配方** ⇒「再点一次」永远做不到。★★ 守卫**挂在步骤上、不挂在动作上**（一个动作的多条预检语义不同：「有没有旧集群」可以是终态判据，「`kubeadm` 在不在」**永远不是**），三条装载期硬校验 + 报告里念出理由。实测：控制面与工作节点**两侧**复跑都判「跳过」、`changed` 为空、`RESTARTS` 不增。③ ★★ **"是不是我们建的"必须有一个落点**（§12.32.4）—— `kubeadm reset` 不可逆，放进"一键"里就必须能自动回答"这个集群该不该被拆"，而那不是能靠观测回答的问题（**旧集群在本话题开工时是活着的、Ready 的**）；判据是**所有权标记** `/etc/kubernetes/aoc-owned.json`（init/join 成功后写、reset 会一起删掉）。★ 代价如实写：不是我们建的**活**集群会被当成"旧集群"拆掉 ⇒ 它保持 `red` + **禁止批量**。★★ 另抓到并修掉**两条真缺陷**：`ok_exit_codes` 因判定里带了"0 永远算成功"而**表达不了"这条命令必须失败"**（六个老动作一直在**假绿**，规范 §12.36）；大文件走内联命令行撞 Windows `CreateProcess` 上限（238KB 的 Calico 清单 ⇒ `WinError 206`，规范 §12.35 改走 scp + 原子 `mv`）
+
+  - id: recipe-k8s-init
+    label: 服务配方 · K8s 控制面（一键：拆旧 → init → CNI → 存储类 → 节点 Ready）
+    since: T8
+    done: true
+    risk: red
+    status: 已具备（T8·S6+S7 · 真机端到端）· ★★ **"一键到 Ready"的真实形态**：本平台**配方只在一台机器上执行**，而"一个集群"横跨三台 ⇒ 口径修正为**两次点击**（`k8s-init` @ 控制面 ＋ `k8s-join` @ 每个工作节点，开题单 §10.2.1 修订记录 #6）。17 步：运行时 5 步 → ★ 拆旧集群（red · 手输确认词 · 有守卫）→ `kubeadm init`（显式 `--cri-socket` / endpoint 写 IPv4 / 显式 `--image-repository` / **先把镜像拉齐再动集群**）→ kubeconfig → Calico（官方 v3.25.0 原文，**唯一改动 = IPPool 网段**）→ 存储类/PV/PVC → 读写验证 Job → 等三节点 Ready。★★ **实测三次**：RUN1 中止在 `kubeconfig` 的自证上（抓到"`cmp -s` 成功时空输出 ⇒ `raw` 给 None ⇒ 假红"这条真缺陷）；RUN2 全 17 步通过（含 Calico / 存储 / Ready）；**RUN3 = 幂等复跑：`changed_steps` 为空、`unknown` 为空、`reset_old`/`init` 按守卫跳过（理由原文在报告里）、关键 Pod `RESTARTS` 前后逐项相同**。★ 存储类的判据**不是"对象建出来了"**：一个 Job 把宿主机预先写进卷里的那份**读**出来、再自己**写**一份，两样都留在宿主机上，**平台用自己的手（`file.grep` / `file.stat`）在宿主机上读它们** —— 读、写两个方向各一份证（PV/PVC `Bound` + Job `Complete` + `pod-receipt.txt` 里出现 `aoc-storage-ok` 与 PV 名 + `pod-wrote.txt` 里出现 Pod 自己的主机名）
+
+  - id: recipe-k8s-join
+    label: 服务配方 · K8s 工作节点（一键：拆旧 → 预拉 kube-proxy → join）
+    since: T8
+    done: true
+    risk: red
+    status: 已具备（T8·S6 · 真机端到端）· ★★ **它身上现形了一条只增不减的闸门**：本配方引用了 `red` 动作（拆旧集群）⇒ 装载期强制 **`risk` 取步骤内最严** ⇒ **禁止批量**（`batch-plan` 实测返回 `gate.allowed=false`，理由原文："不能把一次手误放大到 N 台，而 red 恰好是不可 undo 的那一类"）。★ 而这个后果**是对齐不是代价**：「拆掉这台机器上的旧集群」本来就是**每一台各自的决定**，两次执行各自手输确认词。★★ 它同时钉住了本话题最危险的一个错误设计：**"拆"与"建"必须在同一次配方里** —— 若把拆拿出去单独做，旧集群的 `kubelet.conf` 会让 join 判「已达终态」跳过，而三条旁证（`kubelet` active / 10250 在听 / `containerd` 应答）在**旧集群的 kubelet** 上**全都成立** ⇒ 报告说"成功"、节点却不在我们的集群里（**假绿**，规范 §12.32.7）。★ 实测：node01 / node02 各一次真跑（各 8 步、3 条健康检查全过）＋ 复跑一次（`join` 与 `reset_old` 都按守卫跳过、`changed` 为空）
+
+  # ================= ★ T9 新增：集群管理台（2026-09-27 · S2~S8）=================
+  # ★ 口径（T9·S9）：**18 个新动作（8 只读 + 9 变更 + 1 逃生口）＋ 一张界面页签**是本话题交付的
+  #   **一类能力** —— 它们合起来回答的是"**日常管这个集群**"这件事，单独一只都答不完整
+  #   ⇒ 在 platform 段记 **1 条**（与 T8 的"七只手记 1 条"、T6 的"每个配方记 1 条"同口径）。
+  - id: k8s-management
+    label: K8s 管理台（日常管理：8 只只读 ＋ 9 只变更 ＋ 只读逃生口 ＋ 界面六块）
+    since: T9
+    done: true
+    risk: yellow
+    status: 已具备（T9·S2~S8 · **41 次真跑 ＋ 界面 6 件事真走完 ＋ 6 个真缺陷全部修掉并复验**）· ★★ 本条目回答的是「**管集群**」，与 `k8s-bootstrap` 的「**建集群**」是两件事（后者一次性·red·不可 undo；前者日常·以只读为主·每个变更动作都要能回退或**明说"回不去"**）。三条口径是本体：① ★★ **管理类动作的判据一律问「被管的那一方」（规范 §12.37）** —— `kubectl` 的写命令是**声明式提交**，返回 0 只说明 API server 收下了；实测判据全部落在终态上（`rollout status` 退出码 / `readyReplicas` / `spec.unschedulable` / `get` 退出码 1 / `image` 逐字相符），★ 且用**正向白名单**代替枚举坏状态（`OOMKilled` 压根不在 `STATUS` 列）。② ★★ **逃生口只读（§12.40 / §12.43）** —— 「写命令请用对应动作」不是一句文档，而是**结构上做不到**：`verb` 是受控枚举、`flags` 参数**不存在**；实测三条写动词与夹带 `-o yaml` 全被拒，且拒绝信息尾部**带上**作者写的"请用对应的动作"（§12.47）。③ ★★ **本话题的主题是"报告不许说假话"** —— 六个真缺陷里四个是同一族：清单 YAML 脚枪（§12.46）· **"缺值"被判成"变了"（假变更，§12.48）** · **"必须失败型"步骤被非空自证（假红，§12.49 —— §12.37.2 的重犯）** · **结论里无条件的"owner 是空的"（自相矛盾，§12.49）** · **默认探针在本环境镜像上必然红（§12.50）** · **`when` 挂一半 = "仅当填了才跑"这句话是假的（假警报，§12.51）**。★ 并立了两条"数出口"的纪律：**同一个错误码的每条出口都要带上作者的话**、**同一个条件要挂满每个元素且条件必须一致**（后者第一版补丁没修对，靠**复跑**而不是 diff 挡下来 —— §12.51.1）
+
+  # ★★ T10·S9 新增 1 条（2026-09-27 · 监控告警接入 · 第四阶段·可观测）。
+  #   记账口径 = **1 条**，不是 3 条（开题单 §10.2 #3 拍板）：判据是"**用户能不能不看终端做完一件事**"——
+  #   「接入监控告警」**是一件**（从"机器上什么都没有"到"指标在采、规则在判、告警真的送得出去"）。
+  #   ★ 拆成三条（P/A/G 各一条）会让"装了一半"与"装完了"看起来一样 —— 那正是覆盖率最该防的假象。
+  - id: monitoring-stack
+    label: 监控告警接入（Prometheus + Alertmanager + Grafana + node_exporter + 通用 Webhook 收端 + 界面页签）
+    since: T10
+    done: true
+    risk: yellow
+    status: '已具备（T10·S2~S8）：**10 个 `mon.*` 动作**（7 只读判据 + 3 变更）＋ **2 份配方**（`monitoring-stack` 装机 / `monitoring-agent` 铺采集器）＋ **5 个模板目录**（`mon-prometheus` / `mon-alertmanager` / `mon-grafana` / `mon-node-exporter` / `mon-webhook`）＋ 界面「监控告警」页签。★★ **本条目回答的不是"服务起来了"，而是"我能证明它在工作"** —— 三条判据各自有出处：① **指标在采**（§12.54）= Prometheus **自己的** `/api/v1/targets` 里每条 `health=up`（配置文件、`systemctl is-active`、端口在听**三个都不算**）；② **规则在判**（§12.55）= `/api/v1/rules` 与文件**逐条对账** ＋ `for` 的**三跳状态迁移**（inactive → pending → firing，两侧各查一次），且"重载成功"的判据是 **`prometheus_config_last_reload_successful` = 1**（不是 curl 返回 200）；③ **真的送出去了**（§12.57）= **收端留证**（append-only 的 `alerts-received.jsonl`），配了 webhook 地址**不算**。★★★ 本话题最值钱的一条是 **§12.56.1「抑制必须问 Alertmanager」**：**Prometheus 的 `/api/v1/alerts` 里被抑制的那条照样是 `firing`**（抑制是**投递前**的决定）⇒ **用错 API 会得出"抑制没生效"这个错误结论** —— 这不是"哪一方更权威"，是「**两方回答的根本不是同一个问题**」；★ 并已把这条**钉进断言 🄅**（抑制类结论只许出现在问 Alertmanager 的动作里）。★ 另外三条一起交付的口径：**监听面显式收窄**（§12.53，判据读内核 `/proc/net/tcp`，`00000000` 即判红）· **T10 的"回不去"落在数据上**（§12.60：时序数据 / 收端记录 / **Grafana 手工面板** / 静默记录，逐项写清）· **保留期双上限**（§12.61：`time` 与 `size` 两个都显式设）。★ 真跑抓到 **5 个真缺陷**（§12.64），其中两个是"基础设施级"：**大文件推不了第二遍**（`file.push` 覆盖前备份撞 `backup.max_file_mb`）与 ★★ **`parser: line_count` 挂 `grep -c` ⇒ 计数恒为 1（十处同时中招，离线自检一条都没抓到）** —— 与 T9 §12.52「离线绿 ≠ 完整绿」逐字同源。'
+
+# ------------------------------------------------------------------ 虚拟化层（T16 · 六·虚拟化层）
+# ★ 为什么记 2 条而不是 10 条（10 个 vm.* 动作）：判据是"**用户能不能不看终端做完一件事**"。
+  #   → 「让一台关机的靶子机开起来、干完事、关回去」是**一件事**；
+  #   → 「变更前打快照」是**另一件事**（护栏四件套的第 4 件）。
+  # ★ 拆成 10 条会让"动作铺得多"冒充"事情做得成"（与 monitoring-stack 同一条口径）。
+  - id: vm-lifecycle
+    label: 虚拟机生命周期（列表 / 状态 / 开机 / 优雅关机 / 拔电源 / 等 guest 就绪 / 界面页签）
+    since: T16
+    done: true
+    risk: yellow
+    status: '已具备（T16·S1~S8）：**10 个 `vm.*` 动作**（`vm.list` / `vm.status` / `vm.ip` / `vm.snapshot-list` / `vm.wait-guest` 五个只读 ＋ `vm.start` / `vm.stop` / `vm.snapshot-create` 三个 yellow ＋ `vm.stop-hard` / `vm.snapshot-revert` 两个 red）＋ 界面第 **12** 个页签「虚拟机」＋ 编排配方（开机 → 等就绪 → 体检 → 可选关回）。★★ **本条目真正的交点不是"能开机"，而是三条纪律同时落地**：① ★★★ **非 ssh 执行通道**（§12.115）—— 工作台此前"一切执行都经 SSH 到 Linux"，而虚拟化层要动的是**宿主机上的 VMware 本体**（一个 Windows 进程）；通道由**动作**声明（`channel: ssh\|local`），判据只有一句"这条命令在哪台机器上跑"，★ 而"执行面"（任务里记的宿主机）与"意图面"（配方跑的那台 VM）**分开记、都如实**；② ★★ **电源的判据问被管的那一方**（§12.117）—— 三级判据（VMware 收下请求 / `vmrun list` 认为它在跑 / guest 报出 IP），★★ **「起来了」与「能 ssh 进去」是两件事**，不许合成一句"开机成功"；③ ★★★ **VM 归属闸门在平台侧**（§12.116，红线 12）—— `D:\VMs` 下 14 台里 10 台与本项目无关，"能碰的集合" = `hosts.yaml` 登记 ∪ `config.yaml` 的 `vm.extra_allow`（**当次点名，写进文件即留痕**），拒绝话术必须含「**这是保护，不是故障**」，★ 并且**不许靠"id == 目录名"的巧合**（实测 `docker-01` 的 vmx 叫 `vm-docker-01.vmx`）。★ 顺带落成两条口径：**「收条」与「判据」分开写**（§12.119：可能返回非零的那一步 `optional` ＋ 写清理由；★ 判据那一步**必须非 optional**）与 **「问不到」≠「不存在」**（§12.122：探针必须交代"我查了什么键"）。★ 真跑抓到的真缺陷：**只改 `run()` 的通道分派还不够 —— 真正执行的那一行在 `_exec_one` 内部**（表现是"连通性走本机、步骤却去 ssh 127.0.0.1 失败"）。'
+  - id: vm-snapshot-guard
+    label: 变更前打快照（护栏四件套的第 4 件：整机回滚）
+    since: T16
+    done: true
+    risk: yellow
+    status: '已具备（T16）：`vm.snapshot-create`（yellow）＋ `vm.snapshot-list`（green）＋ `vm.snapshot-revert`（🔴 **red**，手输确认词 + 禁批量）。★★ **护栏从三件套升为四件套**（§12.118）：改动前文件备份 / 一键恢复 / `red` 手输确认词 / **变更前打快照** —— 快照是**整机**粒度，与文件级备份**并列不替代**（快照回不了"只回一个文件"）。★★ **触发方式 = 显式**（2026-09-28 拍板）：界面按钮 / 配方步骤 / 人勾选，**不做**"任何变更动作前自动全域快照"（快照占盘 ＋ **会改变快照链**、影响后续回滚语义）。★ 判据**不是**"snapshot 命令返回 0"，而是**再读一次链**：这个名字真的在上面（同名是否报错由 VMware 决定 ⇒ `changed` 由"这个名字原来在不在"算出来）。★ **"回不去"要落在快照链上**：回滚之后"被丢掉的现状"没有任何快照能找回来（除非它本来就在别的快照里）—— 逐项写进结论，**空也写「无」**；★ 并且**如实说**本动作**不断言**"回滚后 guest 里是什么状态"（那要另问 guest）。'
+
+# ------------------------------------------------------------------ 覆盖率加权（T4 · 规范 §10.3）
+# 口径 B（加权）的权重表：**一处集中**，便于横向比较与对账（散在 44 个条目中间反而没人会看）。
+# 对账时 app/catalog.py::reconcile 会把权重合并回每条条目，界面上仍是"每条都有自己的 weight 与 weight_why"。
+#
+# 字段：
+#   w    —— 权重 1~5（上限 5，下限 1）
+#   src  —— 来源档：infer = 由 T1~T3 记录反推（含用户原话 / 开题单主线点名）｜fallback = 按 priority 兜底
+#   why  —— **必须写得出出处**；写不出出处的一律 fallback 档，并在页面上标「兜底」
+#
+# 定权规则（规范 §10.3.3）：
+#   基准：P0=4 / P1=3 / P2=2 / P3=1；platform: 段条目基准 = 4（已在日常使用）
+#   修正：**只有"记录里有名有姓的点名"才 +1**（上限 5）
+#   禁令：❌ 不设 −1 —— "做得不够好"进待办清单，不进权重，否则"越差越不重要"是反向激励
+#         ❌ 不衡量"当前环境跑不跑得通" —— openssl 未装不该让 sec.cert 降权
+#
+# ⚠️ 本表**全部为反推**：用户已明确给不了"平时最常干的 5~8 件事"（开题单 §10 #2），
+#    所以页面与文档上都标注「反推」，**不冒充用户原话**。
+#
+# 开工时点对账（2026-09-25 动笔前）：Σw_all = 191；缺口 5 项 Σw = 19（host.kernelparams 3 / sec.ssh-harden 3 /
+#   container.overview 3 / checkup 5 / host-enroll 5）→ 加权口径 172/191 = 90.1%（条数口径 40/44 = 90.9%）
+#
+# ★ 收尾时点对账（2026-09-25 T4 收尾）：Σw_all 仍 = 191（分母只有"新增/删除登记项"才会变）
+#   缺口从 5 项收到 3 项（host.checkup 与 host-enroll 已交付）→ Σw_missing = 9
+#   → 加权口径 **182/191 = 95.3%**（条数口径 41/44 = 93.2%）；platform 段 6/6
+#   ⚠️ 这个数字是**从账本算出来的**，不是写死在这里的 —— 本注释只作人读的历史对照，
+#      真正的口径由 app/catalog.py::reconcile 实时计算，页面上显示的就是它。
+#   ★ 收尾时抓到一处真错并已修正：host-enroll 交付后 done 还停在 false，
+#      导致页面少算 5 分权重（177/191 冒充 182/191）——"数字经得起追问"这条主线，
+#      靠的正是"交付即回填账本"这个动作，漏一次就自相矛盾。
+#
+# ★ 收尾时点对账（2026-09-25 T5 收尾，**实测值**）：T5 新增两个动作 + 一条平台能力入账
+#   → Σw_all = 191 + 3（svc.configtest）+ 3（file.remove）+ 5（recipe-engine）= 202
+#   → Σw_done = 193（缺口仍是那 3 项 Σw = 9）→ 加权口径 **193/202 = 95.5%**
+#   → 条数口径 **43/46 = 93.5%**（P0 28/28 = 100%）；platform 段 **7/7**；兜底权重 0 条
+#   ★ T5 又撞上同一条坑的**变体**，而且被看门狗抓了个正着：
+#     ① 新增两个动作时，只写 entries 忘记写 weights → 它们被就地兜底；
+#     ② 新增平台能力 recipe-engine 时也一样 → 被记进 `implicit_weight_ids`。
+#     reconcile 的兜底**不是"自动帮我搞定"，而是"标出来让你去补"**（自检会红）。
+#     T4 漏的是 platform.done，T5 两次漏的都是 weights —— 同一条纪律，换个字段照样会犯。
+#
+# ★ 进行中时点对账（2026-09-26 T6·S1 交付三个探活动作，**实测值**）：
+#   → Σw_all = 202 + 3×3（db.mariadb-ping / db.valkey-ping / nfs.export-check）= 211
+#   → Σw_done = 193 + 9 = 202（缺口仍是那 3 项 Σw = 9）
+#   → 加权口径 **202/211 = 95.7%**；条数口径 **46/49 = 93.9%**；platform 段 7/7；兜底权重 0 条
+#   ⚠️ 本行是**进行中**的快照：S2~S4 还要入账三个配方（platform 段）与可能的新动作，S7 定稿。
+#      这也是"收工前必须重算"的原因 —— 数字是从账本算出来的，注释只是人读的历史对照。
+#
+# ★ 进行中时点对账（2026-09-26 T6·S2，**实测值**）：
+#   → 新入账：recipe-nginx（★ 补 T5 漏掉的那笔）+ recipe-mariadb，各 w = 4（platform 基准，不 +1）
+#   → Σw_all = 211 + 8 = 219；Σw_done = 202 + 8 = 210（缺口仍是那 3 项 Σw = 9）
+#   → 加权口径 **210/219 = 95.9%**；条数口径 **46/49 = 93.9%**；platform 段 **9/9**；兜底权重 0 条
+#   ⚠️ 仍是进行中：S3 / S4 还要入账 valkey / nfs 两条配方，**S7 定稿**。
+#
+# ★ 进行中时点对账（2026-09-26 T6·S3+S4，**实测值**）：
+#   → 新入账：recipe-valkey + recipe-nfs，各 w = 4（platform 基准，不 +1）
+#   → Σw_all = 219 + 8 = 227；Σw_done = 210 + 8 = 218（缺口仍是那 3 项 Σw = 9）
+#   → 加权口径 **218/227 = 96.0%**；条数口径 **46/49 = 93.9%**；platform 段 **11/11**；兜底权重 0 条
+# ★ 收尾时点对账（2026-09-26 T6·S5~S7 收口，**实测值** · `GET /api/coverage` 实时算出）：
+#   → 又新入账 1 条动作：`container.overview`（域 J，green，P1，w = 3）—— 它原来在**缺口**里，
+#     现在从"未做"变"已实现"⇒ 它那 3 分从 Σw_missing **转入** Σw_done
+#   → Σw_all = 227（分母不变）；Σw_done = 218 + 3 = **221**；Σw_missing = 9 − 3 = **6**
+#   → 加权口径 **221/227 = 97.4%**；条数口径 **47/49 = 95.9%**；P0 **28/28 = 100%**
+#   → platform 段 **11/11**；条目总数 60 条（58 已实现）；**兜底权重 0 条**（implicit_weight_ids = []）
+#   ★ 更正记录：本注释的前一版把加权写成"218/227 = 96.0%"——那是**手算估的**，
+#     漏算了 container.overview 那 3 分从缺口转入已实现。**数字必须从账本实时算**（教训第 5 次）。
+#   → 缺口只剩 2 项：`host.kernelparams`（w3）、`sec.ssh-harden`（w3）—— 两项都判 T3 遗留，S7 未动。
+#
+# ★ 进行中时点对账（2026-09-26 T7·S1，**实测值** · `GET /api/coverage` 实时算出）：
+#   → 新入账 3 条动作（entries）：`pkg.outdated`（H，green，P1，w3）、`pkg.rollback`（H，red，P1，w4）、
+#     `file.stat`（C，green，P1，w3）；新入账 1 条平台能力：`recipe-hot-reload`（w4，platform 基准）
+#   → Σw_all = 227 + 3 + 4 + 3 + 4 = **241**；Σw_done = 221 + 14 = **235**；Σw_missing = 6（仍是那 2 项）
+#   → 加权口径 **235/241 = 97.5%**；条数口径 **50/52 = 96.2%**（P0 28/28 = 100%）
+#   → platform 段 **12/12**；条目总数 **64**（62 已实现）；**兜底权重 0 条**（implicit_weight_ids = []）
+#   ★★ **口径变更提醒（给 S9 收口用）**：T7 开题单里写的"做了 2 项 T3 缺口 ⇒ 覆盖率 49/49 = 100%"
+#     —— 那个分母是**加这三条新条目之前**的数。现在分母是 **52**（分子 50）：
+#     2 项缺口清掉之后是 **52/52 = 100%**、加权 **241/241 = 100%**。
+#     ⇒ 结论不变（仍能到 100%），**但数字必须从账本实时算**（教训第 5 次，别再手抄）。
+#     ★ 这正是"交付即回填账本"要防的那件事：**开题单里的预估数 vs 账本里的实测数**，
+#       两者不一致时**以账本为准**，并在收口时把开题单/总纲里的数字一并订正。
+#
+# ★ 进行中时点对账（2026-09-26 T7·S2~S6，**实测值** · 从账本实时算）：
+#   → S6 新入账 1 条平台能力：`recipe-batch`（w = 5 · src = infer）—— ★ 与 T3 的 `batch-exec` 同为 5：
+#     它也是**两处记录点名**（总纲 §4「批量服务管理」＋ T7 开题单 §3.6 与验收 #7），
+#     而且把批量从**动作**那一层扩到**服务编排**这一层（4 台并排跑一次命令 ≠ 4 台各装一遍服务）。
+#   → Σw_all = 241 + 5 = **246**；Σw_done = 235 + 5 = **240**；Σw_missing = 6（仍是那 2 项）
+#   → 加权口径 **240/246 = 97.6%**；条数口径 **50/52 = 96.2%**（P0 28/28 = 100%）
+#   → platform 段 **13/13**；条目总数 **65**（63 已实现）；**兜底权重 0 条**（implicit_weight_ids = []）
+#   ★ S2~S6 这一段的共同点：**没有新增一个动作**（全是平台能力 / 编排语义 / 文档与样例），
+#     所以"条数口径"的分母纹丝不动（仍是 52）—— 只有 platform 段在长（12 → 13）。
+#     ★ 这一点值得记下来：**分母不变不代表没干活**；两个口径各自在回答不同的问题
+#       （条数 = "命令的覆盖面"，加权 = "真正要紧的事做了没有"）。
+#   ★ 顺带订正一处稳态：`stage_scope` 从 `T6` 改为 `T7`（它只在 `GET /api/coverage` 里当"当前阶段"显示；
+#     自检不依赖它，改它不会动任何数字）。
+#
+# ★★ 收尾时点对账（2026-09-26 T7·S7，**实测值** · 从账本实时算）：**账本第一次没有任何缺口**
+#   → 最后 2 项 T3 缺口清零：`host.kernelparams`（域 A · w3）与 `sec.ssh-harden`（域 G · w3）。
+#     ★ 这两条**本来就在下面的 weights 表里**（T4 反推权重时就登记成 fallback / 3）⇒
+#       **分母不动**，那 6 分只是从 Σw_missing **转入** Σw_done。
+#   → Σw_all = **246**（与 S6 相同）；Σw_done = 240 + 6 = **246**；Σw_missing = **0**
+#   → 加权口径 **246/246 = 100.0%**；条数口径 **52/52 = 100.0%**（P0 **28/28**）
+#   → platform 段 **13/13**；条目总数 **65**（**65 已实现**）；**兜底权重 0 条**（implicit_weight_ids = []）
+#   ★ 这一格是"数字必须从账本实时算"这条纪律最好的检验点：自检 **㉘** 直接钉住
+#     「52/52 ＋ 246/246 ＋ **缺口清单为空** ＋ 兜底 0 条」，★ 并且**连分母一起钉**（52）——
+#     防的正是"把登记项删掉凑 100%"那种**假 100%**（分母变小，比例照样能到 100%）。
+#   ★ 另一条一起结清的账：为 `sec.ssh-harden` 扩了一个解析器（`space_kv`），
+#     理由与边界写在规范 **§12.23** —— **扩核心代码要有出处，不许"为省事"扩**（§5 第 10 条）。
+# ★★ 收尾时点对账（2026-09-26 T8·S9，**实测值** · 从账本实时算：`GET /api/coverage`）：
+#   条数口径 **52/52 = 100.0%**（P0 28/28）｜ 加权口径 **260/260 = 100.0%**
+#   ｜ platform 段 **16/16** ｜ 条目 **68/68** ｜ ★ 兜底权重 **0** 条 ｜ ★ **缺口清单：空**
+#   ★ 与上一话题（T7 收尾 52/52 · 246/246 · platform 13/13 · 条目 65/65）的差：
+#     **+3 条 platform 条目 / +14 加权** —— 全部来自 T8 本阶段新增：
+#       · `k8s-bootstrap`（w=5）—— 七只手 + 幂等守卫 + 清单应用（★ 总纲 §4 + 开题单 §2/§3.7/§6/§7 点名）
+#       · `recipe-k8s-init`（w=5）—— 控制面一键（★ 总纲 §4 的"一次点击"验收 + 开题单 §3.9/§7 #1）
+#       · `recipe-k8s-join`（w=4）—— 工作节点一键（platform 配方基准，不额外 +1）
+#   ★★ **分母为什么只动 platform**：`entries` 段那 52 条是"Linux 运维命令覆盖地图"
+#      （T1 立项时的口径），新增的 `k8s.*` 动作**不属于那张地图**——它们落在 platform 段，
+#      与 T6 的四个服务配方、T7 的 `recipe-hot-reload` / `recipe-batch` 同一个口径。
+#      ⇒ 分母 52 与 65 都不动，**不靠改口径凑数**（这正是 T7 立的规矩：分母也要钉住）。
+#   ★★ 本次"四个地方"的回填（验收 #12）逐处点名：
+#     ① `entries` 段 —— **不动**（52 条全部已实现，无新增项）；
+#     ② `platform.done` —— 新增 3 条（三条 `done: true`）；
+#     ③ `weights` —— 新增 3 条（w=5 / w=5 / w=4，`src: infer`，每条 `why` 都写出点名出处）；
+#     ④ 页首时点对账 —— `stage_scope` 由 **T7 → T8**，`updated` 保持 2026-09-26。
+#   ★ 断言 ㉘ 仍然钉住"**账本没有缺口**"这件事实（52/52 ＋ 260/260 ＋ 缺口为空 ＋ 兜底 0，且**分母也钉住**）。
+
+weights:
+  # ───── w=5（基准 + 记录点名 · 共 10 条）─────
+  # ★ T8·S9 新增 2 条（下面两条 k8s-*）—— 见各自 why 里的"点名在哪"。
+  host.overview:
+    w: 5
+    src: infer
+    why: "反推：T1 竖切闭环唯一贯穿全链路的动作，也是每次演示的第一个动作（T1 结题回执 / T2·T3 证据索引）"
+  svc.list:
+    w: 5
+    src: infer
+    why: "反推：服务健康第一问；T2 靠它发现 kubelet=activating（T2 结题回执）"
+  disk.usage:
+    w: 5
+    src: infer
+    why: "反推：T4 体检的红/黄阈值直接建立在它上面（开题单 §3.3）；磁盘满是最常见事故"
+  host.checkup:
+    w: 5
+    src: infer
+    why: "反推：用户点名要一键体检，开题单 §2 主线 3；第一阶段收口的判定中枢"
+  host-enroll:
+    w: 5
+    src: infer
+    why: "反推：T3 记录里用户原话点名（不是本末倒置吗），开题单 §2 主线 1 的第一件事"
+  file-backup-before-change:
+    w: 5
+    src: infer
+    why: "反推：T3 护栏重点；规范 §9.1「备份失败即中止」被定为项目底线"
+  batch-exec:
+    w: 5
+    src: infer
+    why: "反推：T3 范围明确要求多机批量；T4 的 4 台并排体检也复用它（开题单 §3.3）"
+  recipe-batch:
+    w: 5
+    src: infer
+    why: "反推：两处记录点名（总纲 §4「批量服务管理」＋ T7 开题单 §3.6 与验收 #7）—— 与 T3 的 batch-exec 同源。★ 它把批量从**动作**那一层扩到**服务编排**这一层：4 台并排跑一次命令，与 4 台各跑一遍「装一个服务」，风险与判据都不是一个量级（所以闸门也只增不减）"
+
+  # ★ T8 新增（2026-09-26 · 集群引导）
+  k8s-management:
+    w: 5
+    src: infer
+    why: "反推（记录点名 +1 → 5）：★ 它被**三处**点名 —— 总纲 §4 T9 卡片的验收句「日常管理：节点 / 工作负载 / Pod / 配置存储 / 排障 / 证书，每件事在界面里一键取结论」＋ T9 开题单 §2 的三条主线（管理动作 / 排障结论化 / 逃生口）＋ §7 验收 #1~#11。★★ 与 `k8s-bootstrap` 的分工是这一条的关键：T8 回答「**把集群建起来**」（一次性 · red · 不可 undo），T9 回答「**把它管住、并且说实话**」（日常 · 以只读为主 · 每个变更动作都要能回退或明说「回不去」）。★ 本话题最值钱的产出不是 18 个动作，而是把「报告说假话」的**四个方向**都抓住了：**假红**（必须失败型步骤被非空自证）· **假变更**（缺值被判成变了）· **假警报**（`when` 挂一半）· **自相矛盾**（无条件的 owner 断言）"
+
+  k8s-bootstrap:
+    w: 5
+    src: infer
+    why: "反推：**四处记录点名** —— 总纲 §4 T8「建集群」＋ T8 开题单 §2 主线 2/3、§3.7（kubeadm 配方）、§6 产出物、§7 验收 #1~#4。★ 它是本项目第一次把手伸到「**改错了会锁住自己**」的地方（内核参数 / 容器运行时 / 集群引导）⇒ 判据全部换成**终态**（清单条数 / `cmp` / `/livez` / `wait --for=condition=Ready` 的退出码），并新增**幂等守卫**让「再点一次」成立"
+  recipe-k8s-init:
+    w: 5
+    src: infer
+    why: "反推：**两处记录点名** —— 总纲 §4 T8 的验收句「把三台裸装机器 → 一个 Ready 的 K8s 集群做成一次点击」＋ T8 开题单 §3.9「一键到 Ready」/ §7 验收 #1。★ 本话题把它的口径**修正过一次**（「一键」的形态是「两次点击」：配方只在一台机器上执行，而一个集群横跨三台），修正理由写在开题单 §10.2.1 修订记录 #6"
+
+  # ★★ T10 新增（2026-09-27 · 监控告警接入 · 第四阶段·可观测）
+  monitoring-stack:
+    w: 5
+    src: infer
+    why: '"反推（记录点名 +1 → 5）：★ 它被**三处**点名 —— 总纲 §4 T10 卡片「监控告警接入（Prometheus / Alertmanager / Grafana 作为目录条目）」＋ T10 开题单 §2 的五个块（装机 / 采集面 / 告警面 / 通知面 / 界面）＋ §7 验收 #1~#14。★★ 它与别的服务条目的**本质差别**：验收**不在"服务起来了"**，而在「**我能证明它在工作**」—— 指标**在采**（目标的健康度）· 规则**在判**（生效面 ＋ `for` 的状态迁移）· 告警**真的送到了**（收端留证）。★ 本话题最值钱的一条口径是 **§12.56.1**：**抑制必须问 Alertmanager** —— Prometheus 里被抑制的那条**照样是 `firing`**，用错 API 会得出**相反**的结论；★ 另两个"基础设施级"的真缺陷也出在这里（§12.64）：**大文件推不了第二遍** 与 **`parser: line_count` 计数恒为 1（十处同时中招、离线一条都没抓到）**"'
+
+  # ───── w=4（P0 基准 / 平台能力基准 · 共 28 条）─────
+  # ★ T8·S9 新增 1 条（recipe-k8s-join，见下面 T8 块）。
+  recipe-k8s-join:
+    w: 4
+    src: infer
+    why: "反推：T8 开题单 §3.7 / §6 点名（工作节点 `kubeadm join`）。★ 按 platform 段配方基准 4 计（不额外 +1）—— 它是 `k8s-init` 的**并列产物**，不是另一次点名。★★ 本话题一处**只增不减**的闸门在它身上现形：它引用了 `red` 动作 ⇒ `risk` 取最严 ⇒ **禁止批量**，而那条规则正好挡住了「把拆旧集群批量铺到两台」这个错误设计"
+  host.datetime:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  host.logins:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  disk.topdir:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  disk.bigfiles:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  file.grep:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  block.overview:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  log.view:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名（结论待收窄属待办清单，不参与权重）"
+  proc.overview:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名（TOP_N 写死属待办清单，不参与权重）"
+  svc.start:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  svc.stop:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  svc.restart:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  net.addr:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  net.route:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  net.dns:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  net.ping:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  net.port:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  net.http:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  net.firewall:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  sec.selinux:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  sec.avc:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  pkg.installed:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名（体检第 9 项的地基，属实现细节不进 why）"
+  pkg.search:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  kernel.log:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  perf.overview:
+    w: 4
+    src: fallback
+    why: "兜底：P0 基准 4 —— 记录里没有单独点名"
+  task-replay:
+    w: 4
+    src: fallback
+    why: "兜底：平台能力基准 4 —— 已在日常使用（每步留证是 T1 的核心命题）"
+  report-export:
+    w: 4
+    src: fallback
+    why: "兜底：平台能力基准 4 —— 已在日常使用（T2 验收 #4）"
+  backup-restore:
+    w: 4
+    src: fallback
+    why: "兜底：平台能力基准 4 —— 已在日常使用（护栏的另一半，规范 §9.2）"
+
+  # ───── w=3（P1 基准 · 共 16 条）─────
+  host.kernelparams:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（仍是缺口，见总纲 §3 账本剩余 4 项）"
+  sec.ssh-harden:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（仍是缺口）"
+  container.overview:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（计划 T6，属第二阶段）"
+  timer.list:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名"
+  svc.enable:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（真跑留证属 T4 尾巴，不参与权重）"
+  svc.disable:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（真跑留证属 T4 尾巴，不参与权重）"
+  cron.upsert:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名"
+  cron.remove:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名"
+  sec.cert:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（本批机器 openssl 未装属环境事实，不参与权重）"
+  fw.port-open:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名"
+  fw.port-close:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名"
+  pkg.install:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（真跑留证属 T4 尾巴，不参与权重）"
+  pkg.update:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名"
+  pkg.remove:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（真跑留证属 T4 尾巴，不参与权重）"
+  file.push:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名"
+  file.pull:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名"
+  svc.configtest:
+    w: 3
+    src: infer
+    why: "反推：T5 做配方时发现既有 42 个动作里根本没有这一类别（'校验配置但不改状态'），为它先立规范 §12.8 再写 YAML；'改完配置先 -t 一遍再重启'是运维最省钱的一道闸门（T5 开题单 §3.6）"
+  file.remove:
+    w: 3
+    src: infer
+    why: "反推：T5 开题单 §3.6 点名 —— 配方'卸载·全删'缺的那只手。T3 当时明确把 rm 推到后续（破坏性太强），T5 用'red + 路径白名单 + 禁止批量 + 先备份'四道锁把它收进来"
+  db.mariadb-ping:
+    w: 3
+    src: infer
+    why: "反推：T6 开题单 §3.3 把'服务可用吗'列为必须补的能力缺口（三选一结论里选了'扩白名单 + 新增只读探活动作'），§1.6 还专门查到'client 包不在 server 包里'就是为了这个判据（规范 v1.7 §12.11）"
+  db.valkey-ping:
+    w: 3
+    src: infer
+    why: "反推：同 T6 开题单 §3.3；★ 它同时是'Rocky 10 没有 redis 包、只有 valkey'这条环境事实的落点（§1.1）"
+  nfs.export-check:
+    w: 3
+    src: infer
+    why: "反推：T6 开题单 §3.3 表格里给 NFS 定的判据就是'让 showmount 看到我们的导出'——那才是'导出真的生效'（§1.6 顺带查到 nfs-server 的 ExecStartPre 就是 exportfs -r）"
+  pkg.outdated:
+    w: 3
+    src: fallback
+    why: "兜底：P1 基准 3 —— 记录里没有单独点名（T7 开题单 §3.2 只是把它列为升级主线的第 1 件事；真正的共同点是'升级三步法'这个组合，不是它自己一条）"
+  pkg.rollback:
+    w: 4
+    src: infer
+    why: "反推（记录点名 +1 → 4）：★ 它被**两处**点过名 —— T7 开题单 §1.1「最要紧的五条」之 #5 原话'回退只有承诺，没有动作'（含检查清单 47'承诺兑现不了比不承诺更坏'），以及 §7 验收 #2b 标 ★★『回退真能执行、真能自证』。★ T7 之前三个包动作的结论都在承诺 `dnf history undo`，而全库 48 个动作没有一个能做它"
+  file.stat:
+    w: 3
+    src: infer
+    why: "反推：T7 开题单 §3.7 把'可能扩「路径不存在」判据'列为要动的平台代码之一；规范 v1.8 §12.16 是它的立项依据（全删收敛检查的**路径那一半**）。它自己不显眼，但少了它，'目录真的删掉了吗'只能看命令退出码 —— 那正是 §12.6.5 点名要杜绝的假绿"
+  recipe-nginx:
+    w: 4
+    src: infer
+    why: "反推：platform 基准 4 —— 不额外 +1（+1 只留给'被用户原话点名'的条目）。它是配方层的第一个真样本：'加一个服务只写 YAML'这条命题的现场证据（T5 结题回执）"
+  recipe-mariadb:
+    w: 4
+    src: infer
+    why: "反推：platform 基准 4 —— 不额外 +1（三个服务同属 T6 开题单 §2 主线 2 的并列产物，不是各自被点名）。它是'配方能复制吗'的第一个新样本，也是两个 v1.7 新判据（responds / port_open）的现场（T6·S2 证据）"
+  recipe-valkey:
+    w: 4
+    src: infer
+    why: "反推：platform 基准 4 —— 不额外 +1（同 recipe-mariadb，三服务并列）。它的价值在'第二个服务'这个位置：证明清单可复制、引擎零改动；同时贡献了一条可复用的服务差异判据 ——'配置要写在服务自己留的钩子上，且那条路必须可被证伪'（T6·S3 证据）"
+  recipe-nfs:
+    w: 4
+    src: infer
+    why: "反推：platform 基准 4 —— 不额外 +1（同 recipe-mariadb，三服务并列）。它的价值在'第三个服务'这个位置：逼出了'非 systemd 的生效动作'这道判断题，答案是复用单元自己的 ExecStartPre（svc.restart 即生效），并顺带把'端口按整组钉'与'健康检查要问链路最末端'两条落成实例（T6·S4 证据）"
+  recipe-engine:
+    w: 5
+    src: infer
+    why: "反推（记录点名 +1 → 5）：T5 开题单 §2 主线 1 标题就是「Recipe（配方）引擎 —— 第二阶段的地基」；设计 02 §2 把它称作'本项目的技术核心、也是最大的架构收敛点'；T5 §0 一句话也写着'把一件运维的事整体交给它'"
+  recipe-hot-reload:
+    w: 4
+    src: infer
+    why: "反推：platform 基准 4 —— 不额外 +1（+1 只留给'被用户原话点名'的条目）。★ 它是 T7 拍板 #5 的直接产物（'要热装载；否则扩展点的门槛高得离谱'），并与 `设计\\02` 坑 #10 对上：'用户自己写配方是这套东西能活下去的前提'——而改一行 YAML 要重启控制台，正是这道前提上最大的坎"
+  # ── T16（六·虚拟化层）──────────────
+  vm-lifecycle:
+    w: 5
+    src: infer
+    why: "反推（记录点名 +1 → 5）：★ 它被**用户原话**点名 —— 2026-09-25 用户问「虚拟机是关机状态，让 AI 去虚拟机的'服务器'去做操作，这是可行的吗」（总纲 §4.2 开篇原话 · 设计\\05 缘起），并在 T16 开题单 §7 验收①里被写成一条端到端判据（关掉一台 → 开机 → **等就绪** → 自动体检 → 关回）。★ 另有两处结构点名：总纲 §3 T16 行（范围）与 §8.2 红线 12~17（靶子纪律 / `hard` 与 `revert` 永远 red / 开机不是默认行为）"
+  vm-snapshot-guard:
+    w: 5
+    src: infer
+    why: "反推（记录点名 +1 → 5）：设计\\05 §3 把它列为要新建的五件事之一（'★ 新护栏：变更前打快照 —— 与既有的改动前文件备份 / 一键恢复 / 确认闸门并列，护栏从三件套升为四件套'），T16 开题单 §2.4 与 §10 拍板 #3 再次点名（**显式触发**）。★ 它不是'再加一个动作'：它改变的是**回不去的粒度**（整机 vs 文件）"
+
+# 演示用动作（不属于运维覆盖条目，单独登记，避免污染覆盖率分母）
+demos:
+  - id: demo.confirm-gate
+    purpose: 验证 risk:yellow 的执行前二次确认闸门（T1 验收标准 #3）
+    risk: yellow
+    real_content: 只读（时间与时区）
+    reused_by: T3 的真实变更动作将复用同一闸门逻辑

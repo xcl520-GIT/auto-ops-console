@@ -1,0 +1,270 @@
+# auto-ops-console · 全局配置（**模板** —— 首次使用时会被复制成 config.yaml）
+#
+# ★★ 为什么库里放的是模板而不是真文件：
+#   真 `config.yaml` 里含**这台机器专属的两样东西** —— 你的 `vmrun.exe` 装在哪、
+#   你的虚拟机放在哪个目录。它不进 Git（见 `repo\.gitignore`），
+#   由**首次安装脚本**把这一份复制成 `config.yaml`。
+# ★ 用法：改下面**标了 ★ 的两处**（都跟 VMware 有关；不用 VMware 就整段不管），
+#   然后 `python -m app.server --check` 验一遍装载。
+# ★ 这份模板与真文件**结构完全一致**（只换了那两处值 + 清空了一个列表），
+#   所以"照它改"不会漏掉任何一节。
+
+# auto-ops-console · 全局配置
+# 说明：本文件描述「控制台自己」的运行参数，不描述目标机。
+#     目标机清单在 hosts.yaml，动作定义在 catalog/actions/*.yaml。
+
+server:
+  # ★ 安全红线（开题单 §3-5）：只允许本机或内网监听，永远不接受 0.0.0.0
+  host: 127.0.0.1
+  port: 8787
+  # 允许的监听地址前缀白名单；不在此列表内一律拒绝启动
+  allow_bind_prefixes:
+    - "127.0.0.1"
+    - "localhost"
+    - "::1"
+    - "192.168."
+    - "10."
+    - "172.16."
+    - "172.17."
+    - "172.18."
+    - "172.19."
+    - "172.2"
+    - "172.30."
+    - "172.30."
+    - "172.31."
+
+# ── 最小鉴权（T14 · 规范 §12.97；红线 11 的执行面）──────────────────
+# ★★ 为什么要有它：在 T14 之前，这个控制台的安全性**完全**建立在"只绑 127.0.0.1、只有本机能用"上。
+#   一旦 AI 能在对话里请求变更动作，**任何能对 8787 说话的进程**就等于拿到了执行权。
+#   ⇒ 红线 11：**放开 `yellow` 之前必须先补鉴权**。这一节就是那一步。
+# ★★ 本段**不许出现口令本身**（红线 8 同源）—— 这里只有"放哪儿"和"策略参数"。
+#   口令只以 PBKDF2-HMAC-SHA256 的 salt/iterations/hash 落在 `var/auth.json`（已进 .gitignore），
+#   会话令牌**只在内存**、不落盘（进程重启即全体失效）。
+# ★★ 两条刻意"fail-closed"的行为（不是参数，是纪律 —— 不提供开关）：
+#   ① 没设过口令 ⇒ **所有 `/api/**` 全拒**（不是"没口令就放行"）；
+#   ② 口令文件坏了 ⇒ **报错**，不许当成"没设过口令"（否则"设置口令"就成了免鉴权的重置 = 后门）。
+auth:
+  file: var/auth.json           # 相对 repo/；★ 该文件已在 repo/.gitignore 里
+  token_ttl_sec: 28800          # 会话令牌存活 8 小时；到期重新登录
+  # OWASP 2023 对 PBKDF2-HMAC-SHA256 的推荐下限。调大更安全、登录更慢（本机单用户，代价可忽略）。
+  pbkdf2_iterations: 210000
+  min_password_len: 8           # 低于 6 会被代码兜底抬高（再低就是"假口令"）
+  max_fail_per_minute: 5        # 一分钟内失败上限 ⇒ 锁 lockout_sec
+  lockout_after: 10             # 连续失败到这个数 ⇒ 锁 lockout_sec（成功率会清零计数）
+  lockout_sec: 60
+  # ★ 这道闸是为「本机其它程序 / 浏览器插件乱撞」准备的，**不是**防公网 ——
+  #   能防什么 / 不能防什么写在 `GET /api/auth/status` 里，而且是**连着一起说**的（§12.97.4）。
+  # ★ 界面上要改口令：必须先登录（旧口令 + 新口令）；**没有"免登录重置"这条路**。
+
+# 所有「落库时间」统一使用此业务时区（开题单技术要求 #7）
+# 注意：目标机自身的时区可能不同，日志时间按目标机时区展示，并在结论里显式标注。
+timezone: Asia/Shanghai
+
+paths:
+  catalog: catalog
+  actions: catalog/actions
+  map: catalog/map.yaml
+  hosts: hosts.yaml
+  var: var
+  artifacts: var/artifacts
+  database: var/ops.db
+  web: web
+
+ssh:
+  binary: ssh
+  connect_timeout: 8            # 建链超时（秒）
+  default_timeout: 20           # 单步默认执行超时（秒）
+  # 连接复用（agentless 的代价补偿）：省掉每次握手开销
+  control_master: true
+  control_persist: 300          # 复用连接保持 300 秒
+  control_dir: var/ssh-ctl
+  # 首次连接的主机指纹策略（开题单技术要求 #2）：
+  #   accept-new = 首次自动登记指纹，之后固定不变（默认，T1 够用且不掉链子）
+  #   yes        = 严格模式，必须先由用户显式信任主机，否则直接拒连
+  #   no         = 不校验（★ 危险，仅在纯隔离实验网段临时使用）
+  strict_host_key: accept-new
+  batch_mode: true              # 禁止一切交互式提问（密码/口令），保证无人值守
+  server_alive_interval: 15
+  server_alive_count_max: 3
+  # ★ 强制远端的 locale（写代码时发现的真实隐患）：
+  #   若目标机 LANG=zh_CN.UTF-8，`timedatectl status` 的字段名会变成「本地时间」，
+  #   我们按 "Local time" 做的字段解析会静默取空 —— 动作看起来成功，结论却全是（无）。
+  #   用 `env LC_ALL=C LANG=C` 前缀固定为 C locale，让所有按字段名解析的输出保持稳定。
+  #   （用 env 而不是 shell 变量前缀，语义更明确，也完全避开"拼接"这件事。）
+  remote_env:
+    LC_ALL: C
+    LANG: C
+
+exec:
+  max_output_bytes: 262144      # 单步输出上限 256KB，超出则截断并标记
+  max_foreach_items: 50         # foreach 展开上限，防止失控
+  default_timeout: 20
+
+# ── 备份护栏（T3 · 规范 §9.1）──────────────────────────────────────
+# 变更类动作**执行前**自动备份它声明要改的路径。护栏地基：
+# 备份失败 → 变更步骤一律不执行（宁可不做，不做无法撤回的事）。
+backup:
+  remote_root: /var/backups/aoc   # 目标机落点（引擎自动 mkdir -p <root>/<任务ID>）
+  local_root: var/backups         # 管理机回拉落点（相对 repo/）
+  max_file_mb: 50                 # 单文件超过则要求动作显式 allow_large: true
+  keep_tasks: 20                  # 管理机侧保留最近 N 个任务的备份（tools/backup_gc.py）
+  min_free_mb: 512                # 目标机可用空间低于此值 → 拒绝备份（防写满）
+
+# ── 批量执行（T3 · 规范 §9.3）─────────────────────────────────────
+# 平台能力：同一动作 + 同一份参数铺到 N 台；每台独立任务、可单独回放。
+batch:
+  max_workers: 4                  # 并发主机数；失败隔离（单台失败/不可达不影响其它）
+  # ★ red 动作禁止批量是**硬规矩**（规范 §9.3），不提供开关，避免"顺手改配置放开"。
+  #   原因：批量会把一次手误放大到 N 台，而 red 恰好是不可 undo 的那一类。
+
+# ── 虚拟化层（T16 · 规范 §12.115~§12.118；六·虚拟化层）─────────────
+# ★★ 这一节是「工作台把手伸到**机器的开关**」的全部配置。
+#    动作在 catalog/actions/vm.*.yaml 里，执行面是**本机 Windows 进程**（vmrun.exe），
+#    ★ 不走 ssh —— 这是本项目第一次出现"执行面 ≠ ssh 面"（规范 §12.115）。
+vm:
+  # `vmrun.exe` 的位置。★ 装在哪**因机器而异**（有人在 Program Files、有人装在别的盘）—— 用 `where vmrun` 找一下。
+  #   ★ 找不到时的报错会带"试过哪些路径"，并说清这是**环境事实**、不是故障。
+  vmrun: 'C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe'   # ★★ 换机器改这里：你的 vmrun.exe 在哪
+  # `vmrun -T <type>` 的取值：ws = Workstation（本环境）。
+  type: ws
+  # ★ 宿主机在**任务 / 留证**里的 host 身份 —— 由 app\vmware.py **合成**，
+  #   **不写进 hosts.yaml**：它是**执行面**，不是一台目标机。
+  #   塞进去它就会出现在目标机下拉 / 批量 / 体检 / AI 工具面里，被当成一台 Linux 机器。
+  host_id: vmhost
+  host_name: 宿主机（VMware Workstation · 本机）
+  # 单次 vmrun 调用的默认超时（秒）；开机/关机/建快照这类慢操作由动作自己声明更长的 timeout。
+  default_timeout: 120
+  # ★★ 纵深防御（规范 §12.116）：只允许操作这些目录下的 .vmx。
+  #    与 file.remove 的路径白名单同源 —— 就算名字写对了，出了这个目录也一律拒绝。
+  allow_vmx_dirs:
+    - C:\vmware-vms   # ★★ 换机器改这里：你的虚拟机放在哪个目录下
+  # ★★ 当次点名（规范 §12.116）：这里列出的虚拟机**允许操作**，哪怕它没有登记进 hosts.yaml。
+  #    ★ 为什么做成"写进文件"而不是"界面上点一下"：**点名要留痕** ——
+  #      事后能回答"当时是谁把哪一台放开的"。空列表 = 一个都不额外放开。
+  #    写法：主机 id（node-03）／vmx 全路径／vmx 文件名（vm-docker-01.vmx）都可以。
+  # ★★ 当次点名的用法（本项目真的用过一次）：
+  #    要从一台**没登记进 hosts.yaml** 的机器上克隆 ⇒ 由人**当次点名**授权，**写进文件即留痕**（规范 §12.116）。
+  #    ★ 用完请按拍板把它收回（清空这一项）—— 点名是"这一次"，不是"从此归本项目管"。
+  extra_allow: []   # ★ 当次点名用（写进文件即留痕）；**用完请清空** —— 空 = 一个都不额外放开
+  # 只读枚举用：VMware 自己的虚拟机清单（红线 13：**只允许只读**）。
+  #   %APPDATA% 会被展开；读不到**不是错误**，由目录扫描兜底。
+  inventory: '%APPDATA%\VMware\inventory.vmls'
+  # 跑 tools\vmprobe.py 的解释器；留空 = 当前解释器（python -m app.server 用的那个）。
+  python: ''
+
+# ── 主机纳管（T4 · 规范 §10.1）────────────────────────────────────
+# 填「IP + 账号」→ 起一个**一次性内网分发点** → 界面给出"去目标机粘这一条命令" →
+# 之后校验 / 登记 / 体检全自动。用户不需要知道公钥是什么。
+enroll:
+  # 管理机用来登录目标机的私钥 / 公钥（公钥由分发点发出去；不存在会自动生成并告知）
+  identity_file: ~/.ssh/id_ed25519
+  pubkey: ~/.ssh/id_ed25519.pub
+  # ★ 一次性分发点的存活上限（秒）：用完即停，到点**无条件**关停（规范 §10.1.2 第 3/4 条）
+  dispatch_ttl_sec: 120
+  # 生效校验的探测上限：探测这么多次仍不通过 → 判失败并说清原因（规范 §10.1.4）
+  verify_max_attempts: 5
+  # "认证被拒"连续这么多次即判失败 —— 钥匙不对不会因为多等一会儿而变好（T4 反例实测出来的）
+  verify_auth_fail_limit: 2
+  # 绑定的本机地址：留空 = 自动探测"通往目标机的本机地址"，
+  # 并且**永远**要过 server.allow_bind_prefixes 白名单（不可能绑到 0.0.0.0）
+  # bind_host: 192.0.2.10        # 举例：绑到某一块内网网卡（默认只绑本机 127.0.0.1）
+
+# ── 一键体检（T4 · 规范 §10.2）────────────────────────────────────
+# ★ 阈值一律放这里，**不许写死在代码里**（规范 §10.2.2）；体检报告里会回显用的是哪一档。
+#   改完直接重跑体检即生效：不需要改代码、不需要重跑自检。
+#   键名改了要同步 app/checkup.py 的 _THRESHOLD_DEFAULTS —— 那边**只接受已知键**，
+#   写错的键会被忽略（宁可漏配，也不要让一个手滑的键名静默改变判定口径）。
+checkup:
+  enabled: true
+  thresholds:
+    disk_pct_warn: 85        # 挂载点容量使用率：≥ 此值判黄
+    disk_pct_crit: 95        #                  ≥ 此值判红
+    inode_pct_warn: 85       # inode 使用率：≥ 此值判黄
+    inode_pct_crit: 95       #              ≥ 此值判红
+    failed_service_warn: 1   # 处于 failed 状态的服务个数：≥ 此值判黄
+    kernel_err_warn: 10      # 内核错误条数：≥ 此值判黄（几条无害告警不该让整台机器变黄）
+  # 核心服务失败 → 一律判红（登录通道本身出问题，其它结论都要打问号）
+  # ★ T4 曾把靶子 aoc-fail.service 临时声明进这里，用**真实失败的服务**触发红档（验收 #4）；
+  #   **2026-09-26 已按当初写下的约定改回 ["sshd"]** —— 临时值留在仓库里会被后来的人误当成口径。
+  #   以后若要再演一遍红档：临时加回 "aoc-fail" ＋ 场外铺夹具，**演完立刻改回**。
+  core_services: ["sshd"]
+  # "有意放行但没人监听"的无主规则只在这几个端口上判（免得把正常放行也算进来）
+  orphan_port_candidates: [8080, 9090, 9100]
+
+# ── 完整自检的**目标机**（T6 补）─────────────────────────────────
+# ★ 为什么必须显式写这一项：完整自检（不加 `--offline`）会真跑动作，并断言
+#   「`svc.list` 能检出失败服务」—— 而那个对照物是**自造夹具** `aoc-fail.service`，
+#   它只能铺在**允许铺 `aoc-` 对象**的机器上。
+#   原来写死 `cfg.hosts[0]`，等于"谁排在 hosts.yaml 第一位，谁就去当靶子" ——
+#   T4 换过主机清单之后 `hosts[0]` 变成 **node-01**（明令**禁止变更**的那台），
+#   于是那条断言**永远红**，而且红的原因跟被测代码毫无关系
+#   （同 tools/selftest.py ⑩ 那条注释的教训：**自检红的原因不该是"环境不是我以为的那样"**）。
+#   ⇒ 显式点名一台**实验室靶机**；没写这一项时回退 `hosts[0]`，并**打印警告**（不许静默）。
+# ★ 铺夹具的仪式见 var/lab/selftest-fixtures.sh（`up` 铺 / `down` 清）。
+selftest:
+  host_id: node-03
+
+log:
+  level: INFO
+
+# ── AI 助手（T12 · 五·AI 助手；规范 §12.73~§12.82）────────────────
+# ★★ 本段**不许出现 key**（红线 8）—— 这里只有"环境变量的名字"。
+#   规则：key 只留在本进程内存里（环境变量注入 或 界面输入），不落盘 / 不进日志 / 不进 Git / 不进截图。
+ai:
+  enabled: true
+  provider: deepseek                  # 适配器在 app/ai/provider.py 里登记；换一家只加一个类
+  base_url: https://api.deepseek.com
+  # ★ 模型名**不要凭印象写** —— 用 tools/ai-ping.py 问一次它（T12·S0 的现场样本：
+  #   实测是 deepseek-flash / deepseek-v4-pro，没有 deepseek-chat 这类旧名）。
+  model: deepseek-flash
+  key_env: AOC_LLM_API_KEY            # 开发/自检/演示的注入路径 ①
+  # ── 数据外流档位（规范 §12.78）──
+  # ★ 本期**只实现 A 档**（只发结论 + 动作 ID + 参数）；B/C 是界面上的置灰占位，
+  #   写了别的值也会被强制回 A（宁可拒绝，也不假装支持）。
+  outflow_tier: A
+  # ── 预算与上限（规范 §12.81：钱也是事实，不许凭印象估）──
+  max_rounds: 8                       # 单会话最多几轮工具调用
+  max_tool_result_bytes: 4096         # 单次工具结果回传给模型的上限（结论优先，原文只在界面展开）
+  # ★★ T13 拍板（2026-09-27）：跨机检索明显更贵 ⇒ **保守档 60000**；
+  #    超限**停下问人**（`budget_stop_mode: confirm`），★ 且**已经拿到的结论不丢**（规范 §12.81）。
+  max_session_tokens: 60000
+  # ── T13 检索与汇总（规范 §12.86 ~ §12.92）──────────────────────
+  retrieval_max_rows: 40              # 定位表一次最多显示几行；超出 ⇒ 标注"共 N 行"并给收窄建议
+  dedupe_composite: true              # 复合读去重：同一轮里 host.checkup 覆盖的子动作不再重复跑（§12.91）
+  hitrate_enabled: true               # 选域命中率**本地**记账；★ 绝不外发（§12.92）
+  budget_stop_mode: confirm           # 超预算的形态：停下来问人（不是抛错中断）
+  require_user_scope: true            # ★ 模型自编"在哪找"⇒ 回问而不是执行（规范 §12.85）
+  batch_workers: 4                    # 只读多机并发（沿用 batch.max_workers 的口径）
+  max_hosts_per_action: 4             # 一个动作最多铺到几台（防止"去每台找一遍"失控）
+  timeout_sec: 120                    # 单次模型请求超时
+  temperature: 0.2                    # 低温度：运维场景要的是稳，不是花样
+
+  # ── ★★ T14·S3：放开给 AI「**请求**」的 `yellow`（规范 §12.96；红线 11 的前置已完成）──
+  # ★ 「放开」的含义**严格限定为**：AI 可以在卡片上**提出**这件事；
+  #   **不是**「AI 可以按下这个按钮」—— 执行永远要人在界面点确认（§12.96.1）。
+  # ★★ 这张表是 `app/ai/requests.py::APPROVED_YELLOW` 的**子集**（那里是"上限"）：
+  #   往这里加一个没被批准的动作（例如 `k8s.exec`）⇒ **离线自检当场红**
+  #   —— 这正是验收 6 要的判据：**表不许被悄悄改宽**。
+  # ★ 撤法动作（`svc.stop` / `pkg.rollback` / `fw.port-close` / `cron.remove` …）**故意不放**：
+  #   它们是给**人**按的按钮。放进白名单就等于给 AI 留了一条"绕一圈再改一次"的路。
+  # ★ 不写这一项 = 一个 `yellow` 都不放开（默认空）。
+  yellow_allowlist:
+    - pkg.install          # ★ 验收① 的主角（装 → 卸 → 回滚那条链）
+    - svc.start
+    - svc.restart
+    - svc.enable
+    - svc.reset-failed
+    - svc.daemon-reload
+    - sysctl.set
+    - fw.port-open
+    - cron.upsert
+    - file.push
+    # ── ★★ T16（规范 §12.120 · 清单 253）──
+    #   ★ 这三条是「**当前放开**」（上限在 `app\ai\requests.py::APPROVED_YELLOW`）。
+    #   ★★ 它们都只是"**AI 可以请求**"：卡片照样要在「待确认」页**等人点**那一下
+    #      —— 那就是红线 16「开机不是默认行为」的落地形态。
+    #   ★★★ `vm.stop-hard`（拔电源）与 `vm.snapshot-revert`（回滚）**不在这里，也永远不进**：
+    #      它们由 `guard()` 按 **risk == red** 结构上挡住（与这张表无关的第二道闸，§12.120）。
+    - vm.start
+    - vm.stop
+    - vm.snapshot-create

@@ -1,0 +1,19 @@
+[Unit]
+Description=AOC Monitoring · Webhook 收端（Alertmanager 投递的落点）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aocmon
+Group=aocmon
+Environment=AOC_WEBHOOK_BIND={{ wh_bind }}
+Environment=AOC_WEBHOOK_PORT={{ wh_port }}
+Environment=AOC_WEBHOOK_SINK=/opt/aoc-monitoring/data/webhook/alerts-received.jsonl
+ExecStart=/usr/bin/python3 /opt/aoc-monitoring/webhook/receiver.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,176 @@
+# ============================================================
+# managed by auto-ops-console (T10) —— 请勿手工编辑
+# 落点：/opt/aoc-monitoring/etc/rules.yml
+#
+# ★★ 本文件的**唯一用途**是让"规则在判"这件事可证伪（规范 v1.13 §12.55）：
+#   · 14 条规则，**每一条都带 `for`** —— 判据不是"文件里有 for 这个字"，
+#     而是 `/api/v1/rules` 读回来之后状态真的会走 inactive → pending → firing（§12.55）。
+#   · **AocMonSelfTestWarning / AocMonSelfTestCritical 是一对抑制对**：
+#       写 1 ⇒ 只有 Warning 响；写 2 ⇒ Critical 响 **且 Warning 被抑制**（§12.56）。
+#     指标来自 node_exporter 的 **textfile collector**（`aoc_mon_selftest`）——
+#     造条件 = 在 textfile 目录里放一个 `.prom` 文件，用完删掉（代价有界、零风险）。
+#   · `AocExporterDown` 是第二个造条件入口（停掉一个 exporter ⇒ `up == 0`）。
+# ★ 渲染参数：无（全静态）。
+# ★ `{{ $labels.* }}` / `{{ $value }}` 是 **Prometheus 的 Go 模板**，不是平台的参数占位符 ——
+#   平台的占位符正则只认「双大括号 + 小写标识符」那一种写法，两者不会打架（规范 §12.4）。
+#   ★★ 实测踩到（T10·S2）：这条注释**第一版**里写了那个占位符的**示例文字**，
+#      而模板引擎**不认注释**（它是纯文本替换）⇒ 计划期直接报 `TEMPLATE_PARAM_MISSING: param`。
+#      ⇒ 规矩：模板文件里的**注释也算正文**，示例一律用中文描述，不许写出占位符的字面形态。
+# ============================================================
+
+groups:
+  - name: aoc-monitoring-availability
+    interval: 15s
+    rules:
+      - alert: AocExporterDown
+        expr: up{job="node"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          aoc_group: availability
+        annotations:
+          summary: "采集器不可达：{{ $labels.instance }}"
+          description: "Prometheus 连续 30 秒抓不到 {{ $labels.instance }} 的 node_exporter（up == 0）。先看该机 node_exporter 单元状态，再看网络。"
+
+      - alert: AocTargetAbsent
+        expr: absent(up{job="node"})
+        for: 1m
+        labels:
+          severity: critical
+          aoc_group: availability
+        annotations:
+          summary: "抓取目标整段消失"
+          description: "node 这个 job 一条 target 都没有了 —— 不是某台掉线，而是整个采集面空了。先查 targets/node-base.json 是否被删。"
+
+      - alert: AocScrapeSamplesDrop
+        expr: scrape_samples_scraped{job="node"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          aoc_group: availability
+        annotations:
+          summary: "抓到了但一条样本都没有：{{ $labels.instance }}"
+          description: "scrape 成功却 samples == 0，通常是 exporter 起来了但采集器全被关掉，或权限/挂载点异常。"
+
+  - name: aoc-monitoring-selftest
+    interval: 15s
+    rules:
+      # ★ 这两条是**同一个指标的两个阈值** —— 抑制对就靠它们成立（§12.56）。
+      - alert: AocMonSelfTestWarning
+        expr: aoc_mon_selftest >= 1
+        for: 20s
+        labels:
+          severity: warning
+          aoc_group: selftest
+        annotations:
+          summary: "自检指标越过警戒线（{{ $labels.instance }}）"
+          description: "aoc_mon_selftest = {{ $value }}（≥1）。该指标来自 node_exporter 的 textfile collector，是**人为造条件**用的真实采集链路。"
+
+      - alert: AocMonSelfTestCritical
+        expr: aoc_mon_selftest >= 2
+        for: 20s
+        labels:
+          severity: critical
+          aoc_group: selftest
+        annotations:
+          summary: "自检指标越过严重线（{{ $labels.instance }}）"
+          description: "aoc_mon_selftest = {{ $value }}（≥2）。按抑制规则，severity=critical 会**抑制**同组同实例的 warning —— 所以此时 AocMonSelfTestWarning 应当**不出现**。"
+
+  - name: aoc-monitoring-capacity
+    interval: 15s
+    rules:
+      - alert: AocFilesystemSpaceLow
+        expr: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 0.15
+        for: 1m
+        labels:
+          severity: warning
+          aoc_group: capacity
+        annotations:
+          summary: "磁盘余量低于 15%：{{ $labels.instance }} {{ $labels.mountpoint }}"
+          description: "可用 {{ $value }}（比例）。先看是哪个挂载点、再找最大目录，别急着重启服务。"
+
+      - alert: AocFilesystemSpaceCritical
+        expr: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 0.05
+        for: 1m
+        labels:
+          severity: critical
+          aoc_group: capacity
+        annotations:
+          summary: "磁盘余量低于 5%（紧急）：{{ $labels.instance }} {{ $labels.mountpoint }}"
+          description: "可用 {{ $value }}（比例）。这条同样会抑制同组的 warning —— 让最严重的那条站出来。"
+
+      - alert: AocHostDiskInodesLow
+        expr: node_filesystem_files_free{fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_files{fstype!~"tmpfs|overlay|squashfs"} < 0.15
+        for: 1m
+        labels:
+          severity: warning
+          aoc_group: capacity
+        annotations:
+          summary: "inode 余量低于 15%：{{ $labels.instance }} {{ $labels.mountpoint }}"
+          description: "空间还有但 inode 快没了 —— 大量小文件的典型症状（缓存/会话/临时文件）。"
+
+  - name: aoc-monitoring-saturation
+    interval: 15s
+    rules:
+      - alert: AocHostHighCpu
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 2m
+        labels:
+          severity: warning
+          aoc_group: saturation
+        annotations:
+          summary: "CPU 持续高于 85%：{{ $labels.instance }}"
+          description: "5 分钟均值 {{ $value }}%。先看是哪个进程，再决定要不要动。"
+
+      - alert: AocHostHighMemory
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 90
+        for: 2m
+        labels:
+          severity: warning
+          aoc_group: saturation
+        annotations:
+          summary: "内存持续高于 90%：{{ $labels.instance }}"
+          description: "已用 {{ $value }}%。★ 靶机只有 3.6GB 内存，Prometheus 自己也是内存大户。"
+
+      - alert: AocLoadAverageHigh
+        expr: node_load1 > 4
+        for: 5m
+        labels:
+          severity: warning
+          aoc_group: saturation
+        annotations:
+          summary: "1 分钟负载高于 CPU 核数：{{ $labels.instance }}"
+          description: "load1 = {{ $value }}，而四台靶机都是 4 逻辑核。"
+
+  - name: aoc-monitoring-integrity
+    interval: 15s
+    rules:
+      - alert: AocHostClockOffset
+        expr: abs(node_timex_offset_seconds) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          aoc_group: integrity
+        annotations:
+          summary: "时钟偏差超过 50ms：{{ $labels.instance }}"
+          description: "偏差 {{ $value }} 秒。★ `for` 的观测依赖时钟 —— 时钟漂了，告警时序就不可信。"
+
+      - alert: AocConfigReloadFailed
+        expr: prometheus_config_last_reload_successful == 0
+        for: 30s
+        labels:
+          severity: critical
+          aoc_group: integrity
+        annotations:
+          summary: "Prometheus 最近一次配置重载失败"
+          description: "配置或规则文件写坏了。★ 这条要盯着：reload 失败时旧规则还在跑，很容易被当成没事。"
+
+      - alert: AocRuleEvalSlow
+        expr: prometheus_rule_group_last_duration_seconds > 1
+        for: 2m
+        labels:
+          severity: warning
+          aoc_group: integrity
+        annotations:
+          summary: "规则组求值变慢：{{ $labels.rule_group }}"
+          description: "上一轮求值耗时 {{ $value }} 秒 —— 再慢下去 `for` 的语义就开始失真。"

@@ -1,0 +1,115 @@
+# ============================================================
+# 动作：容器运行时真探活
+# 来源：T8·S5 —— 配方 `k8s-containerd` 的 health 缺的那一句"**真问一句它活着吗**"（规范 §12.31.4）
+# 形态：**只读**（green）—— 只把运行时的应答、镜像缓存清单交出来
+# ============================================================
+
+id: container.runtime
+title: 容器运行时真探活
+summary: 走 containerd 的 API 真问一句（ctr version，看得到 Server 段才算通）+ 本地镜像缓存清单
+domain: J
+risk: green
+priority: P1
+tags: [只读, 容器, containerd, 探活]
+
+note: |
+  ★★ **为什么必须有它**（规范 §12.31.4）：T6 定了"服务活着吗"要走 `responds`（真问一句），
+  而不是 `state: active`（那只说明"systemd 认为进程还在"）。
+  containerd / kubelet 这一类**守护进程**同理 —— 单元 active **不等于** API 在应答。
+
+  ★★ **判据为什么是 `Server:` 而不是版本号**：
+  `ctr version` 在没有守护进程时会**只打 Client 段并以非零退出**；有守护进程时才多出
+  `Server:` 段。所以 `Server:` 是"**API 真的通了**"这个**结构性事实**，而：
+
+  · 它**不随版本漂** —— 写死 `v2.2.6` 就是"包一升级就假红"（那正是 T8 要避免的"断言自己会骗人"）；
+  · 它**系统状态伪造不了** —— `systemctl is-active containerd` 无法制造出这一行。
+
+  ★ 本动作**不做**"配置生效了吗"的判定：`pinned_images.sandbox` 那类值属于**主配置**
+  （`rpm -qf` 说是包的文件），本话题**一个字都不改它**（规范 §12.31.1 / §12.31.2）——
+  于是也不需要"读回生效值"这件事。镜像来源的验证走**链路最末端**（`container.pull` 真拉一次）。
+
+  ★ 只读（green）：不启停服务、不拉镜像、不写任何文件 —— `changed` 恒 `false`（规范 §12.3）。
+
+params:
+  - name: images_limit
+    label: 镜像清单最多列几条
+    type: int
+    required: true
+    min: 5
+    max: 200
+    default: 40
+    help: '只影响**给人看的清单**长度（旧集群镜像缓存可能有十几二十条）；不影响 `images_count` 那个总数。'
+
+precheck:
+  - name: ctr_present
+    title: 确认这台机器上有 ctr（containerd.io 包自带）
+    run: [ls, -l, /usr/bin/ctr]
+    parser: raw
+    timeout: 20
+    note: >
+      ★ 预检**只回答"这只手在不在"**，**不回答"守护进程在不在"** —— 后者正是本动作要探的东西：
+      它必须表现为**探活那一步非零退出**（任务 failed、`responds` 判 unknown），
+      而不是"动作压根没跑"（规范 §12.31.4 / 断言 ㊲③）。
+
+steps:
+  - name: probe
+    title: ★★ 真探活（走 gRPC 问一句；看得到 Server 段才算通）
+    run: [ctr, version]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 30
+    note: >
+      ★★ **本步是自证来源**，也是配方里 `responds` 的判据所在（`first_field: "Server:"`）。
+      ★ **成功时不判"输出非空"就够了，判的是"里面有没有 Server 段"** ——
+      那是 `responds` 干的事；本步的自证只保证"问得出话来"（空输出对 `raw` 是 None，那才是真故障）。
+
+  - name: images_count
+    title: 本地镜像缓存条数（★ 数行数：空清单是 **0 这个结论**）
+    run: [ctr, -n, k8s.io, images, ls, -q]
+    parser: line_count
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★ 与 `images` 是**同一条命令、两个解析器**（§10.6.3 的老做法）：
+      一个镜像都没有时 `raw` / `lines` 给空（那是"没有"），而 `line_count` 给 **0**。
+      ★ 自证挂在这一步上（**数字**），不挂在原文那一步上 —— 否则"缓存是空的"会变成假红。
+
+  - name: images
+    title: 本地镜像缓存清单（人看的那一份）
+    run: [ctr, -n, k8s.io, images, ls, -q]
+    parser: head_lines
+    parser_arg: "{{ images_limit }}"
+    ok_exit_codes: [0]
+    optional: true
+    timeout: 60
+    note: '只取前 N 条给人看；总数看上面那一步。★ 截断与否不影响任何判定。'
+
+verify:
+  - name: ★★ 探活必须问得出话来（`ctr version` 给了非零退出码 = 守护进程没在应答）
+    from: probe
+    on_missing: >
+      拿不到 `ctr version` 的输出 —— 大多数情况下是 **containerd 没在跑**
+      （客户端在、`/run/containerd/containerd.sock` 没应答）。
+      ★ 这不是"本动作没写好"，而是"运行时真的不在"：先看「单元状态」里 containerd.service，
+      再决定要不要起它。
+  - name: 必须数得出镜像缓存条数（数不出来说明 daemon 应答了但内容库读不到）
+    from: images_count
+    on_missing: 数不出条数 —— daemon 在应答但镜像库读不到（够罕见，别当成"没有镜像"）
+
+conclusion: |
+  【{host.name}】容器运行时真探活（只读）
+  ── 探活（ctr version）──
+  {probe}
+
+  ── 本地镜像缓存：共 {images_count} 条（下面是最多 {images_limit} 条）──
+  {images}
+
+  判读：
+    · ★★ **上面那段里出现 `Server:` 段** ⇒ containerd 的 API **真的在应答**；
+      只有 `Client:` 段（或整段报错）⇒ 客户端在、**守护进程不在**
+      —— 这时 `systemctl is-active containerd` 说什么都**不算数**（那是旁证，不是探活）；
+    · ★ 镜像缓存条数为 **0** 是**结论**（"本地没有镜像"），不是"读不到"：
+      本动作的探活那一步会先失败，走不到这里；
+    · ★ 本动作**只读**：不启停服务、不拉镜像、不删任何东西；
+    · ★ 它**不判**"镜像来源配得对不对" —— 那件事只有**真拉一次**（`container.pull`）能回答
+      （规范 §12.31.3：`401` 只说明"仓库活着"，**不等于**"这条路能拉下来"）。

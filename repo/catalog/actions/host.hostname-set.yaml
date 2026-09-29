@@ -1,0 +1,112 @@
+# ============================================================
+# 动作：设置主机名（身份五项之③）
+# 来源：规范 §12.128 / §12.132（地址与名字由人给，写进登记）
+# 形态：hostnamectl set-hostname + /etc/hosts 的 127.0.0.1 那行 → **回读**判据
+# 风险：yellow（可恢复）｜ 执行通道：ssh
+# ============================================================
+
+id: host.hostname-set
+title: 设置主机名（身份五项之③）
+summary: 给这台机器一个新的主机名 —— 克隆机顶着母机的名字，纳管与巡检都会认错人
+domain: A
+risk: yellow
+priority: P0
+channel: ssh
+tags: [变更, 身份, 造机]
+
+note: |
+  ★ 身份五项之③（规范 §12.128）。克隆出来的机器**顶着母机的名字** ⇒
+    纳管登记、巡检报告、告警里的人名会全部指向母机。
+  ★★ 判据（**问被重置的那一方**）：`hostname` **回读**等于目标值。
+    "`hostnamectl` 返回 0"不算（§12.117 同源）。
+  ★ 连带改 `/etc/hosts` 里 `127.0.0.1` 那一行 —— 否则本机解析仍会把旧名字当自己
+    （sudo / 本地服务会不认新名字）。
+  ★ **不碰** DNS、不碰其它机器的 hosts：那属于网络与目录服务的范畴（不在本话题范围）。
+  ★ 演练开关 `dry_run=yes`：只跑判据、不动手 ⇒ 判据**必须红**。
+
+confirm:
+  title: 确认设置主机名
+  body: |
+    即将把「{host.name}」（{host.address}）的主机名设为：**{name}**
+
+    会发生什么：
+      · `hostnamectl set-hostname {name}`（同时写 `/etc/hostname`）
+      · `/etc/hosts` 里 `127.0.0.1` 那一行的名字跟着改
+      · ★ **不改** SSH 的提示符、不改 DNS、不改别的机器上的记录
+
+    能不能撤回：
+      · 能：把主机名改回去（旧 `/etc/hostname` 与 `/etc/hosts` 已备份）
+      · 回不去的：已经按新名字建立的日志 / 指标序列（它们自己的账）
+
+    判据（做完怎么算成）：
+      · `hostname` **回读** == {name}
+  confirm_text: 我已确认要改这台机器的主机名
+
+backup:
+  - path: /etc/hostname
+    label: 改名前的主机名文件
+    required: false
+  - path: /etc/hosts
+    label: 改名前的主机名解析表
+    required: false
+
+params:
+  - name: name
+    label: 新主机名
+    type: str
+    required: true
+    default: aoc-tpl-01
+    pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+    placeholder: aoc-tpl-01
+    help: 只许小写字母/数字/连字符（RFC 1123）；★ 建议与 `hosts.yaml` 里的 id 保持一致
+
+  - name: dry_run
+    label: 演练模式（只跑判据、不动手）
+    type: enum
+    required: true
+    choices: ["不演练：真的改名", "演练：只判定、不动手"]
+    values: ["no", "yes"]
+    default: "no"
+
+steps:
+  - name: push_script
+    title: 把身份脚本推到目标机
+    transfer: put
+    src: aoc-identity.sh
+    dst: /usr/local/sbin/aoc-identity.sh
+    parser: raw
+
+  - name: reset
+    title: 改名 + 自证（★ 判据是**回读**，退出码就是结论）
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, reset, hostname, "{{ name }}", "{{ dry_run }}"]
+    parser: raw
+    timeout: 120
+    ok_exit_codes: [0]
+    note: |
+      ★ 0 = 回读等于目标名 · 3 = 回读不是目标名（**判红**）· 2 = 读不到 / 命令不在。
+      ★ 这一步**不许 optional**：它就是本动作的判据。
+
+  - name: after
+    title: 判据的**旁证**：独立重读一次
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, show, hostname]
+    parser: raw
+    timeout: 60
+    optional: true
+
+verify:
+  - name: 主机名必须真的改过来了（否则任务已经是失败）
+    from: reset
+    on_missing: 改名那一步没有给出任何输出 —— 本结论不可用
+  - name: 必须能独立重读到新主机名（旁证）
+    from: after
+    on_missing: 独立重读没有输出 —— ★ 这不等于"没成功"，但不该继续往下走
+
+conclusion: |
+  【{host.name}】主机名设置结果
+  · 目标名：{name}
+  · 脚本自证：{reset}
+  · 独立重读：{after}
+
+  ★ 判据（问被重置的那一方）：`hostname` **回读** == {name}
+  ★ 连带改了 `/etc/hosts` 的 127.0.0.1 那一行（否则本机解析仍认旧名字）；
+    ★ **没碰** DNS、也没碰其它机器上的记录 —— 那是网络/目录服务的范畴（不在本话题范围）。

@@ -1,0 +1,69 @@
+# ============================================================
+# 动作：路由与邻居
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 F（P0 · 只读）
+# 形态：一次给全结论（默认路由 + 完整路由表 + ARP/邻居表）
+# 风险：green
+# ============================================================
+
+id: net.route
+title: 路由与邻居
+summary: 默认网关、完整路由表与邻居（ARP）表，含二层异常判读
+domain: F
+risk: green
+priority: P0
+tags: [只读, 网络, 路由, ARP]
+note: |
+  两个数据源都用 `ip -j`（结构化 JSON）。邻居表的 state 是列表（如 ["REACHABLE"]），
+  由 format_value 用「、」连接，不再渲染成 ['REACHABLE'] 这种 Python 字面量。
+
+params: []
+
+steps:
+  - name: gw
+    title: 默认路由
+    run: ["ip", "-j", "route", "show", "default"]
+    parser: json
+
+  - name: routes
+    title: 路由表
+    run: ["ip", "-j", "route"]
+    parser: json
+
+  - name: neigh
+    title: 邻居（ARP）表
+    run: ["ip", "-j", "neigh"]
+    parser: json
+    optional: true
+
+  - name: rules
+    title: 策略路由规则
+    run: ["ip", "-j", "rule"]
+    parser: json
+    optional: true
+    note: 只有配了策略路由（多线路/多网卡分流）才需要看；默认空表。
+
+verify:
+  - name: 必须读出路由表
+    from: routes
+    on_missing: ip -j route 没有返回任何路由 —— 网络栈可能异常
+  - name: 必须有默认路由
+    from: gw
+    severity: warn
+    on_missing: 未发现默认路由 —— 该机无法访问本网段以外的地址（内网孤岛机器可忽略）
+
+conclusion: |
+  【{host.name}】路由与邻居表
+  默认网关 {gw.0.gateway}（出口 {gw.0.dev}，协议 {gw.0.protocol}）｜ 路由条目 {routes.count} 条
+  路由表：
+  {routes}
+  邻居（ARP）表 {neigh.count} 条：
+  {neigh}
+  策略路由规则 {rules.count} 条：
+  {rules}
+
+  判读：
+  · 路由表三看：① 有没有 default（没有就出不了网）② 是否有同网段的重复/冲突条目 ③ metric 是否符合预期；
+  · 邻居表 state 说明：REACHABLE 正常 ｜ STALE/DELAY 正常（缓存老化）｜
+    FAILED 或 INCOMPLETE **持续出现** → 二层不通：网关 IP 写错、网段掩码不对、VLAN 不匹配、对端关机；
+  · 邻居表显示（无）→ 最近没和同网段主机通信过，属正常现象，不等于故障；
+  · 邻居表的 lladdr（MAC）为 00:00:00:00:00:00 或全 0 → 对端没有正确应答 ARP。

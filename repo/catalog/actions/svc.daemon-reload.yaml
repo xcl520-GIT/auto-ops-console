@@ -1,0 +1,129 @@
+# ============================================================
+# 动作：重载 systemd 单元定义（daemon-reload）
+# 来源：T8·S2 —— T6 定性、T7 再确认的**能力缺口**（规范 §12.25）
+# 风险：yellow
+# ============================================================
+
+id: svc.daemon-reload
+title: 重载 systemd 单元定义
+summary: systemctl daemon-reload —— 让 systemd 重新读盘上的单元文件与 drop-in（★ 它不重启服务）
+domain: E
+risk: yellow
+priority: P0
+tags: [变更, 服务, systemd, drop-in]
+
+note: |
+  ★★ **这个动作补的是一个挂了两个阶段的缺口**：T6 定性、T7 再确认 ——
+  全库动作里**没有任何一个**做 `systemctl daemon-reload`（它只出现在 `var/lab/` 的实验室脚本里）。
+  后果：**systemd drop-in 这条路一直封着** —— 新写的 drop-in，**systemd 看不见**。
+
+  ★★ **核心口径（§12.25.1 / §12.25.2）**：
+  · 它**做的**：让 systemd 重新读盘上的单元定义（单元文件 / drop-in / `EnvironmentFile`）；
+  · 它**不做的**：**不重启服务**、**不让已经在跑的进程换配置**；
+  · ★★ 它**更不能证明**"服务真的用了新配置" —— 那正是 T6 踩过的 **drop-in 假绿**
+    （写了 drop-in 不 reload ⇒ 服务照样用包自带配置跑、健康检查全绿、我们那份配置一个字没被读）。
+
+  ⇒ 所以本动作给出的是**第二重自证的第 ① 步**：`systemctl show` 读的是
+  **systemd 内存里那份定义**（`FragmentPath` / `DropInPaths`），
+  它能把"reload 之后 systemd 到底看见了哪些文件"摊开给你看。
+  ★ 要证"服务真的用了新配置"，必须**再重启服务 + 看探针**（§12.25.2 的 ② ③ 两步）——
+  本动作**只负责第 ① 步**，分工不许混。
+
+  ★ `unit` 是**必填**的：`daemon-reload` 本身是全量的，但我们需要一个单元
+  来产出"systemd 现在看见了什么"的证据 —— 不给单元，这个动作就只剩一句"我 reload 了"。
+
+confirm:
+  title: 确认重载 systemd 单元定义
+  body: |
+    即将在「{host.name}」（{host.address}）上执行 `systemctl daemon-reload`，
+    并回读 `{{ unit }}` 在 **systemd 内存里**的那份定义作为证据。
+
+    会发生什么：systemd 重新读盘上的单元文件与 drop-in 目录。
+    ★ **它不会重启任何服务**，也不会让正在跑的进程换配置 ——
+    "服务真的用了新配置"要靠"重启服务 + 探针"另证。
+  confirm_text: 我已确认要重载单元定义
+
+params:
+  - name: unit
+    label: 用哪个单元取证
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9@._-]{1,64}\.(service|socket|timer|target|mount|path)$'
+    default: kubelet.service
+    placeholder: kubelet.service
+    help: 'reload 是全量的；这个参数只决定"用哪个单元回读定义"作为证据'
+
+steps:
+  - name: reload
+    title: 重载单元定义（daemon-reload）
+    run: [systemctl, daemon-reload]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+    note: ★ 成功时**什么都不输出** ⇒ 不能当自证来源（§9.6）；自证交给下一步的 `show`。
+
+  - name: show
+    title: ★★ 回读 systemd **内存里**那份定义（第二重自证的第 ① 步）
+    run:
+      - systemctl
+      - show
+      - "{{ unit }}"
+      - -p
+      - LoadState
+      - -p
+      - ActiveState
+      - -p
+      - SubState
+      - -p
+      - FragmentPath
+      - -p
+      - DropInPaths
+      - -p
+      - UnitFileState
+    parser: shell_kv
+    ok_exit_codes: [0]
+    timeout: 30
+    note: >
+      ★ `FragmentPath` 是 systemd 认为的主单元文件；`DropInPaths` 是它**现在看得见**的
+      drop-in 清单。★ 这两个值都来自 **systemd 的内存**，所以它们能回答
+      "reload 之后 systemd 到底看见了哪些文件" —— 这正是"写了 drop-in 有没有被看见"的取证口。
+
+  - name: files
+    title: 单元文件与 drop-in 原文（人看的证据）
+    run: [systemctl, cat, "{{ unit }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1]
+    timeout: 30
+
+verify:
+  - name: ★★ 必须能回读到 systemd 的定义（这一步问不出来才算故障）
+    from: show
+    on_missing: >
+      `systemctl show` 没有任何键值 —— 目标机不是 systemd 系统，或权限不足。
+      ★ 反过来：`ActiveState=inactive` / `DropInPaths` 为空**都不算故障**，那是结论。
+  - name: 必须能读回单元文件原文（拿不到说明这个单元的证据不完整）
+    from: files
+    severity: warn
+    on_missing: 读不到单元文件 —— 这个单元可能不存在（用「单元状态」确认一下）
+
+conclusion: |
+  【{host.name}】重载 systemd 单元定义（变更）
+  已执行：systemctl daemon-reload ｜ 取证单元：{unit}
+  · LoadState：{show.LoadState} ｜ UnitFileState：{show.UnitFileState}
+  · 运行状态 ActiveState / SubState：{show.ActiveState} / {show.SubState}
+  · ★ systemd 认为的主单元文件（FragmentPath）：{show.FragmentPath}
+  · ★ systemd **现在看得见**的 drop-in（DropInPaths）：{show.DropInPaths}
+  · 单元文件与 drop-in 原文：
+  {files}
+
+  判读：
+    · ★★ **这一步只做到了一半**：它证明"**systemd 重新读了盘上的定义**"，
+      **不证明**"服务真的用了新配置"（§12.25.2）——
+      剩下两步是：**重启服务**（`svc.restart`）+ **看探针**（`state` / `port_open` / `responds`）；
+    · ★ `DropInPaths` 里**没有**你刚写的那个 drop-in ⇒ 说明它所在的目录**不在 systemd 的搜索路径里**
+      （或文件名不合法）—— 这种情况不 reload 也没用，先查落点（§12.25.3 的约定位置）；
+    · ★ `DropInPaths` 里**有**它、但服务行为没变 ⇒ 那是**第二重自证 ②** 没做（没重启 / 有更高优先级的定义覆盖）；
+    · 本动作**不重启服务、不改任何文件** —— 它只让 systemd 重新读一遍；（因此它的 `changed` 恒为"没变"）
+    · ★ 回退：`daemon-reload` 本身**没有可回退的东西**（它不写盘）；
+      要"回到改之前"就把 drop-in 删掉再 reload 一次（删除属 `file.remove`）。

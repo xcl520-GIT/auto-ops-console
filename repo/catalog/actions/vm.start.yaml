@@ -1,0 +1,131 @@
+# ============================================================
+# 动作：启动虚拟机
+# 来源：设计\05-虚拟化层-架构设计.md §3/§4 · 总纲 §4.2 T16 · 红线 16
+# 形态：VMware 收下请求（收条）→ 等到 VMware 认为它在跑（判据）
+# 风险：yellow（★ 红线 16：开机不是默认行为，必须人点头）
+# 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.start
+title: 启动虚拟机
+summary: 把一台关机的虚拟机开起来 —— ★ 返回 0 只是"VMware 收下了"，判据在后面那条探针上
+domain: M
+risk: yellow
+priority: P0
+channel: local
+tags: [变更, 虚拟化, 电源]
+
+note: |
+  ★★ 本动作把"命令返回 0 ≠ 事情成了"落在**电源**这一层（规范 §12.117 / §12.119）：
+    · `vmrun start` 那一步是**收条** —— 它只说明 VMware 收下了请求，所以它是 `optional`
+      （对已经在跑的 VM，`vmrun` 可能直接报错，**那不是失败，是幂等**）；
+    · 真正的判据是后面那条**探针**：问 VMware（`vmrun list`）"它到底在不在跑"。
+      ★ 探针那一步**不许 optional** —— 把判据设成 optional 就等于**把判据取下来**。
+  ★★ 红线 16：**开机不是默认行为** —— 它消耗宿主机 CPU / 内存 / 磁盘 IO，
+    必须人点头（界面勾选确认 / AI 提请求后人点确认那一下）。
+  ★ 「起来了」与「能 ssh 进去」是**两件事**：本动作只断言前者（后者由紧随其后的体检回答）。
+
+confirm:
+  title: 确认启动虚拟机
+  body: |
+    即将在**宿主机**上启动虚拟机「{vm_name}」（{vm_vmx}）。
+
+    会发生什么：
+      · 该虚拟机开始占用**宿主机**的 CPU / 内存 / 磁盘 IO（≤ 4GB 内存 / 200GB 磁盘的规格）
+      · 它的服务会随开机自启（例如 target 机上的 kubelet / 监控三件套）
+      · ★ 若它已经在运行，本动作**什么都不会改**（幂等：探针会如实告诉你是"本来就在跑"）
+
+    能不能撤回：
+      · 能：`vm.stop`（soft，走 guest 优雅关机）即可关回去
+      · ★ 但**里面的服务会经历一次重启**，开机期间失败的请求恢复不了
+
+    判据（做完怎么算成）：
+      · 不是"命令返回 0"，而是**再问一次 VMware**：`vmrun list` 里出现这台机器
+  confirm_text: 我已确认要开机
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名；★ 只有"已登记"或"当次点名"的才允许操作
+
+  - name: timeout_sec
+    label: 最多等多少秒（等到 VMware 认为它在跑）
+    type: int
+    required: true
+    default: 120
+    min: 10
+    max: 900
+    help: 超过这个时间还没进入运行态 ⇒ **判红**（如实说"等不到"）
+
+precheck:
+  - name: vmx_ok
+    title: 确认这台虚拟机的 vmx 打得开
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "listSnapshots", "{{ vm_vmx }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    note: |
+      ★ 判据是 `vmrun` 自己能不能打开这个 vmx —— **对已关机的 VM 同样有效**（实测）。
+      ★ 这一步不成立 ⇒ 后面每一步都会是"打开不了"的噪音，所以让它当**预检**，
+        失败就中止（`PRECHECK_FAILED`），而不是让三条步骤各报一次同样的错。
+
+steps:
+  - name: probe_before
+    title: 动手前先问一次：它现在在跑吗（★ 幂等的判据来源）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "state", "--vmx", "{{ vm_vmx }}"]
+    parser: json
+    timeout: 60
+    note: |
+      ★★ 这一步是**幂等**的判据来源（规范 §12.117）：它读到的 `was_running`
+      决定本次是"真的开了一次机"还是"本来就开着、什么都没改"。
+      ★ 它必须**在动手之前**跑 —— 事后补问只能得到"现在在跑"，那证明不了"是我开的"。
+
+  - name: start
+    title: 请求开机（★ 这一步只是**收条**）
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "start", "{{ vm_vmx }}", "nogui"]
+    parser: raw
+    timeout: 120
+    optional: true
+    note: |
+      ★★ 为什么是 `optional`：对**已经在运行**的 VM，`vmrun` 可能直接报错，
+        而那是**幂等路径（已达终态）**，不是失败。
+      ★ 但"收条"这两个字要写在明处：这一步的成败**只说明 VMware 收没收到请求**，
+        **不说明它起来了** —— 判据在下一步。★ `nogui` = 不弹出 VMware 窗口（后台起）。
+
+  - name: wait_running
+    title: 判据：再问一次 VMware，它真的在跑吗（★ 退出码就是结论）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_vmx }}", "--expect", "running", "--wait", "{{ timeout_sec }}"]
+    parser: json
+    timeout: 960
+    ok_exit_codes: [0]
+    note: |
+      ★ 0 = 在运行 · 3 = 等到超时也没进运行态（**判红**）· 2 = 读不到（vmrun 不在等）。
+      ★ 这一步**不许 optional**：它是本动作唯一的判据。把它设成 optional 就等于"把判据取下来"
+        （规范 §12.119 —— 一个"失败了也不算失败"的判据就是假绿）。
+
+verify:
+  - name: 必须读到"动手前"的状态（否则幂等无法判定）
+    from: probe_before
+    field: was_running
+    on_missing: 没读到动手前的状态 ⇒ 这次到底改没改，**无法判定**（不许猜）
+  - name: 必须读到"动手后"的状态（判据本身要有证据）
+    from: wait_running
+    field: state
+    on_missing: 判据那一步没有给出状态 —— 本结论不可用
+
+conclusion: |
+  【{vm_name}】启动结果
+  · 动手前：{probe_before.state}（was_running={probe_before.was_running}）
+  · 动手后：{wait_running.state}（等了几秒 {wait_running.waited_sec}）
+  · VMware 的运行清单判据来源：{wait_running.checked}
+  · 收条那一步：见「start」步骤的原始输出（★ 它只说明 VMware 收没收到请求）
+
+  判读：
+  · 若 `was_running=yes` ⇒ 本次**没有改动任何东西**（幂等：它本来就在跑）；
+  · 现在**已经起来了** —— 但这**不等于**"能 ssh 进去"（规范 §12.117）：
+    要在里面做事，接着跑一次「一键体检」（它会真的 ssh 一次）；
+  · 用完记得关回去：`vm.stop`（soft，优雅关机）。

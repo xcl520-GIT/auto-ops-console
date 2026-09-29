@@ -1,0 +1,68 @@
+id: perf.overview
+title: 负载与资源概览
+summary: 负载 / CPU / 内存 / 换页 / IO 与中断，一屏判断"这台机器累不累"
+domain: I
+risk: green
+priority: P0
+tags: [性能]
+
+note: |
+  ★ 与「进程总览」的分工：那个回答"谁在吃资源"，这个回答"**整体压力是什么形状**"
+  （是 CPU 忙、内存紧、还是 IO 卡）。判断机器"累不累"先看这一屏。
+  ★ vmstat 采两次（间隔 1 秒）—— 第一次是**开机以来的平均值**，第二次才是"当下"。
+
+steps:
+  - name: loadavg
+    title: 负载与运行进程
+    run: [cat, /proc/loadavg]
+    parser: space_list
+    note: /proc/loadavg = 1/5/15 分钟负载 + 运行/总进程数 + 最近 PID
+
+  - name: vmstat
+    title: CPU / 内存 / 换页 / IO 快照（采 2 次）
+    run: [vmstat, "1", "2"]
+    parser: lines
+    timeout: 30
+    note: 第 2 行才是"当下这一秒"的值；1 秒间隔不会拖慢动作
+
+  - name: mem
+    title: 内存明细
+    run: [free, -m]
+    parser: free_m
+
+  - name: pressure
+    title: 内核压力停顿（PSI，若内核支持）
+    run: [cat, /proc/pressure/cpu]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1]
+    note: |
+      PSI 是较新内核（4.20+）的特性；没有该文件的机器上 cat 返回 **1**。
+      把它声明为"正常报告"并标 optional → 这一步既不会失败、也不会污染结论
+      （结论里显示（无）即可）—— 比让它显示成一个红色"failed"更诚实。
+
+verify:
+  - name: 负载数据可读
+    from: loadavg
+    on_missing: 读不到 /proc/loadavg
+  - name: vmstat 有输出
+    from: vmstat
+    on_missing: vmstat 没有输出（可能未安装 procps-ng）
+  - name: 内存明细可读
+    from: mem
+    on_missing: free 没有解析出内存数据
+
+conclusion: |
+  负载与资源概览（{host.name}）
+  · 负载（/proc/loadavg，1/5/15 分钟）：{loadavg}
+  · vmstat（第 2 行为"当下"）：
+  {vmstat}
+  · 内存（MB）：
+  {mem}
+  · CPU 压力停顿（PSI）：{pressure}
+
+  判读：
+    · 负载 > CPU 核数 且持续 → 有排队；**单看 1 分钟负载会误判**，要看 5/15 分钟；
+    · vmstat 里 `si`/`so` 长期非 0 = 在用 swap（内存不够）；
+    · `wa`（IO 等待）高 = 磁盘慢，不是 CPU 忙 —— 这两个要分清；
+    · PSI 的 avg10/avg60 比负载更敏感，它衡量"被卡住的时间比例"。

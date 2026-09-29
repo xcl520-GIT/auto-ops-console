@@ -1,0 +1,83 @@
+# ============================================================
+# 动作：HTTP 探测
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 F（P0 · 只读）
+# 形态：一次给全结论（响应码 / 各阶段耗时 / TLS 校验 / 响应头）
+# 风险：green
+# ============================================================
+
+id: net.http
+title: HTTP 探测
+summary: 探测一个 URL：响应码、建连与总耗时、TLS 校验结果，附响应头
+domain: F
+risk: green
+priority: P0
+tags: [只读, 网络, HTTP]
+note: |
+  用 curl 的 `-w` 输出**结构化结果**（%{http_code} 等变量），而不是解析 curl 的人读输出。
+  注意 `-w` 串里不能出现 `|`（动作层禁止 shell 元字符），所以用空格与中文分隔。
+  连接失败时 curl 返回非零退出码 → 外层会给出「原因 + 建议」（含 curl 的具体报错原文）。
+
+params:
+  - name: url
+    label: 要探测的 URL
+    type: str
+    required: true
+    default: https://www.baidu.com
+    pattern: '^https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{4,300}$'
+    placeholder: https://www.baidu.com
+    help: 必须带 http:// 或 https:// 前缀。默认填公网站点，便于先确认探测链路本身正常。
+  - name: timeout
+    label: 超时（秒）
+    type: int
+    min: 1
+    max: 30
+    default: 8
+
+steps:
+  - name: probe
+    title: 探测（响应码与耗时）
+    run:
+      - curl
+      - -sS
+      - -o
+      - /dev/null
+      - -w
+      - "HTTP %{http_code} ｜ 总耗时 %{time_total}s ｜ 建连 %{time_connect}s ｜ TLS校验 %{ssl_verify_result} ｜ 下载 %{size_download} 字节"
+      - --max-time
+      - "{{ timeout }}"
+      - "{{ url }}"
+    parser: raw
+    note: >
+      -sS = 静默但保留错误信息；-o /dev/null 丢弃正文只取指标。
+      变量表见 curl 手册的 -w 段，全部是结构化字段，不受版本影响。
+
+  - name: headers
+    title: 响应头
+    run: ["curl", "-sS", "-I", "--max-time", "{{ timeout }}", "{{ url }}"]
+    parser: lines
+    optional: true
+    timeout: 40
+    note: 用 HEAD 请求取响应头（Server / Content-Type / Location / 缓存策略）。站点不支持 HEAD 时本步跳过。
+
+verify:
+  - name: 必须拿到 HTTP 探测结果
+    from: probe
+    on_missing: curl 没有输出任何指标 —— 探测链路异常，本结论不可用
+
+conclusion: |
+  【{host.name}】HTTP 探测
+  目标 URL：{url} ｜ 超时 {timeout}s
+  探测结果：
+  {probe}
+  响应头（HEAD 请求）：
+  {headers}
+
+  判读：
+  · 2xx → 服务正常；3xx → 跳转（看响应头的 Location）；401/403 → 鉴权/权限问题（不是网络问题）；
+    404 → 路径不对；5xx → 服务端自身报错（去目标机看服务日志）；
+  · 出现 000 或整条探测报错 → 连不上：① 目标端口是否在监听（用「端口占用」）
+    ② 防火墙是否放行（用「防火墙规则」）③ 目标服务是否在跑；
+  · 建连耗时远大于总耗时 → 网络层慢（链路/防火墙丢包）；两者接近 → 服务端处理慢；
+  · TLS校验 0 = 证书校验通过；非 0 → 证书链有问题（自签、过期、域名不匹配），
+    证书到期时间用「证书到期检查」动作确认；
+  · 响应头显示（无）→ 该站点不接受 HEAD 请求（正常，看上面的响应码即可）。

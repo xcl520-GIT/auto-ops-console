@@ -1,0 +1,86 @@
+# ============================================================
+# 动作：DNS 解析链路
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 F（P0 · 只读）
+# 形态：一次给全结论（DNS 服务器 + hosts + 正向解析 + 全部地址记录）
+# 风险：green
+# ============================================================
+
+id: net.dns
+title: DNS 解析链路
+summary: DNS 服务器、本地 hosts 与一次完整解析验证（用的就是应用真实走的链路）
+domain: F
+risk: green
+priority: P0
+tags: [只读, 网络, DNS]
+note: |
+  ★ 实测事实：RHEL 10 最小安装**没有** dig / nslookup / host（只有 getent）。
+  所以本动作走 `getent hosts` —— 它调用 glibc 的解析链路（/etc/nsswitch.conf 决定的顺序：
+  先 files 再 dns），**比 dig 更接近"应用实际会怎么解析"**。
+  想要 dig，先装：dnf install -y bind-utils（结论里也写了这句）。
+
+params:
+  - name: name
+    label: 要解析的名字或 IP
+    type: str
+    required: true
+    default: 198.51.100.2
+    pattern: '^[A-Za-z0-9._:-]{1,253}$'
+    placeholder: www.example.com
+    help: 域名做正向解析；填 IP 则是反查（PTR）。默认填的是本环境 NAT 网关。
+
+steps:
+  - name: resolv
+    title: DNS 服务器配置
+    run: ["cat", "/etc/resolv.conf"]
+    parser: lines
+
+  - name: hosts_file
+    title: 本地 hosts
+    run: ["cat", "/etc/hosts"]
+    parser: lines
+    optional: true
+    note: 解析顺序里 files 在 dns 之前，所以 /etc/hosts 里的一条记录会"抢先"生效 —— 排障必须先看它。
+
+  - name: resolve
+    title: 解析结果（getent hosts）
+    run: ["getent", "hosts", "{{ name }}"]
+    parser: lines
+    optional: true
+    note: >
+      解析不出来时 getent 返回退出码 2。这里标 optional，是为了让"解析失败"表现为
+      结论里的（无）+ 下面的排查方向，而不是把整个动作判失败（那是"结论"不是"故障"）。
+
+  - name: resolve_ah
+    title: 全部地址记录（getent ahosts）
+    run: ["getent", "ahosts", "{{ name }}"]
+    parser: lines
+    optional: true
+    note: ahosts 会把同一名字的所有 A/AAAA 记录与排序结果都给出来。
+
+verify:
+  - name: 必须读到 DNS 配置
+    from: resolv
+    on_missing: 读不到 /etc/resolv.conf —— 无法判断该机用哪个 DNS 服务器
+  - name: 必须拿到解析结果
+    from: resolve
+    severity: warn
+    on_missing: 该名字解析失败（见下方判读的三步排查）
+
+conclusion: |
+  【{host.name}】DNS 解析链路（查询 {name}）
+  本机 DNS 服务器（/etc/resolv.conf）：
+  {resolv}
+  本机 hosts（会先于 DNS 生效）：
+  {hosts_file}
+  解析结果（getent hosts {name}）：
+  {resolve}
+  全部地址记录（getent ahosts {name}）：
+  {resolve_ah}
+
+  判读：
+  · 解析顺序由 /etc/nsswitch.conf 的 hosts 行决定（通常是 `files dns`）：先 /etc/hosts，再问 DNS；
+  · 结果显示（无）→ 三步排查：① 上面 DNS 服务器是否可达（用「连通性与路径」ping 它，注意 53/UDP）；
+    ② 名字是否拼写正确（用「HTTP 探测」直接打 IP 更易定位）；③ /etc/hosts 里是否有冲突记录；
+  · 想要 dig / nslookup / host 这类细粒度工具：目标机默认没装，`dnf install -y bind-utils` 即可
+    （用「包搜索」动作可以直接查哪个包提供它）；
+  · 本动作只读：只做查询，不修改任何解析配置。

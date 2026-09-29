@@ -1,0 +1,127 @@
+id: fw.port-open
+title: 防火墙放行端口
+summary: firewall-cmd 放行端口（永久或仅运行时），并自证规则真的在运行时生效
+domain: F
+risk: yellow
+priority: P1
+tags: [变更, 防火墙]
+
+note: |
+  ★ 自证用的是 `--query-port` 的**退出码**（0=已放行 / 1=未放行），
+  而不是"add-port 返回 0"。只加 `--permanent` 却不 reload 是最典型的"看着成功其实没生效"，
+  所以本动作在永久模式下会**显式 reload**，随后查的是 **runtime** 是否真的生效。
+  ★ 注意：firewalld 必须是运行状态。本工作台当前 4 台靶机上它都是 inactive，
+  预检会在这种时候直接说明原因（而不是抛一句"命令失败"）。
+
+confirm:
+  title: 确认放行端口
+  body: |
+    即将在「{host.name}」（{host.address}）的防火墙区域「{zone}」放行 {port}/{protocol}。
+
+    会发生什么：该端口在这个区域变为可达（public 区域通常意味着对外可达）。
+    可撤回：用「防火墙撤销端口」撤销放行。
+  confirm_text: 我已确认要放行
+
+params:
+  - name: port
+    label: 端口
+    type: int
+    required: true
+    min: 1
+    max: 65535
+    default: 8080
+    help: '1–65535'
+  - name: protocol
+    label: 协议
+    type: enum
+    choices: [TCP, UDP]
+    values: [tcp, udp]
+    default: tcp
+  - name: zone
+    label: 区域
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9_-]+$'
+    default: public
+    help: '常见：public / trusted / drop；名字只允许字母数字与 _ -'
+  - name: permanent
+    label: 生效范围
+    type: enum
+    choices: [永久（重启后仍在）, 仅当前运行时]
+    values: ["--permanent", ""]
+    default: "--permanent"
+    help: '永久模式会写入配置并 reload；仅运行时模式重启即失效'
+
+precheck:
+  - name: fw_running
+    title: 确认 firewalld 正在运行
+    run: [firewall-cmd, --state]
+    parser: raw
+    ok_exit_codes: [0]
+    note: |
+      探针实测：firewalld 未运行时 `--state` 返回 **252**、输出 "not running"。
+      只接受 0 —— 没跑就停在预检（引擎会把 252 识别成"服务未运行"并给建议）。
+
+steps:
+  - name: before
+    title: 放行前：看该端口是否已在列表里（对照"新增"还是"已存在"）
+    run: [firewall-cmd, --zone, "{{ zone }}", --list-ports]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+
+  - name: open
+    title: 放行端口
+    run:
+      - firewall-cmd
+      - --zone
+      - "{{ zone }}"
+      - { when: permanent, value: "{{ permanent }}" }
+      - --add-port
+      - "{{ port }}/{{ protocol }}"
+    parser: raw
+    timeout: 30
+
+  - name: reload
+    title: 重载防火墙（仅永久模式会执行）
+    run:
+      - { when: permanent, value: firewall-cmd }
+      - { when: permanent, value: --reload }
+    parser: raw
+    optional: true
+    note: |
+      ★ 全部元素都挂 when → 参数为空时渲染出空 argv → 引擎整步跳过（规范 §8.3）。
+      永久模式必须 reload，否则规则只在配置文件里、runtime 没生效。
+
+  - name: query
+    title: 自证：查该端口在运行时是否已放行（★ 退出码就是结论）
+    run: [firewall-cmd, --zone, "{{ zone }}", --query-port, "{{ port }}/{{ protocol }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    note: 只接受 0（已放行）。若是 1，说明规则没真正生效 → 本步失败，动作判失败
+
+  - name: after
+    title: 放行后的区域概览
+    run: [firewall-cmd, --zone, "{{ zone }}", --list-all]
+    parser: lines
+
+verify:
+  - name: 端口查询返回已放行
+    from: query
+    on_missing: --query-port 没有返回内容
+  - name: 能读到区域概览
+    from: after
+    on_missing: 读不到 zone 概览，无法给出对照
+
+conclusion: |
+  防火墙放行结果（{host.name}）
+  · 区域：{zone}　端口：{port}/{protocol}　范围：{permanent}
+  · 放行前端口列表：{before}
+  · 查询结果：{query}
+  · 当前区域概览：
+  {after}
+
+  判读：
+    · query 应为 yes（且本步的退出码已是 0）；
+    · 若是永久模式，重启后仍在；仅运行时模式重启即失效；
+    · 撤销：执行「防火墙撤销端口」，参数填同一组值。

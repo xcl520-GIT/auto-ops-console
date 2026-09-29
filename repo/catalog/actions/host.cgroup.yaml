@@ -1,0 +1,107 @@
+# ============================================================
+# 动作：cgroup 版本与控制器
+# 来源：T8·S2 —— T8·S4「建集群前提检查」缺的那一半（cgroup v2）（规范 §12.24 同族）
+# 形态：**只读**（green）—— 一次给全：版本 / 挂载点 / 控制器 / 委派开关
+# ============================================================
+
+id: host.cgroup
+title: cgroup 版本与控制器
+summary: cgroup v1 还是 v2、挂载点、可用控制器与子树委派开关（容器主机的必查项）
+domain: A
+risk: green
+priority: P1
+tags: [只读, 内核, cgroup, 容器前置]
+
+note: |
+  ★ 为什么需要它：现代 Kubernetes（1.31+ 起默认、1.34 上是常态）要求 **cgroup v2**；
+  而"这台机器到底是 v1 还是 v2"以前在平台上**没有任何动作能回答**
+  —— T8 侦察时只能靠换命令手工看。这是 T8·S4「前提检查」缺的那一半。
+
+  ★★ **判定口径（三句）**：
+  · `stat -fc %T /sys/fs/cgroup` 给 **`cgroup2fs`** ⇒ **统一层级（v2）**；
+    给 `tmpfs` ⇒ 通常是 **v1 混合挂载**（各子系统各自挂）；
+  · 再看 `mounts` 段（`findmnt -t cgroup,cgroup2`）—— 它把"实际挂了什么"摊开，
+    ★ 比单看 fstype 可靠（有的发行版两者都在）；
+  · v2 上 `/sys/fs/cgroup/cgroup.controllers` 列出**这一层可用的控制器**
+    （`cgroup.subtree_control` 列出**已委派下去的**）—— 两个文件在 v1 上**不存在**，
+    所以它们标 `optional`：**"文件不在" = 这是 v1**，那是**结论**不是错误。
+
+  ★ `findmnt` 来自 util-linux（Rocky 最小化安装也有）；`stat` / `cat` 都在 coreutils 里。
+  ★ 本动作只读：不挂载、不改控制器、不动任何 cgroup 文件。
+
+params: []
+
+steps:
+  - name: fstype
+    title: /sys/fs/cgroup 的文件系统类型（★ 版本的第一手证据）
+    run: [stat, -fc, "%T", /sys/fs/cgroup]
+    parser: raw
+    timeout: 20
+
+  - name: mounts
+    title: cgroup 挂载点清单
+    run: [findmnt, -n, -o, "FSTYPE,TARGET", -t, "cgroup,cgroup2"]
+    parser: lines
+    optional: true
+    timeout: 20
+    note: >
+      ★ 逗号在同一个元素里 ⇒ 按 §9.8 加引号（不加引号 YAML 会把它当别的东西）。
+
+  - name: controllers
+    title: v2 可用控制器（v1 上这个文件不存在）
+    run: [cat, /sys/fs/cgroup/cgroup.controllers]
+    parser: raw
+    optional: true
+    timeout: 20
+    note: ★ 输出形如 `cpuset cpu io memory pids`；**空/不存在 ⇒ 这是 v1**（结论，不是错误）。
+
+  - name: subtree
+    title: v2 已委派的子树控制器
+    run: [cat, /sys/fs/cgroup/cgroup.subtree_control]
+    parser: raw
+    optional: true
+    timeout: 20
+
+  - name: self
+    title: 本进程所在 cgroup（v2 形如 `0::/...`）
+    run: [cat, /proc/self/cgroup]
+    parser: raw
+    optional: true
+    timeout: 20
+
+  - name: cgroup_v1
+    title: v1 各子系统挂载（v2 上通常为空）
+    run: [findmnt, -n, -o, "FSTYPE,OPTIONS", -t, "cgroup"]
+    parser: lines
+    optional: true
+    timeout: 20
+
+verify:
+  - name: 必须读出 /sys/fs/cgroup 的类型（★ 这一步问不出来才算故障）
+    from: fstype
+    on_missing: >
+      `stat -fc %T /sys/fs/cgroup` 没有输出 —— cgroup 文件系统不可达（内核不支持或未挂载），
+      这时**无法判定版本**，不要当成"是 v1"。
+
+conclusion: |
+  【{host.name}】cgroup 版本与控制器（只读）
+  · /sys/fs/cgroup 类型（stat -fc %T）：**{fstype}**
+  · cgroup 挂载点：
+  {mounts}
+  · v2 可用控制器（cgroup.controllers）：{controllers}
+  · v2 已委派（cgroup.subtree_control）：{subtree}
+  · 本进程所在 cgroup（/proc/self/cgroup）：
+  {self}
+  · v1 子系统挂载（cgroup）：
+  {cgroup_v1}
+
+  判读：
+    · **`cgroup2fs` ⇒ 统一层级（v2）**：现代 Kubernetes / containerd 的首选，
+      资源限制与 `systemd` 同管一棵树的前提；
+    · **`tmpfs` ⇒ 多半是 v1 混合挂载**：看 `mounts` 段是否出现多个 `cgroup` 挂载点，
+      以及 `cgroup.controllers` 是否为空/不存在 —— 两者任一成立即可判 v1；
+    · ★ `cgroup.controllers` 为空（或文件不存在）**不是故障** —— 它只是说明"这一层没有控制器"
+      （v1 上本来就没这个文件），**结论要由 `fstype` + `mounts` 一起下**；
+    · ★ 与容器运行时/`kubelet` 的 `cgroupDriver` 口径有关：**两边必须一致**（都用 systemd）；
+      不一致会出现"资源限制失效、Pod 状态混乱"这类难查的问题；
+    · 本动作只读：不挂载、不改控制器、不写任何 cgroup 文件。

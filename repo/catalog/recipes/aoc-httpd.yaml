@@ -1,0 +1,148 @@
+# ============================================================
+# 配方：Apache httpd（★ T7·S5 样例：**用脚手架生成、按 TODO 填空完成**）
+# ------------------------------------------------------------
+# 一次点击 = 从"机器上什么都没有"到"站点 8085 可用且**真能返回 200**"：
+#   装包 → 渲染站点配置 + 首页 → 启动 + 自启 → （配置变了才）重启 → 健康检查
+# 反向操作：停止 / 卸载（保留数据）/ 卸载（全删）
+#
+# ★ 这份配方是**"用户自己写一份配方"这条路的现场证据**（规范 §12.21）：
+#   骨架由 `python tools/new-recipe.py aoc-httpd --unit httpd --package httpd --port 8085 ^
+#            --config /etc/httpd/conf.d/aoc.conf --data /var/www/aoc-httpd` 生成，
+#   然后按骨架里那 7 处 `★ TODO` 逐条填入（下面用 `★ 填空 N` 标出填了什么）。
+#
+# ★ 设计宪法（规范 §12.0）：
+#   ① 只声明"要什么"，判定与分支一律走平台侧（没有一处命令、没有一处表达式）
+#   ② 「没变」可断言：第二次跑该清单为空就是幂等证明
+#   ③ 每个正向步骤都有反向操作（见 uninstall）
+# ============================================================
+
+id: aoc-httpd
+name: Apache httpd（自写配方样例）
+version: "1"
+summary: 一键部署 Apache httpd（站点配置 + 首页 + HTTP 200 真探活 + 幂等重跑 + 可卸载）
+risk: yellow
+
+note: |
+  ★ 这是 T7·S5 的**样例配方**：它证明"用户自己写一份配方"这条路真的走得通 ——
+  从脚手架到能跑，全程**没有改一行平台代码**（规范 §12.21）。
+
+  ★ **填空 ①（配置文件写在哪）** —— 规范 §12.13.5：找服务自己留的钩子。
+    真机确认：RHEL 的 `httpd.conf` 末尾有 `IncludeOptional conf.d/*.conf`（server 配置上下文）
+    ⇒ 我们**只往 `/etc/httpd/conf.d/` 里放一个自己的文件**（`aoc.conf`），**不动**包自带的
+    `httpd.conf` —— 那个文件是包管理的，`remove_config` 复原不了它（T5 踩过）。
+
+  ★ **填空 ②（怎么生效）** —— httpd 要重启才会重读 `conf.d`，所以用"`notify` 唤起 `svc.restart`"。
+
+  ★ **填空 ③（健康检查"真问一句"）** —— 规范 §12.11：骨架默认只有 `state` + `port_open`（**旁证**），
+    这里补上 `http_status: 200` —— ★ 它才是"这个站点真的能返回页面"的证据。
+    （★ 也因此需要渲染一份 `index.html`："目录里什么都没有"时 Apache 会回 403，不是 200。）
+
+  ★ **填空 ④（数据目录）** —— `/var/www/aoc-httpd` 是**站点内容**：进 `keep_data`（"保留数据"真保留），
+    只在「全删」时由 `purge_paths` 删掉。
+
+  ★ **填空 ⑤（前置护栏）** —— 骨架里那段 `absent: httpd` 是**示例**（照抄就把自己拦住了：本配方
+    装的就是 httpd）⇒ 按骨架的说明**整段删掉**。★ 为什么不改成"absent nginx"：nginx 与 httpd
+    各占各的端口，**并不冲突** —— 宁可不写，也不写一个假闸门（规范 §12.6）。
+
+  ★ **填空 ⑥（包名）** —— `httpd`（不是 `apache2`：那是 Debian 系的名字）。
+
+  ★ **填空 ⑦（模板内容）** —— 骨架给的 `port = {port}` 是占位，换成 Apache 真正认的
+    `Listen` + `<VirtualHost>`（见 `catalog/templates/aoc-httpd/main.conf`）。
+
+  ★ 诚实标注：本配方的站点目录**没有**做 SELinux 上下文迁移（`semanage fcontext`）。
+    本环境 SELinux 是 **Permissive**，所以不受影响；★ 在 **Enforcing** 的机器上，
+    自定义 DocumentRoot 需要 `httpd_sys_content_t`，否则会返回 403 ——
+    而**这正是"健康检查真问一句"的价值**：它会把 403 判成 fail，而不是"服务在跑就算成功"。
+
+params:
+  - name: port
+    label: 监听端口
+    type: int
+    required: true
+    min: 1024
+    max: 65535
+    default: 8085
+    help: '默认 8085（避开 80，也避开 nginx 配方的 8080）。改端口后重跑一次配方即可。'
+  - name: root_dir
+    label: 站点目录
+    type: str
+    required: true
+    pattern: '^/var/www/[A-Za-z0-9][A-Za-z0-9._-]{0,40}$'
+    default: /var/www/aoc-httpd
+    help: '必须落在 /var/www/<名字>；配方会**自己创建**它（不用你提前建目录）。'
+
+steps:
+  - name: install
+    title: 安装 httpd
+    action: pkg.install
+    args: { package: httpd }
+
+  - name: render_conf
+    title: 渲染站点配置（/etc/httpd/conf.d/aoc.conf）
+    template: aoc-httpd/main.conf
+    dest: /etc/httpd/conf.d/aoc.conf
+    mode: "0644"
+    notify: [restart]
+    note: >
+      ★ 内容 sha256 与目标机现有一致时**不写盘**（规范 §12.4）⇒ 幂等的那一次既不产生变更、也不触发重启。
+
+  - name: render_index
+    title: 渲染首页（{{ root_dir }}/index.html）
+    template: aoc-httpd/index.html
+    dest: "{{ root_dir }}/index.html"
+    mode: "0644"
+    notify: [restart]
+    note: '★ 目录靠"往目录里写一个正经文件"建出来（规范 §12.13.6）。'
+
+  - name: start
+    title: 启动服务
+    action: svc.start
+    args: { unit: httpd }
+
+  - name: enable
+    title: 设为开机自启
+    action: svc.enable
+    args: { unit: httpd }
+
+  - name: restart
+    title: 重启 httpd（仅当配置真的变了）
+    action: svc.restart
+    args: { unit: httpd }
+    trigger_only: true
+    note: '由两个渲染步骤的 notify 唤起；第二次跑（内容没变）**根本不会执行** —— 幂等靠这个成立。'
+
+health:
+  - expect:
+      state: { unit: httpd, equals: active }
+  # ★★ 这一条才是"真问一句"（规范 §12.11）：站点真的能返回 200
+  - expect:
+      http_status: { url: "http://127.0.0.1:{{ port }}/", equals: 200 }
+  - expect:
+      port_open: "{{ port }}"
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: httpd }
+  disable:
+    - action: svc.disable
+      args: { unit: httpd }
+  # ★ 只删**配方自己写出来的**那两个文件（包自带的 httpd.conf 一个字不动）
+  remove_config:
+    - action: file.remove
+      args: { path: /etc/httpd/conf.d/aoc.conf }
+  # ★ 站点内容：只在「全删」时删
+  purge_paths:
+    - "{{ root_dir }}"
+  keep_data:
+    - "{{ root_dir }}"
+  remove_packages:
+    - httpd
+  stop_confirm_text: 我已确认要停止服务
+  purge_confirm_text: 我已确认全删
+  # ★ 停止 / 「保留数据」卸载**之后**应当成立的事实（规范 §12.6.3）：
+  #   用"**端口没人听**"这种外部可观测的判据，不用 `state: {equals: inactive}`
+  #   （后者依赖"单元还驻留在 systemd 内存里"，`svc.disable` 之后它会从内存卸载 —— T5 真跑踩过）。
+  health:
+    - expect:
+        free_port: "{{ port }}"

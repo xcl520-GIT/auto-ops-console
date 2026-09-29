@@ -1,0 +1,187 @@
+# ============================================================
+# 动作：滚动重启
+# 来源：T9·S4 —— 规范 §12.37.1 ①、§12.38
+# 形态：**可恢复变更**（yellow，但"没重启过"这个状态回不去）
+# ============================================================
+
+id: k8s.rollout-restart
+title: 滚动重启
+summary: 让工作负载逐个换新（不等价于"重启机器"）—— ★ 判据是 `generation` 真的前进过 ＋ 滚动完成
+domain: J
+risk: yellow
+priority: P1
+tags: [变更, K8s, 工作负载]
+
+note: |
+  ★★ **判据两条，缺一不可**（规范 §12.37.1 ①）：
+  ① **`generation` 真的前进过**（前后对照）—— 它证明"这次确实触发了新的滚动"；
+  ② **`rollout status` 的退出码为 0** —— 它证明"新版本真的起来了"。
+  ★ 只听 `kubectl rollout restart` 的返回 0 **不够**：那只是"声明被收下了"。
+
+  ★★ **回得去 / 回不去**（规范 §12.38）：
+  · ❌ **"没重启过"这个状态回不去** —— 重启就是重建容器，没有"撤销重启"。
+  · ✅ 但**不破坏可用性**：滚动是**逐个**来的（`maxUnavailable` 控制），期间服务不断。
+  ★ 这就是它 `yellow` 而不是 `red` 的理由：**不可逆，但不造成中断**。
+
+params:
+  - name: kind
+    label: 对象类型
+    type: enum
+    required: true
+    choices: [Deployment, StatefulSet, DaemonSet]
+    values: [deployment, statefulset, daemonset]
+    default: Deployment
+  - name: name
+    label: 对象名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: t9-web
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+  - name: wait_seconds
+    label: 等滚动完成超时（秒）
+    type: int
+    required: true
+    min: 10
+    max: 900
+    default: 180
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认滚动重启
+  body: |
+    即将对「{namespace}/{kind}/{name}」触发**滚动重启**：逐个重建容器。
+    · 能不能撤：❌ **回不去**（"没重启过"这个状态没有反操作）；
+      ★ 但它**不像"停服再起"**：滚动是逐个来的，期间服务不断（除非副本数只有 1）。
+    · 影响面：会短暂出现**新旧容器并存**；连接会被重新分配；有状态服务的启动时间可能较长。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认要滚动重启
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: target_exists
+    title: ★ 对象必须存在
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: gen_before
+    title: 改之前的 `metadata.generation`（★ 判据① 的对照值）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.metadata.generation}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: act
+    title: 触发滚动重启（★ 只说明"声明被收下了"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - rollout
+      - restart
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: wait
+    title: ★★ 判据②：等滚动真的完成（`rollout status` 的退出码）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - rollout
+      - status
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "--timeout={{ wait_seconds }}s"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 920
+
+  - name: gen_after
+    title: 改之后的 `generation`（★ 判据①：它**必须前进过**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.metadata.generation}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对），本次没有改任何东西。
+  - name: ★★ `generation` 必须前进过（否则"这次重启"没有被集群认作一次变更）
+    from: gen_after
+    on_missing: >
+      改完之后读回来的 `generation` 是空的 —— 说明这次没读到对象状态；
+      ★ 拿不到对照数据时**不给结论**（不许把它当成"重启成功了"）。
+
+conclusion: |
+  【{host.name}】滚动重启 · {namespace}/{kind}/{name}（变更）
+  `generation`：{gen_before} → {gen_after}（★ 前进过 = 这次真的触发了新滚动）
+  `rollout status` 原文：{wait}
+
+  ★★ 回得去 / 回不去（规范 §12.38）：
+    · ❌ **回不去**：没有"撤销重启"这回事（容器是新建的）；
+    · ✅ **但没造成中断**：滚动逐个进行（期间新旧并存），服务通常一直可用；
+    · ★ 要回到**上一个镜像**那是另一件事 —— 用 `k8s.set-image`（换回旧镜像）或 `k8s.rollout-undo`。
+
+  判读：
+    · ★★ 判据是 **`generation` 前进了** ＋ **`rollout status` 退出码为 0**，两条都要；
+    · ★ `DaemonSet` 的"期望数"随**节点数**变（节点被 `drain` 时它会变小）—— 那是正确行为；
+    · ★ 本动作**不动镜像、不动配置、不动副本数**（只改 `restartedAt` 那一笔注解）。

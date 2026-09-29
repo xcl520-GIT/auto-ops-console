@@ -1,0 +1,50 @@
+# ============================================================
+# 动作：虚拟机 IP（问 guest 自己）
+# 来源：设计\05-虚拟化层-架构设计.md §3 · 总纲 §4.2 第六阶段 T16
+# 形态：通过 VMware Tools 问 guest 要它自己的 IP
+# 风险：green ｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.ip
+title: 虚拟机 IP（问 guest 自己）
+summary: 通过 VMware Tools 问 guest 要 IP —— 用于确认"它起来之后地址是哪一个"
+domain: M
+risk: green
+priority: P1
+channel: local
+tags: [只读, 虚拟化, 网络]
+note: |
+  ★ 这是"**起来了**"这一类判据里的**第三级**（规范 §12.117 的三级判据表）：
+  Tools 能报出 IP ⇒ guest 已经启动到能跑 Tools 的程度。
+  ★★ 但它**不证明 ssh 通** —— 那是另一件事，归下一步（`host.checkup` 会红就说明不通）。
+  ★ 关机的 VM 上这条会**失败**，而失败的原因是"没在跑"（`VM_NOT_RUNNING`）——
+    这是**结论**，不是故障；平台会把它翻译成人话。
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名
+
+steps:
+  - name: ip
+    title: 问 guest：你的 IP 是多少
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "getGuestIPAddress", "{{ vm_vmx }}"]
+    parser: raw
+    timeout: 60
+
+verify:
+  - name: 必须拿到一个地址
+    from: ip
+    on_missing: guest 没有报出地址（VM 可能没在跑，或 guest 里没有可用的 VMware Tools）
+
+conclusion: |
+  【{vm_name}】guest 报告的地址：{ip}
+
+  判读：
+  · 这个地址是 **guest 自己**报的（经 VMware Tools），所以它同时也是"**工具在跑**"的证据；
+  · ★ 它**不等于**"ssh 通"：要确认能登进去，跑一次「一键体检」或「主机纳管」的探测；
+  · 关机状态下这条会读不到 —— ★ 那不是故障，是一条结论：**VM 没在跑**。

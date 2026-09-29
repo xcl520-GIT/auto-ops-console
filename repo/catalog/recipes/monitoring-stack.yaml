@@ -1,0 +1,411 @@
+# ============================================================
+# 配方：监控告警接入（T10 · 第四阶段·可观测）
+# ------------------------------------------------------------
+# 一次点击 = 从"机器上什么都没有"到"指标在采、规则在判、告警真的会响并且送得出去"：
+#   传四个 tarball → 解包 → 渲染配置与 unit → 起服务 → reload → 健康检查
+#
+# ★★★ 本配方与别的服务配方最大的不同：**它的验收不在"服务起来了"**。
+#   三件套"起没起来"只是本配方的 health；真正的判据是三只只读动作：
+#     · `mon.targets`          —— 指标**在采**（目标的 health）
+#     · `mon.rules`            —— 规则**在判**（生效面 vs 文件逐条对得上）
+#     · `mon.alerts-received`  —— 告警**真的送到了**（收端留证）
+#   请把这三只动作跑一遍再签收（开题单 §7 验收 #2 / #4 / #6）。
+#
+# ★ 设计宪法（规范 §12.0）：
+#   ① 本文件只声明"要什么"，**判定与分支一律走平台侧**（没有一处命令、没有一处表达式）
+#   ② 「没变」可断言：平台采集 changed → **第二次跑该清单为空**就是幂等证明
+#   ③ 每个正向步骤都有反向操作（见 uninstall）
+# ============================================================
+
+id: monitoring-stack
+name: 监控告警接入（Prometheus + Alertmanager + Grafana）
+version: "1"
+summary: 一键把监控三件套 + node_exporter + Webhook 收端装到本机，并让告警真的送得出去
+risk: yellow
+
+note: |
+  ★★ **装法（S0 实测决定，开题单 §10.2.1 #1）**：三件套一律走**官方静态 tarball**。
+    理由：本环境**没有 EPEL** —— `dnf search` 里 prometheus / alertmanager / node_exporter
+    **一个都搜不到**（只有 grafana 可得）；而"一半包管、一半 tarball"会产生**两套安装/卸载/残留清单**，
+    与"统一装到 /opt/aoc-monitoring/"这条口径直接冲突。
+  ★★ **tarball 由管理机下载、`file.push` 推上来**（§10.2.1 #2）：靶机到外网只有 **~0.10 MB/s**，
+    管理机有 **2.59~3.16 MB/s**，差 10~30 倍。四个包合计约 **325MB** ⇒ 走靶机要 ~55 分钟，走管理机 ~2 分钟。
+  ★★ **监听面（§12.53）**：Prometheus / Alertmanager / Webhook 收端**只绑 127.0.0.1**；
+    Grafana **只绑内网地址**（`grafana_bind`）；node_exporter 只绑本机内网地址（`listen_ip`）。
+    ★ **一处都不许出现 0.0.0.0** —— `mon.overview` 会读内核套接字表当场判红。
+  ★★ **保留期（§12.61）**：`retention.time` 与 `retention.size` **两个都显式设**。
+    ★ 只设时间是常见错 —— 写入量一大就爆盘；靶机只有 45GB 根分区。
+  ★★ **口令（红线 #2）**：本配方与模板里**没有一处口令**。Grafana 首次登录 `admin/admin`
+    会被**强制改密** —— ★★ **这一步只能人做**，报告里不会假装它已完成。
+  ★★ **回不去的东西（§12.38）**：时序数据（TSDB）/ 收端已收到的告警记录 / Grafana 里人手工改过的面板。
+    卸载会删掉前两个，第三个**不在本配方管辖范围内**（它不在我们的目录里，但也回不来）。
+
+params:
+  - name: scrape_interval
+    label: 抓取与求值间隔（秒）
+    type: int
+    required: true
+    min: 5
+    max: 120
+    default: 15
+    help: '默认 15 秒。★ 调小会让 4 台靶机的 CPU 明显上升（它们只有 4 核）。'
+  - name: site
+    label: 站点标签
+    type: str
+    required: true
+    default: aoc-lab
+    pattern: '^[a-z][a-z0-9-]{1,24}$'
+    help: 写进 external_labels.site，用来区分多套环境。
+  - name: prom_listen
+    label: Prometheus 监听地址
+    type: str
+    required: true
+    default: 127.0.0.1:9090
+    pattern: '^127\.0\.0\.1:[0-9]{2,5}$'
+    help: ★ 只许本机回环 —— Prometheus 的所有读写都由控制台经 ssh 在**本机**发起，没有对外暴露的必要（§12.53）。
+  - name: am_listen
+    label: Alertmanager 监听地址
+    type: str
+    required: true
+    default: 127.0.0.1:9093
+    pattern: '^127\.0\.0\.1:[0-9]{2,5}$'
+    help: ★ 同上：只许本机回环。
+  - name: ne_ip
+    label: node_exporter 绑定的内网地址
+    type: str
+    required: true
+    default: 192.0.2.13
+    pattern: '^(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}$'
+    help: ★ 采集器**必须绑能被 Prometheus 抓到的内网地址**，但**绝不许是 0.0.0.0**（§12.53）。
+  - name: ne_port
+    label: node_exporter 端口
+    type: int
+    required: true
+    min: 1024
+    max: 65535
+    default: 9100
+  - name: wh_bind
+    label: Webhook 收端绑定地址
+    type: str
+    required: true
+    default: 127.0.0.1
+    pattern: '^127\.0\.0\.1$'
+    help: ★★ 只许本机回环 —— Alertmanager 与收端同机，**监听面一处都不扩大**（§12.57）。
+  - name: wh_port
+    label: Webhook 收端端口
+    type: int
+    required: true
+    min: 1024
+    max: 65535
+    default: 9095
+    help: ★ 改了它，`receiver_url` 也要跟着改（两处不一致 ⇒ 投递会失败，收端会一直空着）。
+  - name: grafana_bind
+    label: Grafana 绑定的内网地址
+    type: str
+    required: true
+    default: 192.0.2.13
+    pattern: '^(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}$'
+    help: ★ Grafana 要给人用浏览器打开，所以绑内网地址（仍然**不是 0.0.0.0**）。
+  - name: grafana_port
+    label: Grafana 端口
+    type: int
+    required: true
+    min: 1024
+    max: 65535
+    default: 3000
+  - name: retention_time
+    label: 时序数据保留期
+    type: str
+    required: true
+    default: 15d
+    pattern: '^[0-9]{1,4}[smhdwy]$'
+    help: ★ 硬上限之一。默认 15 天。
+  - name: retention_size
+    label: 时序数据体积上限
+    type: str
+    required: true
+    default: 5GB
+    pattern: '^[0-9]{1,4}(KB|MB|GB|TB)$'
+    help: ★ 硬上限之二。**必须两个都设** —— 只设时间的话，写入一快就爆盘。
+  - name: target_k8s01
+    label: 目标 1（node-01 的 exporter 地址）
+    type: str
+    required: true
+    default: 192.0.2.11:9100
+    pattern: '^(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{2,5}$'
+  - name: target_k8s02
+    label: 目标 2（node-02）
+    type: str
+    required: true
+    default: 192.0.2.12:9100
+    pattern: '^(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{2,5}$'
+  - name: target_k8s03
+    label: 目标 3（node-03 本机）
+    type: str
+    required: true
+    default: 192.0.2.13:9100
+    pattern: '^(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{2,5}$'
+  - name: target_docker01
+    label: 目标 4（docker-01）
+    type: str
+    required: true
+    default: 192.0.2.60:9100
+    pattern: '^(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{2,5}$'
+  - name: receiver_url
+    label: 告警投递地址（收端）
+    type: str
+    required: true
+    default: http://127.0.0.1:9095/webhook
+    pattern: '^http://127\.0\.0\.1:[0-9]{2,5}/webhook$'
+    help: ★ 只许本机收端 —— 收端与 Alertmanager 同机，**监听面一处都不扩大**（§12.57）。
+
+steps:
+  # ── 1 + 2. 送上去并解包（`mon.unpack` 自带"上传 → 解包 → 建软链 → 归属"）──
+  # ★ 为什么不用 `file.push`：见 `mon.unpack` 的 `stage` 步注释 —— 它会为覆盖前备份，
+  #   而 106MB/190MB 的包过不了 `backup.max_file_mb`（50MB）⇒ **同一个包推不了第二遍**。
+  - name: unpack_prometheus
+    title: 上传并解包 Prometheus
+    action: mon.unpack
+    args: { artifact: prometheus-3.15.0.linux-amd64.tar.gz, dest: prometheus-3.15.0, component: prometheus }
+  - name: unpack_alertmanager
+    title: 上传并解包 Alertmanager
+    action: mon.unpack
+    args: { artifact: alertmanager-0.34.1.linux-amd64.tar.gz, dest: alertmanager-0.34.1, component: alertmanager }
+  - name: unpack_node_exporter
+    title: 上传并解包 node_exporter
+    action: mon.unpack
+    args: { artifact: node_exporter-1.12.1.linux-amd64.tar.gz, dest: node_exporter-1.12.1, component: node_exporter }
+  - name: unpack_grafana
+    title: 上传并解包 Grafana
+    action: mon.unpack
+    args: { artifact: grafana-11.6.0.linux-amd64.tar.gz, dest: grafana-11.6.0, component: grafana }
+
+  # ── 3. 渲染配置（★ 走 template 步骤：sha256 相同则不写盘，幂等从这里来）──
+  - name: render_prom_conf
+    title: 渲染 prometheus.yml
+    template: mon-prometheus/prometheus.yml
+    dest: /opt/aoc-monitoring/etc/prometheus.yml
+    mode: "0644"
+    notify: [reload_prom]
+  - name: render_rules
+    title: 渲染 rules.yml（14 条带 for 的规则 + 一对抑制）
+    template: mon-prometheus/rules.yml
+    dest: /opt/aoc-monitoring/etc/rules.yml
+    mode: "0644"
+    notify: [reload_prom]
+  - name: render_targets
+    title: 渲染基础抓取目标（四台靶机）
+    template: mon-prometheus/targets.json
+    dest: /opt/aoc-monitoring/etc/targets/node-base.json
+    mode: "0644"
+  - name: render_am_conf
+    title: 渲染 alertmanager.yml（路由 + 抑制 + 收端）
+    template: mon-alertmanager/alertmanager.yml
+    dest: /opt/aoc-monitoring/etc/alertmanager.yml
+    mode: "0644"
+    notify: [restart_alertmanager]
+  - name: render_grafanaini
+    title: 渲染 grafana.ini（监听面收窄在这里）
+    template: mon-grafana/grafana.ini
+    dest: /opt/aoc-monitoring/etc/grafana.ini
+    mode: "0644"
+    notify: [restart_grafana]
+  - name: render_grafana_ds
+    title: 渲染 Grafana 数据源（声明式，不靠人点）
+    template: mon-grafana/datasource.yml
+    dest: /opt/aoc-monitoring/etc/grafana-provisioning/datasources/prometheus.yml
+    mode: "0644"
+    notify: [restart_grafana]
+  - name: render_receiver
+    title: 渲染 Webhook 收端脚本
+    template: mon-webhook/receiver.py
+    dest: /opt/aoc-monitoring/webhook/receiver.py
+    mode: "0755"
+    notify: [restart_webhook]
+
+  # ── 4. 渲染 systemd 单元 ──
+  - name: render_unit_prom
+    title: 渲染 aoc-prometheus.service（含保留期双上限与监听收窄）
+    template: mon-prometheus/prometheus.service
+    dest: /etc/systemd/system/aoc-prometheus.service
+    mode: "0644"
+    notify: [daemon_reload]
+  - name: render_unit_am
+    title: 渲染 aoc-alertmanager.service
+    template: mon-alertmanager/alertmanager.service
+    dest: /etc/systemd/system/aoc-alertmanager.service
+    mode: "0644"
+    notify: [daemon_reload]
+  - name: render_unit_ne
+    title: 渲染 aoc-node-exporter.service（含 textfile 采集目录）
+    template: mon-node-exporter/node_exporter.service
+    dest: /etc/systemd/system/aoc-node-exporter.service
+    mode: "0644"
+    notify: [daemon_reload]
+  - name: render_unit_wh
+    title: 渲染 aoc-mon-webhook.service
+    template: mon-webhook/receiver.service
+    dest: /etc/systemd/system/aoc-mon-webhook.service
+    mode: "0644"
+    notify: [daemon_reload]
+  - name: render_unit_grafana
+    title: 渲染 aoc-grafana.service
+    template: mon-grafana/grafana.service
+    dest: /etc/systemd/system/aoc-grafana.service
+    mode: "0644"
+    notify: [daemon_reload]
+
+  # ── 5. 让 systemd 认识新单元（条件步骤：单元真的变了才跑）──
+  - name: daemon_reload
+    title: 重读 systemd 单元定义（仅当单元文件真的变了）
+    action: svc.daemon-reload
+    args: { unit: aoc-prometheus.service }
+    trigger_only: true
+    note: '由五个 unit 渲染步骤的 notify 唤起；第二次跑（内容没变）**根本不会执行**。'
+
+  # ── 6. 起服务 + 自启 ──
+  - name: start_node_exporter
+    title: 启动 node_exporter
+    action: svc.start
+    args: { unit: aoc-node-exporter.service }
+    notify: [enable_node_exporter]
+  - name: enable_node_exporter
+    title: node_exporter 开机自启
+    action: svc.enable
+    args: { unit: aoc-node-exporter.service }
+    trigger_only: true
+  - name: start_webhook
+    title: 启动 Webhook 收端
+    action: svc.start
+    args: { unit: aoc-mon-webhook.service }
+    notify: [enable_webhook]
+  - name: enable_webhook
+    title: 收端开机自启
+    action: svc.enable
+    args: { unit: aoc-mon-webhook.service }
+    trigger_only: true
+  - name: start_prometheus
+    title: 启动 Prometheus
+    action: svc.start
+    args: { unit: aoc-prometheus.service }
+    notify: [enable_prometheus]
+  - name: enable_prometheus
+    title: Prometheus 开机自启
+    action: svc.enable
+    args: { unit: aoc-prometheus.service }
+    trigger_only: true
+  - name: start_alertmanager
+    title: 启动 Alertmanager
+    action: svc.start
+    args: { unit: aoc-alertmanager.service }
+    notify: [enable_alertmanager]
+  - name: enable_alertmanager
+    title: Alertmanager 开机自启
+    action: svc.enable
+    args: { unit: aoc-alertmanager.service }
+    trigger_only: true
+  - name: start_grafana
+    title: 启动 Grafana
+    action: svc.start
+    args: { unit: aoc-grafana.service }
+    notify: [enable_grafana]
+  - name: enable_grafana
+    title: Grafana 开机自启
+    action: svc.enable
+    args: { unit: aoc-grafana.service }
+    trigger_only: true
+
+  # ── 7. 让盘上的声明生效（条件步骤：配置文件真的变了才跑）──
+  - name: reload_prom
+    title: 让 Prometheus 重读配置与规则（仅当文件真的变了）
+    action: mon.reload
+    args: { prom_base: http://127.0.0.1:9090 }
+    trigger_only: true
+    note: '★★ 这就是"写了文件 ≠ 规则在生效"那一步；判据在它自己的结论里（重载成功标志）。'
+
+  - name: restart_alertmanager
+    title: 重启 Alertmanager（仅当配置真的变了）
+    action: svc.restart
+    args: { unit: aoc-alertmanager.service }
+    trigger_only: true
+  - name: restart_webhook
+    title: 重启收端（仅当脚本真的变了）
+    action: svc.restart
+    args: { unit: aoc-mon-webhook.service }
+    trigger_only: true
+  - name: restart_grafana
+    title: 重启 Grafana（仅当配置真的变了）
+    action: svc.restart
+    args: { unit: aoc-grafana.service }
+    trigger_only: true
+
+health:
+  - expect:
+      state: { unit: aoc-prometheus.service, equals: active }
+  - expect:
+      state: { unit: aoc-alertmanager.service, equals: active }
+  - expect:
+      state: { unit: aoc-mon-webhook.service, equals: active }
+  - expect:
+      state: { unit: aoc-grafana.service, equals: active }
+  - expect:
+      state: { unit: aoc-node-exporter.service, equals: active }
+  # ★★ 端口判据：T6 抓到过"responds 走本机 socket 不看 TCP 端口"的假绿 ⇒ 这里逐个钉端口。
+  - expect:
+      port_open: "9090"
+  - expect:
+      port_open: "9093"
+  - expect:
+      port_open: "9100"
+  - expect:
+      port_open: "{{ grafana_port }}"
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: aoc-grafana.service }
+    - action: svc.stop
+      args: { unit: aoc-alertmanager.service }
+    - action: svc.stop
+      args: { unit: aoc-prometheus.service }
+    - action: svc.stop
+      args: { unit: aoc-mon-webhook.service }
+    - action: svc.stop
+      args: { unit: aoc-node-exporter.service }
+  disable:
+    - action: svc.disable
+      args: { unit: aoc-grafana.service }
+    - action: svc.disable
+      args: { unit: aoc-alertmanager.service }
+    - action: svc.disable
+      args: { unit: aoc-prometheus.service }
+    - action: svc.disable
+      args: { unit: aoc-mon-webhook.service }
+    - action: svc.disable
+      args: { unit: aoc-node-exporter.service }
+  # ★ 只删**配方自己写出来的**那五个单元文件（包自带的单元一个都不许动 —— 我们本来也没动）。
+  remove_config:
+    - action: file.remove
+      args: { path: /etc/systemd/system/aoc-prometheus.service }
+    - action: file.remove
+      args: { path: /etc/systemd/system/aoc-alertmanager.service }
+    - action: file.remove
+      args: { path: /etc/systemd/system/aoc-mon-webhook.service }
+    - action: file.remove
+      args: { path: /etc/systemd/system/aoc-grafana.service }
+    - action: file.remove
+      args: { path: /etc/systemd/system/aoc-node-exporter.service }
+  # ★ 只有「全删」才动这两处：整个白名单目录（含时序数据、软链、解出来的二进制）
+  purge_paths:
+    - /opt/aoc-monitoring
+  # ★ 「保留数据」是一条**承诺**，报告里必须念出来：停在"服务没了、数据还在"这一档
+  keep_data:
+    - /opt/aoc-monitoring/data
+  # ★ 本配方**没有** remove_packages —— 三件套是 tarball 装的，不归包管理器管（§10.2.1 #1 的另一面）
+  stop_confirm_text: 我已确认要停止监控栈
+  purge_confirm_text: 我已确认全删监控栈
+  health:
+    - expect:
+        free_port: "9090"
+    - expect:
+        free_port: "{{ grafana_port }}"

@@ -1,0 +1,122 @@
+id: fw.port-close
+title: 防火墙撤销端口放行
+summary: firewall-cmd 撤销端口放行，并自证该端口确实已不通（query 返回 1）
+domain: F
+risk: yellow
+priority: P1
+tags: [变更, 防火墙]
+
+note: |
+  ★ 与 fw.port-open **相反**的退出码期望：`--query-port` 对**未放行**的端口返回 **1**。
+  所以本动作的 query 步骤只接受 1 —— 若返回 0（还在放行），说明撤销没生效，整步失败。
+  ★ 撤销一条**本就不存在**的规则会报错（探针未直接验证，但 firewall-cmd 的行为如此），
+  所以本动作先用 query 查一次，把"本来就没放行"这种情况变成一句清楚的结论，
+  而不是一个吓人的错误。
+
+confirm:
+  title: 确认撤销端口放行
+  body: |
+    即将在「{host.name}」（{host.address}）的防火墙区域「{zone}」**撤销** {port}/{protocol} 的放行。
+
+    会发生什么：该端口不再可达（若正好有服务在用它，那个服务会立刻连不上）。
+    可撤回：再用「防火墙放行端口」放行回去即可。
+  confirm_text: 我已确认要撤销
+
+params:
+  - name: port
+    label: 端口
+    type: int
+    required: true
+    min: 1
+    max: 65535
+    default: 8080
+  - name: protocol
+    label: 协议
+    type: enum
+    choices: [TCP, UDP]
+    values: [tcp, udp]
+    default: tcp
+  - name: zone
+    label: 区域
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9_-]+$'
+    default: public
+  - name: permanent
+    label: 生效范围
+    type: enum
+    choices: [永久（重启后仍撤销）, 仅当前运行时]
+    values: ["--permanent", ""]
+    default: "--permanent"
+
+precheck:
+  - name: fw_running
+    title: 确认 firewalld 正在运行
+    run: [firewall-cmd, --state]
+    parser: raw
+    ok_exit_codes: [0]
+
+steps:
+  - name: already
+    title: 先查该端口当前是否在放行状态
+    run: [firewall-cmd, --zone, "{{ zone }}", --query-port, "{{ port }}/{{ protocol }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1]
+    note: |
+      0 = 正在放行、1 = 未放行，两者都是**有效报告**。
+      把它标成 optional 并接受两种退出码，于是"本来就撤销了"不会变成一个错误。
+
+  - name: close
+    title: 撤销放行
+    run:
+      - firewall-cmd
+      - --zone
+      - "{{ zone }}"
+      - { when: permanent, value: "{{ permanent }}" }
+      - --remove-port
+      - "{{ port }}/{{ protocol }}"
+    parser: raw
+    timeout: 30
+
+  - name: reload
+    title: 重载防火墙（仅永久模式会执行）
+    run:
+      - { when: permanent, value: firewall-cmd }
+      - { when: permanent, value: --reload }
+    parser: raw
+    optional: true
+
+  - name: query
+    title: 自证：查该端口是否已不再放行（★ 只接受退出码 1）
+    run: [firewall-cmd, --zone, "{{ zone }}", --query-port, "{{ port }}/{{ protocol }}"]
+    parser: raw
+    ok_exit_codes: [1]
+    note: |
+      探针实测：未放行 → **1**。把 1 声明为"正常报告"，于是"还在放行（返回 0）"就变成失败。
+      **"某物不存在"必须由退出码承担**，不能写成 verify 的非空断言（规范 §9.6）。
+
+  - name: after
+    title: 撤销后的端口列表
+    run: [firewall-cmd, --zone, "{{ zone }}", --list-ports]
+    parser: raw
+    optional: true
+
+verify:
+  - name: 撤销前查到了当前状态（否则无法说明"本来在不在放行"）
+    from: already
+    on_missing: --query-port 没有返回内容
+  - name: 端口列表可读（给结论一个对照）
+    from: after
+    on_missing: 读不到 zone 的端口列表
+
+conclusion: |
+  防火墙撤销结果（{host.name}）
+  · 区域：{zone}　端口：{port}/{protocol}　范围：{permanent}
+  · 撤销前该端口状态（0=在放行 / 1=未放行）：{already}
+  · 撤销后当前端口列表：{after}
+
+  判读：
+    · query 步骤只接受 1，因此能走到这里就说明"该端口已不在放行列表里"；
+    · 若撤销前就已经是 1，说明它**本来就未放行**（本次是幂等操作，无副作用）；
+    · 要恢复：用「防火墙放行端口」放行回去。

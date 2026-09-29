@@ -1,0 +1,142 @@
+# ============================================================
+# 动作：监控 · 抓取目标健康度（T10）
+# 来源：开题单 §7 验收 #2（"在采"）＋ #3（≥4 台在采）
+# 形态：**判据问"被管的那一方"** —— 问 Prometheus **自己的 API**，不是问 systemd
+# 风险：green
+# ============================================================
+
+id: mon.targets
+title: 监控 · 抓取目标健康度（在采没在采）
+summary: 读 Prometheus 的 /api/v1/targets：几条目标、几条 up、几条 down，并当场判"有没有 down"
+domain: J
+risk: green
+priority: P0
+tags: [只读, 监控, 判据, T10]
+
+note: |
+  ★★ 本动作是验收 #2「**在采**」的**判据家**（规范 v1.13 §12.54）：
+    "在采"**不是**看配置文件里写了几个 target，**也不是**看 `systemctl is-active`，
+    而是看 **Prometheus 自己 API 读回来的 `health`**。
+  ★★ 反例是内建在动作里的：**只要有一条 `health=down`，判据步骤 `assert_no_down` 就判红**。
+    把 exporter 停掉 ⇒ 下一次跑这里必然红 —— ★ 这就是"写坏了会红"。
+  ★ 实现上刻意不做任何"聪明"的事：`curl -o` 落文件 → `python3 -m json.tool` 整理成稳定文本 →
+    `grep -c` / `awk` 数数。**全程静态 argv**，没有管道、没有重定向、没有内联脚本
+    （那是 §4 安全契约禁止的），也没有为了它去改核心代码（§12.23 三条判定：换命令绕得开）。
+
+params:
+  - name: prom_base
+    label: Prometheus 地址
+    type: str
+    required: true
+    default: http://127.0.0.1:9090
+    pattern: '^http://127\.0\.0\.1:[0-9]{2,5}$'
+    help: ★ 只允许 http://127.0.0.1:<端口> —— Prometheus 按 §12.53 只绑本机；这个白名单就是那条口径的钉子。
+  - name: min_up
+    label: 至少几台要在采
+    type: int
+    required: true
+    min: 1
+    max: 32
+    default: 4
+    help: 验收 #3 要求 ≥4 台。★ 调小它等于放宽判据，报告里会把实际值念出来。
+
+precheck:
+  - name: unit
+    title: 先看单元在不在（只为"这条路走不走得通"）
+    run: [systemctl, is-active, aoc-prometheus.service]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: >
+      ★ 这一步**不承担结论**：单元 active 只是旁证。
+      真正的判据是下面从 **Prometheus 自己的 API** 读回来的 health（§12.37 的落地）。
+
+steps:
+  - name: fetch
+    title: 取 /api/v1/targets（curl 自己落文件，不用重定向）
+    run: [curl, -sS, --max-time, "15", -o, /opt/aoc-monitoring/_out/targets.json, "{{ prom_base }}/api/v1/targets"]
+    parser: raw
+    timeout: 40
+
+  - name: pretty
+    title: 整理成稳定文本（json.tool ⇒ 每个键独占一行）
+    run: [python3, -m, json.tool, /opt/aoc-monitoring/_out/targets.json, /opt/aoc-monitoring/_out/targets.pretty.json]
+    parser: raw
+    timeout: 40
+    note: ★ 这一步是"可判"的前提：紧凑 JSON 整个响应只有一行，`grep -c` 只会数出 1。
+
+  - name: count_all
+    title: 一共有几条目标
+    run: [grep, -c, '"scrapeUrl":', /opt/aoc-monitoring/_out/targets.pretty.json]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+    note: ★★ rc=1 也算成功：`grep -c` **没命中时会把 `0` 打出来、退出码是 1** —— 而"**0 条目标**"是**结论**（采集面整体空了），不是出错。★ 不声明它 ⇒ 只读动作会挂着一条"步骤失败"（假警报）。
+
+  - name: count_up
+    title: 其中 up 几条
+    run: [grep, -c, '"health": "up"', /opt/aoc-monitoring/_out/targets.pretty.json]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+    note: ★★ 同上：**"up = 0"** 是能发生的最重要的结论之一，不许被记成"这一步失败了"。
+
+  - name: count_down
+    title: 其中 down 几条
+    run: [grep, -c, '"health": "down"', /opt/aoc-monitoring/_out/targets.pretty.json]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+    note: ★ grep 一条都没匹配时 rc=1 —— 那是"0 条 down"，**是结论不是故障**，所以 1 也算成功。
+
+  - name: assert_no_down
+    title: ★★ 判据：一条 down 都不许有
+    run: [grep, -q, '"health": "down"', /opt/aoc-monitoring/_out/targets.pretty.json]
+    parser: raw
+    ok_exit_codes: [1]
+    timeout: 20
+    note: >
+      ★★ 这里**只接受 rc=1**（grep 没命中）—— 命中说明有 target down ⇒ 这一步判红 ⇒ 整条动作红。
+      ★ 为什么**不**把这一步放进 `verify`：它成功时**本来就没有输出**，
+      对非空自证 = 100% 假红（规范 §12.49 的现场）。**判据交给 `ok_exit_codes`。**
+
+  - name: assert_min_up
+    title: ★★ 判据：在采台数必须够
+    run: [awk, "{n+=gsub(/\"health\": \"up\"/,\"\")} END{exit (n>={{ min_up }}?0:1)}", /opt/aoc-monitoring/_out/targets.pretty.json]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: ★ `gsub` 返回**替换次数**，所以它数的是"出现几次"而不是"几行"（紧凑 JSON 也不怕）。
+
+  - name: detail
+    title: 把每条目标的原件摊开（人读用）
+    run: [grep, -e, '"scrapeUrl":', -e, '"health":', -e, '"lastError":', /opt/aoc-monitoring/_out/targets.pretty.json]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    optional: true
+    timeout: 20
+
+verify:
+  - name: 必须读到 targets 列表
+    from: count_all
+    on_missing: Prometheus 的 /api/v1/targets 没有返回内容 —— 服务在不在？端口对不对？
+  - name: 必须数得清 up 的条数
+    from: count_up
+    on_missing: 一条 up 都数不出来 —— 采集面整体异常（先看 down 与 lastError）
+
+conclusion: |
+  【{host.name}】监控 · 抓取目标健康度
+  Prometheus：{prom_base} ｜ 单元状态：{unit}
+  目标总数 {count_all} ｜ **up {count_up}** ｜ **down {count_down}** ｜ 要求在采 ≥ {min_up}
+
+  逐条（scrapeUrl / health / lastError）：
+  {detail}
+
+  判读：
+  · ★★ **本条动作的结论就是 `down = {count_down}` 与 `up = {count_up}`** ——
+    判据已内建：**有一条 down 就判红**、**up 少于 {min_up} 也判红**（这两步的退出码就是判据）；
+  · 看到 `down` 先看同一行的 `lastError`：`connection refused` = exporter 没在跑或端口不对；
+    `context deadline exceeded` = 网络/防火墙；`no such host` = 名字解析；
+  · ★ 想让这条**变红来做反例**：在任意一台 target 上停掉 `aoc-node-exporter.service`，
+    等一个抓取周期（scrape_interval 15s）再跑 —— 那时 `down` 会 ≥1，本动作**必然判红**；
+  · 本动作只读：不写任何文件、不改任何配置。

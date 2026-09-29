@@ -1,0 +1,167 @@
+# ============================================================
+# 动作：kubectl 只读逃生口
+# 来源：T9·S5 —— ★★ 规范 §12.40（**只读子命令白名单 + 受控参数**；**不提供任意写**）
+# 形态：**只读**（yellow：读集群，但"少见的读法"要有闸门）
+# ============================================================
+
+id: k8s.kubectl
+title: kubectl 只读逃生口
+summary: 白名单里的**只读**子命令（get / describe / logs / events / top / explain / api-resources / cluster-info / version）—— ★ 写操作一律拒绝
+domain: J
+risk: yellow
+priority: P1
+tags: [只读, K8s, 逃生口]
+
+note: |
+  ★★ **它是"逃生口"，不是"终端"**（规范 §12.40）：
+  总纲把 T9 的这一项写成「保留 `kubectl` 原样命令入口」——
+  本节把它**收敛成可交付的形状**：**只读子命令白名单 ＋ 受控参数**。
+
+  ★★ **为什么不提供任意写**（三条理由，逐条落地）：
+  ① **闸门只增不减**（v1.8 起的老规矩）：一个能 `delete ns` 的输入框，
+  等于**在平台外面开了一条绕过 `red` 与确认词的路**；
+  ② **它会与"用动作"这件事竞争**：本话题交付了 9 个变更动作，每个都有**终态判据 + 留证 + 回不去的说明**；
+  逃生口一次性把这些全绕开 ⇒ **报告里只剩一行命令**，留证链条断在这里；
+  ③ ★ **它与 T14（变更编排 · 人在环）的前置冲突**：将来 AI 能改东西时，入口必须是**有闸门的动作**，
+  而不是"一段可以任意拼的文本"。
+
+  ★★ **明确拒绝的子命令**（它们**不在** `verb` 的待选列表里，★ 界面上也看不到）：
+  `apply` · `create` · `delete` · `edit` · `patch` · `replace` · `scale` · `rollout` · `drain` ·
+  `cordon` · `uncordon` · `taint` · `label` · `annotate` · `exec` · `cp` · `port-forward` · `proxy` ·
+  `auth` · `config` · `expose` · `set` · `run`。
+  ⇒ ★★ **要用它们请走对应动作**：
+  `k8s.node-drain` / `k8s.node-resume` / `k8s.scale` / `k8s.rollout-restart` / `k8s.set-image` /
+  `k8s.rollout-undo` / `k8s.delete-workload` / `k8s.delete-namespace` / `k8s.apply` / `k8s.exec`。
+
+  ★★ **参数为什么是"受控枚举"而不是自由文本框**（规范 §12.40.3）：
+  本平台的 `run:` 是 **argv 数组**，一个参数占**一个** argv 元素 —— 自由文本会整段变成**一个**参数；
+  ★ 要支持它就得在核心代码里加"把字符串切成 argv"，**那正是 §4 三层契约要挡住的东西**
+  （等于把命令拼装权交回运行期）。⇒ 所以这里：`verb` 用 `run_by` **选段**，
+  `target` / `namespace` 走**白名单正则**。
+
+  ★ **`flags` 为什么不开放**：`-o yaml|json` 会把 **Secret 的值**整段打出来（规范 §12.43）——
+  ★ 逃生口**也不许**绕过这一条。所以 `get` 那一段**固定** `-o wide`（不给 `-o` 的自由）。
+  ★ `top` 在本环境会明确报"没有 Metrics API"（规范 §12.37.3）—— 那是**结论**，不是平台故障。
+
+params:
+  - name: verb
+    label: 子命令（★ 只读白名单）
+    type: enum
+    required: true
+    choices:
+      - get（看对象）
+      - describe（看详情）
+      - logs（看日志）
+      - events（看事件）
+      - top（看资源用量 —— ★ 本环境没有 metrics）
+      - explain（看字段说明）
+      - api-resources（看有哪些资源类型）
+      - cluster-info（看集群端点）
+      - version（看版本）
+    values: [get, describe, logs, events, top, explain, api_resources, cluster_info, version]
+    default: get（看对象）
+    help: '★★ 写命令（apply / delete / patch / exec / scale / drain…）**不在这个列表里** —— 请用对应的动作（见动作说明）。'
+  - name: target
+    label: 看什么（资源类型，或 类型/名字）
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.,/.-]*$'
+    default: pods
+    placeholder: pods
+    help: '★ 例：`pods`、`pods/t9-web-xxxx`、`nodes`、`deploy,svc`。★ `logs` 那一段要写 **Pod 名**。'
+  - name: namespace
+    label: 命名空间（集群级对象随便填）
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+    help: '★ 集群级对象（`nodes` / `pv`）这一格不起作用，留默认即可。'
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认执行只读逃生口
+  body: |
+    即将执行：**kubectl {verb}**（目标 `{target}`，命名空间 `{namespace}`）。
+    · 能不能撤：**无需撤** —— 白名单里的子命令**都是只读的**（不创建、不修改、不删除任何对象）；
+    · ★★ 但要知道它的定位：它是**逃生口**，**不是**终端 ——
+      写操作请用对应动作（那样才有终态判据、留证与"回不去的说明"）。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认执行这条只读命令
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答（**这一步必然有输出**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: run_kubectl
+    title: ★ 执行（**每一条 case 都是完整 argv**；命令里没有一处来自输入）
+    run_by:
+      param: verb
+      cases:
+        get: [kubectl, "--kubeconfig={{ kubeconfig }}", get, "{{ target }}", -n, "{{ namespace }}", -o, wide]
+        describe: [kubectl, "--kubeconfig={{ kubeconfig }}", describe, "{{ target }}", -n, "{{ namespace }}"]
+        logs: [kubectl, "--kubeconfig={{ kubeconfig }}", logs, "{{ target }}", -n, "{{ namespace }}", "--tail=200"]
+        events: [kubectl, "--kubeconfig={{ kubeconfig }}", get, events, -n, "{{ namespace }}", "--sort-by=.lastTimestamp"]
+        top: [kubectl, "--kubeconfig={{ kubeconfig }}", top, "{{ target }}", -n, "{{ namespace }}"]
+        explain: [kubectl, "--kubeconfig={{ kubeconfig }}", explain, "{{ target }}"]
+        api_resources: [kubectl, "--kubeconfig={{ kubeconfig }}", api-resources]
+        cluster_info: [kubectl, "--kubeconfig={{ kubeconfig }}", cluster-info]
+        version: [kubectl, "--kubeconfig={{ kubeconfig }}", version]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 120
+    note: >
+      ★★ **九条 case，全是只读**；★ `get` 那一段**固定 `-o wide`**（★ 不给 `-o` 的自由，
+      理由：`-o yaml|json` 会把 Secret 的值打出来，规范 §12.43）。
+      ★ `top` 在本环境会以非零退出并报 `Metrics API not available` —— 那是**结论**，
+      会如实显示在报告里（规范 §12.37.3：`kubectl top` **一个字都不许承诺**）。
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: >
+      `kubectl get namespaces` 没有给出任何一行 —— API server 没在应答，或这把 kubeconfig 不对。
+  # ★ 这里**不**对 `run_kubectl` 做非空断言：`events` 在没事件时**合法为空**（清单 115）。
+
+conclusion: |
+  【{host.name}】kubectl 只读逃生口 · **{verb}**（只读）
+  目标：{target} ｜ 命名空间：{namespace}
+
+  ── 原文 ──
+  {run_kubectl}
+  ── 原文结束 ──
+
+  判读：
+    · ★★ **这个动作的边界**：只有**只读**子命令。写操作请用对应动作
+      （`k8s.scale` / `k8s.set-image` / `k8s.rollout-undo` / `k8s.delete-workload` /
+      `k8s.node-drain` / `k8s.apply` …）—— 那样才有**终态判据 + 留证 + 回不去的说明**；
+    · ★★ **`-o yaml|json` 不给**（规范 §12.43）：那条路会把 Secret 的值整段打出来；
+      要看某个 Secret 的**键名**用 `k8s.config`；
+    · ★ `top` 报 `Metrics API not available` 是**预期结论**（本环境没有 metrics-server）；
+    · ★ `events` 空 = **最近一段时间没有事件**（不是"没查到"，见 `k8s.events` 的判读）；
+    · ★ 本动作**只读**：不创建、不修改、不删除任何对象（`changed` 恒 false）。

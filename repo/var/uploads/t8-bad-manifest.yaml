@@ -1,0 +1,7 @@
+# T8·S8 反例：故意写坏（kind 不存在）—— 这一份**只用来证明'写坏了会红'**
+apiVersion: v1
+kind: AocNotAKind
+metadata:
+  name: aoc-bad-manifest
+spec:
+  nonsense: true

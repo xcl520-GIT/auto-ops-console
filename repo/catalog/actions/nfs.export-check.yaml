@@ -1,0 +1,54 @@
+# ============================================================
+# 动作：NFS 导出清单（本机自问自答：导出到底生效了没有）
+# 来源：T6 服务铺量 —— `expect` 第 6 类 `responds` 的采集来源（规范 §12.11）
+# 形态：**只读**（green）—— 不重启、不写任何文件
+# ============================================================
+
+id: nfs.export-check
+title: NFS 导出清单
+summary: 问本机的 mountd：现在到底导出了哪些目录（导出是否真的生效），只读
+domain: F
+risk: green
+priority: P1
+tags: [只读, 服务, 存储, NFS]
+
+note: |
+  ★ 为什么这条判据是"真的"：
+  写了 `/etc/exports.d/aoc-*.exports` **不等于**导出生效 —— 得让它被 `exportfs` 读进去、
+  再由内核的导出表（nfsd/mountd）提供给客户端。`showmount -e` 问的正是**这条链路的最末端**：
+  它问本机的 mountd"你现在导出什么"，答什么就是什么。
+
+  ★ 为什么**没有参数**、也不在动作里判"是不是我们那一个导出"：
+  判定属于**配方侧**（宪法 1：判定走平台）。配方的 `health` 用
+  `responds: {action: nfs.export-check, first_field: "{{ <导出点> }}"}` ——
+  `first_field` 是"存在一行的**第一个字段**全等于参照值"，而 `showmount` 每行的第一个字段
+  正好就是导出路径。★ 全等、**不是子串**（`"active" in "inactive"` 的教训）。
+
+  ★ 空输出（本机一个导出都没有）→ verify 不过 → 动作失败 → 期望判 **fail**：
+  "服务在跑但什么都没导出"本来就不该算健康。
+  ★ 本动作**只读**（green）：`changed` 恒 `false`（规范 §12.3）。
+
+params: []
+
+steps:
+  - name: probe
+    title: 问本机 mountd 现在导出什么
+    run: [/usr/sbin/showmount, -e, 127.0.0.1]
+    parser: lines
+    timeout: 30
+    note: >
+      输出形如：首行 `Export list for 127.0.0.1:`，随后每行是一个导出点 + 允许的来源
+      （如 `/opt/aoc-nfs/aoc *`）。★ 首行的第一个字段是 `Export`，不会和真实导出点撞。
+      没导出任何东西时 rc=0 但输出为空 → 由 verify 判红。
+
+verify:
+  - name: 必须至少有一个导出生效（空输出 = 什么都没导出）
+    from: probe
+    on_missing: 本机现在没有任何导出生效 —— 写了配置但没生效，也属于不健康
+
+conclusion: |
+  【{host.name}】NFS 导出清单（本机自问自答）
+  当前导出：
+  {probe}
+  判定：以上是**本机 mountd 的应答原文** —— 它答什么，客户端就能挂什么。
+  说明：本动作**只读** —— 不改 `/etc/exports*`、不重启服务。

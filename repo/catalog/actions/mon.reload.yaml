@@ -1,0 +1,164 @@
+# ============================================================
+# 动作：监控 · 让声明生效（reload）（T10）
+# 来源：开题单 §7 验收 #4（"只改文件不 reload ⇒ 生效面读不到"）
+# 形态：**声明式与生效面之间那一步，必须能被单独点名**
+# 风险：yellow（触发一次配置重载；不改任何文件）
+# ============================================================
+
+id: mon.reload
+title: 监控 · 让盘上的声明生效（reload）
+summary: 触发 Prometheus / Alertmanager 重载配置与规则，并当场核对"最后一次重载成功没有"
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, 监控, reload, 生效面, T10]
+
+confirm:
+  title: 确认让盘上的声明生效
+  body: |
+    即将在「{host.name}」（{host.address}）上触发 Prometheus 重载配置与规则
+    （POST {prom_base}/-/reload）。
+
+    会发生什么：
+      · Prometheus 重新读一遍**已经在盘上**的 prometheus.yml 与 rules.yml；
+      · **不改盘上任何文件**、不重启进程、不清数据；
+      · ★ 新规则会**立刻开始求值** —— 如果它当场满足条件，会马上进入 pending
+        （`for` 一过就 firing 并投递出去）。
+
+    可撤回：把文件改回去再重载一次。
+  confirm_text: 我已确认要重载配置
+
+note: |
+  ★★ 规范 v1.13 §12.55：**写了文件 ≠ 规则在生效**。规则文件是**声明**，生效要靠 reload。
+    本动作存在的意义就是让"要不要 reload"这件事**能被单独点名与控制** ——
+    否则"我改了文件"和"它在判"永远分不开。
+  ★★ 判据**不是** `curl` 返回 200：Prometheus 的 `/-/reload` 只要进程活着就回 200，
+    **配置写坏了它也回 200**。真判据是它自己的
+    `prometheus_config_last_reload_successful` 与 `prometheus_config_last_reload_success_timestamp_seconds` 两个指标。
+  ★ **`changed` 恒 `False`**（豁免，理由见 `app/changed.py::NO_CHANGE_EXEMPT`）：
+    它**不改盘上的任何东西** —— 它做的是"把盘上已经有的东西读进来"。真正"改了什么"记在**写文件那一步**。
+
+params:
+  - name: prom_base
+    label: Prometheus 地址
+    type: str
+    required: true
+    default: http://127.0.0.1:9090
+    pattern: '^http://127\.0\.0\.1:[0-9]{2,5}$'
+
+precheck:
+  - name: unit
+    title: 先确认 Prometheus 在跑（重载要有进程可重载）
+    run: [systemctl, is-active, aoc-prometheus.service]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+
+steps:
+  - name: wait_ready
+    title: ★ 先等它真的就绪（`/-/ready` 返回 200 才算能重载）
+    run: [curl, -sS, -f, --retry, "20", --retry-delay, "2", --retry-connrefused, --max-time, "90", -o, /dev/null, "{{ prom_base }}/-/ready"]
+    parser: raw
+    timeout: 120
+    note: >
+      ★★ **这一步是真跑抓出来的**（T10·S2 配方首跑）：`svc.start` 返回 0 **不等于**"进程已经就绪"，
+      而 `POST /-/reload` 紧跟其后会被**启动竞态**吃掉 —— 现场是"重载请求回 200、
+      可 `prometheus_config_last_reload_successful` 读回来是 0"，本动作因此判红。
+      ★ 修法：先用 `/-/ready` 把它等到就绪（curl 的 `--retry` 是**静态 argv**，不用 shell 循环）。
+      ★ 与 §12.32.2「成功必须是终态，不能是"命令返回 0"」同族 —— 这次它咬在**平台自己的配方**上。
+
+  - name: before
+    title: 记下"重载前"的成功标志与时间戳
+    run: [curl, -sS, --max-time, "10", -o, /opt/aoc-monitoring/_out/reload_before.json, "{{ prom_base }}/api/v1/query?query=prometheus_config_last_reload_successful"]
+    parser: raw
+    timeout: 30
+
+  - name: before_peek
+    title: 摊开看：重载前的原文（curl -o 写文件，stdout 是空的，所以单独一步把它读出来）
+    run: [cat, /opt/aoc-monitoring/_out/reload_before.json]
+    parser: lines
+    timeout: 20
+
+  - name: do_reload
+    title: 触发重载（POST /-/reload）
+    run: [curl, -sS, --max-time, "20", -X, POST, -o, /opt/aoc-monitoring/_out/reload_resp.txt, -w, "HTTP %{http_code}", "{{ prom_base }}/-/reload"]
+    parser: raw
+    timeout: 40
+    note: ★ 这个返回值**只说明"请求送到了"**，不说明"重载成功" —— 判据在下面。
+
+  - name: settle
+    title: 等一拍（让重载完成）
+    run: [sleep, "3"]
+    parser: raw
+    timeout: 20
+
+  - name: after
+    title: 记下"重载后"的成功标志与时间戳
+    run: [curl, -sS, --max-time, "10", -o, /opt/aoc-monitoring/_out/reload_after.json, "{{ prom_base }}/api/v1/query?query=prometheus_config_last_reload_successful"]
+    parser: raw
+    timeout: 30
+
+  - name: after_peek
+    title: ★ 摊开看：重载后 Prometheus 对 `prometheus_config_last_reload_successful` 的原文回答
+    run: [cat, /opt/aoc-monitoring/_out/reload_after.json]
+    parser: lines
+    timeout: 20
+    note: >
+      ★ 这一步是**诊断的落点**：判据步骤（grep -q）成功时没有输出，光看它会"不知道为什么红"。
+      把原文摊在结论里，红了也能一眼看出是"值为 0"还是"压根没这条指标"。
+
+  - name: pretty_before
+    title: 整理（重载前）
+    run: [python3, -m, json.tool, /opt/aoc-monitoring/_out/reload_before.json, /opt/aoc-monitoring/_out/reload_before.pretty.json]
+    parser: raw
+    timeout: 30
+  - name: pretty_after
+    title: 整理（重载后）
+    run: [python3, -m, json.tool, /opt/aoc-monitoring/_out/reload_after.json, /opt/aoc-monitoring/_out/reload_after.pretty.json]
+    parser: raw
+    timeout: 30
+
+  - name: assert_reload_ok
+    title: ★★ 判据：重载后 `..._last_reload_successful` 必须是 1
+    run: [grep, -q, -E, "\"1\"", /opt/aoc-monitoring/_out/reload_after.pretty.json]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: >
+      ★★ 这是"配置和规则**真的被读进去了**"的机器判据（写的规则文件坏了 ⇒ 它是 0 ⇒ 判红）。
+      ★ 它成功时没有输出，所以**不进 verify**。
+
+  - name: failed_rules
+    title: 生效面里有没有"规则文件本身有错"的
+    run: [grep, -c, -E, "\"health\": \"err\"", /opt/aoc-monitoring/_out/rules.pretty.json]
+    parser: line_count
+    optional: true
+    ok_exit_codes: [0, 1, 2]
+    timeout: 20
+    note: ★ 顺带看一眼上一次 `mon.rules` 留下的生效面（文件可能不在，rc=2 也算跑过）。
+
+verify:
+  - name: 重载请求必须发出去了
+    from: do_reload
+    on_missing: 重载请求没有返回 —— Prometheus 在不在？端口对不对？
+
+conclusion: |
+  【{host.name}】监控 · 让盘上的声明生效
+  Prometheus：{prom_base} ｜ 单元：{unit}
+  就绪等待：{wait_ready}
+  重载请求：{do_reload}
+  ── 重载前原文（Prometheus 自己的回答）──
+  {before_peek}
+  ── 重载后原文（Prometheus 自己的回答）──
+  {after_peek}
+
+  判读：
+  · ★★ **判据是"重载后那个标志是 1"**，不是"curl 返回 200"——
+    配置或规则文件写坏了，`/-/reload` **照样回 200**，而标志会停在 0；
+  · 重载**成功但规则没变**是正常情形（本来就没有改动）：那时 `changed` 也应当是 `False`；
+  · ★★ **回得去 / 回不去**（规范 §12.38）：
+    - **回得去**：重载是**可重复**的 —— 把文件改回去再 reload 即可；
+    - **回不去**：重载会**加载新规则并开始求值** —— 如果新规则当场就满足条件，
+      它会**立刻进入 pending**（`for` 一过就 firing 并投递出去）。也就是说：
+      **"重载"这个动作本身是不可撤销的"开始观测"**，只能靠把规则改回去再 reload 来收敛。
+    ★ 本动作**不改盘上任何文件**（所以它不进变更清单）。

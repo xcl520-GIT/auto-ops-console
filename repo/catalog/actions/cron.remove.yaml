@@ -1,0 +1,86 @@
+id: cron.remove
+title: 删除定时任务
+summary: 删除工作台建的 /etc/cron.d/aoc-<名字>（只认这个前缀，删不到别的东西）
+domain: E
+risk: yellow
+priority: P1
+tags: [变更, 定时任务]
+
+note: |
+  ★ 删除范围被参数白名单**锁死**在 `/etc/cron.d/aoc-<名字>`：
+  名字只允许 `[a-z0-9-]`，所以它无法指向 `/etc/cron.d/0hourly` 或任何系统文件。
+  删除前仍会**自动备份**该文件（护栏地基，规范 §9.1）—— 删错了还能恢复。
+  同样地：**不碰 crontab**。
+
+confirm:
+  title: 确认删除定时任务
+  body: |
+    即将在「{host.name}」（{host.address}）上删除 `/etc/cron.d/aoc-{name}`。
+
+    影响面：该定时任务不再执行（它对应的文件被删除）。
+    可撤回：删除前会自动备份该文件；可用任务详情里的「恢复此文件」还原。
+  confirm_text: 我已确认要删除
+
+backup:
+  - path: "/etc/cron.d/aoc-{{ name }}"
+    label: "将被删除的定时任务文件"
+    required: true
+
+params:
+  - name: name
+    label: 任务名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]{0,29}$'
+    default: demo
+    placeholder: aoc-demo
+    help: '只允许小写字母/数字/短横线；对应文件 /etc/cron.d/aoc-<名字>'
+
+steps:
+  - name: show_before
+    title: 删除前先读出内容（留证：到底删了什么）
+    run: [cat, "/etc/cron.d/aoc-{{ name }}"]
+    parser: raw
+
+  - name: remove
+    title: 删除任务文件
+    run: [rm, -f, "/etc/cron.d/aoc-{{ name }}"]
+    parser: raw
+    note: rm -f 对不存在的文件也返回 0（幂等），所以"删两次"不会有副作用
+
+  - name: isgone
+    title: 自证：确认文件确实不在了（★ 期望 ls 返回 2）
+    run: [ls, -l, "/etc/cron.d/aoc-{{ name }}"]
+    parser: raw
+    ok_exit_codes: [2]
+    note: |
+      ls 对不存在的文件返回 **2**，且 **stdout 为空**。只接受 2 —— 若文件还在（返回 0），
+      整步失败。
+      ★ T3 实测踩到的机制级坑：**"某物不存在"这件事必须由退出码承担，
+        不能写成 verify 的"非空"断言** —— 不存在的文件没有输出，非空断言必然报假失败。
+        （见规范 §9.6）
+
+  - name: list_after
+    title: 列出 cron.d 目录（给 verify 一个"确实有输出"的事实）
+    run: [ls, -l, /etc/cron.d]
+    parser: lines
+    note: 删除后目录里应当已经没有 aoc-<名字>，可在原始输出里逐行确认
+
+verify:
+  - name: 删除前读到了原内容（说明这个任务确实存在过）
+    from: show_before
+    on_missing: 删除前读不到该文件 —— 可能任务名写错了
+  - name: 删除后仍能列出 cron.d 目录（证明删除动作确已执行、目标机可达）
+    from: list_after
+    on_missing: 读不到 /etc/cron.d 目录
+
+conclusion: |
+  定时任务删除结果（{host.name}）
+  · 文件：/etc/cron.d/aoc-{name}
+  · 被删除的内容：
+  {show_before}
+  · 当前状态：已不存在（ls 返回 2）
+
+  判读：
+    · 该任务不会再执行；
+    · 如果删错了：在本次任务详情里点「恢复此文件」，它会从改动前的备份还原。

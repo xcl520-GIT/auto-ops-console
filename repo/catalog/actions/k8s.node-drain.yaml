@@ -1,0 +1,256 @@
+# ============================================================
+# 动作：排空节点（drain）
+# 来源：T9·S4 —— 规范 §12.37.1 ①（判据：`spec.unschedulable`）、§12.38（★ 已经没了的东西要说清）
+# 形态：**可恢复变更**（yellow）
+# ============================================================
+
+id: k8s.node-drain
+title: 排空节点
+summary: 把一台节点上的 Pod 赶走并标记为不可调度（★ 三档强度自己选 —— 越强丢的东西越多）
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, K8s, 节点, 维护]
+
+note: |
+  ★★ **判据两条**（规范 §12.37.1 ①）：
+  ① `spec.unschedulable` **为 true**（节点真的被标记了）；
+  ② **非 DaemonSet 的 Pod 已经不在这个节点上了**（`--field-selector spec.nodeName=<节点>` 的原文对照）。
+  ★ 只听 `kubectl drain` 返回 0 **不够** —— 它会跳过够不着的东西并照样返回 0。
+
+  ★★ **`mode` 是本动作最重要的一格**（规范 §12.38 / 清单 105）：
+  **后果重大的开关必须做成显式选择**，不许悄悄带上。三档：
+
+  | 档 | 相当于 | 会丢掉什么 |
+  |---|---|---|
+  | `safe`（默认） | `--ignore-daemonsets` | ★ 相对安全：DaemonSet 的 Pod 留在节点上；遇到 `emptyDir` 的 Pod 会**拒绝继续** |
+  | `with_emptydir` | ＋ `--delete-emptydir-data` | ★★ **`emptyDir` 里的数据会被删掉**（那是"临时数据"，但常常是别人指望着的东西） |
+  | `forced` | ＋ `--force` ＋ 上面的 | ★★ 连**没有控制器的裸 Pod** 也赶走 —— 它们**不会被重建**（等于删了） |
+
+  ★★ **回得去 / 回不去**（规范 §12.38）：
+  · ✅ **回得去**：`k8s.node-resume` 恢复调度（节点重新可以被调度）；
+  · ❌ **回不去**：① **被驱逐的 Pod 已经重建过**（新建的那批不是原来那些）；
+  ② `emptyDir` 的数据**已经没了**（选了那一档就是选了这条）。
+
+params:
+  - name: node
+    label: 节点名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: node-02
+  - name: mode
+    label: ★ 强度（越强丢的东西越多）
+    type: enum
+    required: true
+    choices:
+      - 安全档（保留 DaemonSet 的 Pod；遇到 emptyDir 就拒绝）
+      - 带 emptyDir（★★ 会删掉临时数据）
+      - 强制档（★★ 连裸 Pod 也赶走，它们不会被重建）
+    values: [safe, with_emptydir, forced]
+    default: 安全档（保留 DaemonSet 的 Pod；遇到 emptyDir 就拒绝）
+    help: '★★ 三档的差别就在"会丢掉什么"——先看 `k8s.pods` 里这个节点上有什么，再选。'
+  - name: wait_seconds
+    label: 等驱逐完成超时（秒）
+    type: int
+    required: true
+    min: 10
+    max: 900
+    default: 300
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认排空节点
+  body: |
+    即将把「{node}」上的 Pod 赶走，并把它标记为**不可调度**（强度：{mode}）。
+    · 能不能撤：✅ **能** —— 用 `k8s.node-resume` 恢复调度；
+    · ❌ **回不去**：① **被驱逐的 Pod 会被重建**（新 Pod、新 IP —— 不是原来那些）；
+      ② ★★ 若选了"带 emptyDir"或"强制档"，**`emptyDir` 里的数据会被删掉**；强制档还会赶走**裸 Pod**
+      （它们**不会被重建**）。
+    · 影响面：这个节点上的服务会**迁移到别的节点**（能不能迁得动取决于剩余容量）；
+      DaemonSet 的 Pod（网络插件、日志采集等）**会留在节点上**。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认要排空这个节点
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: node_exists
+    title: ★ 节点必须存在
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - node
+      - "{{ node }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: sched_before
+    title: 排空之前的 `spec.unschedulable`（判据① 的对照值）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - node
+      - "{{ node }}"
+      - "-o"
+      - "jsonpath={.spec.unschedulable}"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: pods_on_node_before
+    title: ★★ 这个节点上**有什么**（留证：谁会被赶走）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - "--field-selector=spec.nodeName={{ node }}"
+      - "-o"
+      - wide
+      - --no-headers
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: act
+    title: 提交排空（★ 三档强度在这里显式展开）
+    run_by:
+      param: mode
+      cases:
+        safe:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - drain
+          - "{{ node }}"
+          - --ignore-daemonsets
+          - "--timeout={{ wait_seconds }}s"
+        with_emptydir:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - drain
+          - "{{ node }}"
+          - --ignore-daemonsets
+          - --delete-emptydir-data
+          - "--timeout={{ wait_seconds }}s"
+        forced:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - drain
+          - "{{ node }}"
+          - --ignore-daemonsets
+          - --delete-emptydir-data
+          - --force
+          - "--timeout={{ wait_seconds }}s"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 920
+    note: >
+      ★★ **`run_by` 的静态 argv 表**（规范 §12.10）：`mode` 只用来**选段**，
+      命令写死在这里 —— **参数永远不许拼进 argv**。★ 这三个 case 就是三档强度，
+      差别一眼可见（★ 也正好满足"后果重大的开关要做成显式选择"）。
+
+  - name: sched_after
+    title: ★★ 判据①：节点必须**不可调度**（`spec.unschedulable` 为 true）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - node
+      - "{{ node }}"
+      - "-o"
+      - "jsonpath={.spec.unschedulable}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: pods_on_node_after
+    title: ★★ 判据②：这个节点上**还剩什么**（DaemonSet 的应该还在，别的应该走光）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - "--field-selector=spec.nodeName={{ node }}"
+      - "-o"
+      - wide
+      - --no-headers
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: node_state
+    title: 节点现在长什么样（`SchedulingDisabled` 应该出现在 `-o wide` 里）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - nodes
+      - "-o"
+      - wide
+      - --no-headers
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对），本次没有改任何东西。
+  - name: ★★ 节点必须真的被标记为不可调度（`spec.unschedulable` 读得出来）
+    from: sched_after
+    on_missing: >
+      排空之后读回来的 `spec.unschedulable` 是空的 —— ★ 那**可能**意味着"它还是可调度"（= 没排空成功），
+      也可能意味着取不到（拿不到对照数据）。★ 两种都不许当成"排空成功"：先看 `{node_state}` 那一屏里
+      有没有 `SchedulingDisabled`。
+
+conclusion: |
+  【{host.name}】排空节点 · {node}（变更；强度：{mode}）
+  · `spec.unschedulable`：{sched_before} → **{sched_after}**（★ true = 已不可调度）
+  · 排空前这个节点上的 Pod：{pods_on_node_before}
+  · 排空后这个节点上的 Pod：{pods_on_node_after}
+  · `drain` 原文：{act}
+  ── 现在的节点表（找 `SchedulingDisabled`）──
+  {node_state}
+
+  ★★ 回得去 / 回不去（规范 §12.38 / 清单 105）：
+    · ✅ **回得去**：执行 `k8s.node-resume`（等价 `uncordon`）⇒ 节点重新可被调度；
+    · ❌ **回不去**：**被驱逐的 Pod 已经重建过** —— 从"排空后"那一屏能看到：留在这里的只有
+      DaemonSet 的 Pod（网络插件 / 日志采集这类）；被赶走的那些已经在别的节点上**重新起过**了；
+    · ❌ **`emptyDir` 的数据**：选了"带 emptyDir / 强制档"就是**删掉了它们**（本动作不会替你留住）；
+    · ⚠️ 若某个 Pod **没能被驱逐**（卡在 `Terminating`），本动作会红 —— 那通常意味它没有控制器
+      （裸 Pod）⇒ 要用"强制档"（★ 但那些 Pod **不会被重建**）。
+
+  判读：
+    · ★★ 判据是 **`spec.unschedulable=true`** ＋ **非 DaemonSet 的 Pod 已经不在**（两屏对照）；
+    · ★ 排空之后 `k8s.workloads` 里 `DaemonSet` 的"期望数"会**变小** —— 那是**正确行为**；
+    · ★ 维护完记得 `k8s.node-resume`（**排空不是终点**，是维护窗口的开始）。

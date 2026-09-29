@@ -1,0 +1,230 @@
+# ============================================================
+# 配方：造一台干净的靶子机（T17 · 规范 §12.127~§12.132）
+#   母机快照 → 克隆 → 登记 → 开机 → 等就绪 → 等 SSH → 重置身份 ×3 → 体检
+#   → 改静态地址 → 更新登记 →（可选）关回
+# ------------------------------------------------------------
+# ★★ 本配方是 T17 的**一句话**：**「给我来一台干净的靶子机」**。
+#    而它的主题句是：**「克隆给出的是拷贝件 —— 直到身份被换掉，它才算一台新机器。」**（§12.129）
+#
+# ★★ 两个执行面交替出现（§12.115 规矩 1：通道由**动作**声明）：
+#    · `vm.*`（快照 / 克隆 / 开机 / 等就绪 / 关回）走**本机通道**（宿主机的 vmrun.exe，不走 ssh）；
+#    · `host.identity-*` / `host.checkup` 走 **ssh 通道**（真的连进那台新机器）。
+#    ★ 它们的目标是**同一台机器**（意图面），但**执行面不同** —— 报告里**不合并**（§12.115 规矩 2）。
+#
+# ★★ 顺序是**有依赖的**（§12.128 第 2 条）：
+#    ① 先**登记**才能 `vm.start` 它（归属判定只认 hosts.yaml 或当次点名，§12.116）；
+#    ② 本链做**身份前三项**（machine-id / SSH host key / 主机名）＋ **体检**；
+#    ③ ★★ **第 4 项身份（静态地址）刻意不在本链里** ——
+#       地址一改，管理机到它的那条 ssh 就换了，而**配方的健康检查是跑完之后按登记地址问的** ⇒
+#       把它塞进链里，健康检查就必然问到一个**已经没有人的地址**（那是**假红**，比不做更坏）。
+#       ⇒ 地址那一步（`host.static-ip-set` ＋ `host.register --update-mode address`）**由人在链尾单独跑**，
+#         两件事各自留任务号（结题回执里给证据）。★ 这是**顺序纪律**，不是遗漏。
+#
+# ★★ 「克隆机刚起来时的地址」= **母机的地址**（克隆会连 MAC 一起复制 ⇒ DHCP 也会给它同一个租约）。
+#    所以中间那一段 ssh 走的是 `initial_address`；身份重置之后再落到 `address`。
+#    ★ 本环境的实测依据：VMware DHCP 租约里，母机 MAC `00:0c:29:00:00:01` ⇔ `203.0.113.130`。
+# ============================================================
+
+id: vm-provision
+name: 造一台干净的靶子机（克隆 → 登记 → 开机 → 等就绪 → 等 SSH → 重置身份 → 体检 → 改地址 → 更新登记）
+version: "1"
+summary: 一句话造机 —— ★ 克隆给出的是拷贝件，**身份换掉之后它才算一台新机器**
+risk: red
+
+note: |
+  ★★ 为什么要 `red` 且要**手输确认词**（§12.6.1 / 铁律 9）：
+    本配方第一步克隆就会**造出一台新机器**（占磁盘、会带来身份串味），
+    最后一步还会**改掉它的网络地址**。这两件事都**不该**由"点一下"发生。
+  ★★ 判据链（四级各归各家，§12.117）：
+    ① `vm.clone`   ：**文件系统上多了一个 .vmx**（不是"vmrun 没报错"）；
+    ② `vm.wait-guest`：guest 真的起来了（VMware Tools 报出地址）；
+    ③ `wait`（等 SSH）：**端口真的开了**；
+    ④ `host.checkup`：**真的 ssh 进去查了一遍**。
+  ★★ 身份重置的判据**每一项都是"与动手前不同"**（§12.128）：
+    而"动手前那个值"**就是母机的值**（克隆复制过来的）⇒ **变了 = 不再串味**。
+  ★ **回不去的东西**（逐项说清，没有也写「无」）：
+    · 母机快照会**一直占磁盘**（要清就人工在 VMware 里删）；
+    · ★ **平台没有"删虚拟机"的动作**（删除比克隆更不可逆，刻意不做）⇒ 新机不要了请**人工在 VMware 里删**；
+    · 旧身份（machine-id / host key / 旧主机名 / 母机那个地址）—— 那是**要消除**的东西，不回。
+  ★ **不做**（划清边界）：不替 VMware GUI 干活（虚拟网络编辑器 / NAT）、不改 `.vmx`（红线 13）、
+    不碰与本项目无关的 10 台 VM（红线 12）、不做"批量造机"（"批量不是事务"，T7 口径）。
+
+no_uninstall: true
+no_uninstall_why: |
+  本配方**不安装任何东西** —— 它做的是一件"造机器"的事：克隆出一台新机、把它的身份换新、登记进平台。
+  ★ 没有可停的服务（反向动作里 `vm.stop` 已经作为可选步骤存在）、没有可撤的开机自启、
+    没有可删的路径（本配方**不写**目标机上的任何业务配置，只改身份那几件事）。
+  ★ 反向操作 = **人工在 VMware 里删掉这台机器**：平台**刻意没有**"删虚拟机"的动作
+    （删除比克隆更不可逆 —— 见 §12.127 边界 2 与 §12.130）。★ 这是"回不去要写清"，不是遗漏。
+  ★ 母机那一条**克隆前的快照**是这次操作唯一的"回退点"：新机出问题时，母机本身可以回到它。
+
+params:
+  - name: mother
+    label: 母机（源虚拟机）
+    type: str
+    required: true
+    default: Rocky Linux 64 位
+    placeholder: 母机名 或 vmx 文件名
+    help: ★ 只有"已登记"或"当次点名"的（`config.yaml` 的 `vm.extra_allow`）才允许操作（红线 12）
+
+  - name: new_id
+    label: 新机 id（★ 同时是目录名、文件名、主机名与登记 id）
+    type: str
+    required: true
+    default: aoc-tpl-01
+    pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{1,38}$'
+    placeholder: aoc-tpl-01
+
+  - name: initial_address
+    label: ★ 克隆机刚起来时的地址（= 母机的地址）
+    type: str
+    required: true
+    default: 203.0.113.130
+    pattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    placeholder: 203.0.113.130
+    help: |-
+      ★ 克隆会**连 MAC 一起复制** ⇒ 它 DHCP 拿到的就是母机那个地址。
+      本环境实测：母机 MAC `00:0c:29:00:00:01` ⇔ `203.0.113.130`（VMware 租约文件里读到的）。
+      ★ 不确定就先用动作 `vm.ip` 看一眼再回来填。
+
+  - name: address
+    label: ★ 新机的最终静态地址（**链外单独跑**那一步时会用到）
+    type: str
+    required: false
+    default: ""
+    pattern: '^$|^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    placeholder: 192.0.2.14
+    help: |-
+      ★ 来源只有两个：**人点名**，或平台**只读扫描**未用地址后挑；★ 必须避开 DHCP 池（.128~.254）。
+      ★★ 它**不在本链的正向步骤里**（理由见页首第 ③ 条）—— 链尾由人单独跑
+        `host.static-ip-set` 与 `host.register --update-mode address`。
+        留着它，是为了把**计划值**写进这次执行的记录（"本来打算改成什么"要能被回看）。
+
+  - name: snapshot
+    label: 母机快照名（克隆**之前**先打的那一条）
+    type: str
+    required: true
+    default: aoc-克隆前
+    pattern: '^[^\r\n]{1,80}$'
+    help: ★ 规范 §12.130 第 2 条：克隆靠的是"源状态"，源状态要可回 —— 这是本次操作唯一的回退点
+
+  - name: min_free_mb
+    label: 至少留多少 MB 磁盘余量
+    type: int
+    required: true
+    default: 5120
+    min: 512
+    max: 102400
+
+  - name: timeout_sec
+    label: 最多等多少秒（等就绪 / 等 SSH / 等关机）
+    type: int
+    required: true
+    default: 300
+    min: 30
+    max: 900
+
+  - name: power_off
+    label: 用完关回去（可选）
+    type: enum
+    required: false
+    choices: ["保持开机（靶子机留着你用）", "关回去（soft 优雅关机）"]
+    values: ["", "soft"]
+    default: ""
+    help: ★ 默认**保持开机** —— "造完就关掉"不是默认行为（与 T16 的 `vm-cycle` 同一条纪律）
+
+steps:
+  - name: snapshot_mother
+    title: ① 先给母机打一条快照（★ 克隆前的护栏，规范 §12.130 第 2 条）
+    action: vm.snapshot-create
+    args: { vm: "{{ mother }}", snapshot: "{{ snapshot }}", timeout_sec: "{{ timeout_sec }}" }
+    note: ★ 这一步跑在**宿主机**上（本机通道）；它只动母机的快照链，**不改 guest 里的任何东西**。
+
+  - name: clone
+    title: ② 克隆（★ 收条 + 判据 —— 新的 .vmx 真的出现了吗）
+    action: vm.clone
+    args: { vm: "{{ mother }}", new_id: "{{ new_id }}", min_free_mb: "{{ min_free_mb }}",
+            timeout_sec: "{{ timeout_sec }}" }
+    note: |
+      ★★ 这一步之后，**新机的身份与母机完全相同**（machine-id / host key / 主机名 / IP / MAC）——
+        所以它现在**还不是一台新机器**（§12.129）。下面第 ④~⑧ 步就是把它"变成新机器"。
+
+  - name: register_initial
+    title: ③ 先登记（★ 不登记就不能开它：归属判定只认 hosts.yaml 或当次点名）
+    action: host.register
+    args: { id: "{{ new_id }}", address: "{{ initial_address }}", new_id: "{{ new_id }}",
+            from_mother: "{{ mother }}", update_mode: "refuse" }
+    note: |
+      ★ 这里登记的是**中间地址**（克隆机刚起来时用的那个）—— 因为接下来要 ssh 进去改身份，
+        而平台只按登记里的地址连它。
+      ★ 写的是**管理机自己**的 `hosts.yaml`：写前备份 ＋ 逐字节可回退 ＋ 对外可见（§12.131）。
+
+  - name: power_on
+    title: ④ 开机（★ 收条 + 判据；红灯级的代价：宿主机资源）
+    action: vm.start
+    args: { vm: "{{ new_id }}", timeout_sec: "{{ timeout_sec }}" }
+
+  - name: wait_guest
+    title: ⑤ 等 guest 就绪（★ "起来了" —— 但它 ≠ "能 ssh 进去"）
+    action: vm.wait-guest
+    args: { vm: "{{ new_id }}", timeout_sec: "{{ timeout_sec }}" }
+
+  - name: wait_ssh
+    title: ⑥ 等 SSH 就绪（★ 判据：端口真的开了）
+    wait:
+      expect: { port_open: "22" }
+      timeout_sec: 180
+      interval_sec: 5
+      fail_reason: |
+        guest 起来了但 SSH 端口没开：可能是 sshd 还在起、防火墙没放行、或者地址不是 initial_address。
+        ★ 先看 `vm.wait-guest` 那一步拿到的地址对不对 —— 「起来了」与「连得上」是两件事（§12.117）。
+        ★ 若地址对而端口不开：到它的控制台看一眼 sshd 状态（那一跳是人工的，平台不代劳）。
+
+  - name: identity_before
+    title: ⑦ 先读一次身份（★★ 这是**对照证据的前半段**：此刻读到的就是**母机的身份**）
+    action: host.identity-show
+    note: |
+      ★★ 它为什么必须在重置**之前**（§12.128 / §12.129）：
+        克隆把身份整盘复制了过来 ⇒ **此刻这四项值 = 母机的值**。
+        于是"重置之后再读一次、两次不一样"这件事，**本身就证明了不再与母机相同** ——
+        不需要把母机开机、也不需要用眼睛去抄母机的值。
+      ★ 若这一跳读不到（例如连不进去），后面的重置**没有对照**，判据就只剩"命令返回 0"了。
+
+  - name: id_machine_id
+    title: ⑧ 重置身份之① —— machine-id
+    action: host.machine-id-reset
+    args: { dry_run: "no" }
+
+  - name: id_ssh_hostkey
+    title: ⑧ 重置身份之② —— SSH host key（★ 最安静的那一项）
+    action: host.ssh-hostkey-reset
+    args: { dry_run: "no" }
+
+  - name: id_hostname
+    title: ⑧ 重置身份之③ —— 主机名
+    action: host.hostname-set
+    args: { name: "{{ new_id }}", dry_run: "no" }
+
+  - name: identity_after
+    title: ⑨ 再读一次身份（★ 对照证据的后半段：四项应当**全都不一样了**）
+    action: host.identity-show
+
+  - name: checkup
+    title: ⑧ 体检（★ 这一步**真的 ssh 进去查** —— "连得上"之后才是"查得通"）
+    action: host.checkup
+
+  - name: power_off
+    title: ⑪ 关回去（可选 · soft 优雅关机）
+    action: vm.stop
+    args: { vm: "{{ new_id }}", timeout_sec: "{{ timeout_sec }}" }
+    when: power_off
+    note: ★ 步骤上的 `when` 指向配方参数 `power_off` —— 只有那个人填了值才跑（参数名写裸名，不写 `{{ }}`）。
+
+health:
+  # ★★ 本配方的健康检查回答的是「**这台新机器现在能不能用**」（§12.117 的第 3/4 级）：
+  #    判据落在**登录通道**上 —— sshd 在跑 ＋ 22 端口真的开。
+  #    ★ 它问的是**登记里的地址**（本次 = `initial_address`）：因为**改地址那一步不在本链里**（页首 ③）。
+  - expect:
+      state: { unit: sshd.service, equals: active }
+  - expect:
+      port_open: "22"

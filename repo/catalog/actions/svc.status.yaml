@@ -1,0 +1,142 @@
+# ============================================================
+# 动作：单元状态（单个）
+# 来源：T8·S2 —— S0 侦察时靠"全量单元留证里筛"才看到 kubelet/containerd 的状态（规范 §12.25）
+# 形态：**只读**（green）—— 一次给全：加载 / 运行 / 自启 / 单元文件 / drop-in
+# ============================================================
+
+id: svc.status
+title: 单元状态（单个）
+summary: 一个 systemd 单元的加载/运行/自启状态、单元文件与 drop-in 路径，一次给全
+domain: E
+risk: green
+priority: P1
+tags: [只读, 服务, systemd]
+
+note: |
+  ★ 为什么需要它：`svc.list` 只给"运行中 / 失败"两张名单 —— 而 T8 真正要问的是
+  「`kubelet.service` 到底是 **activating(auto-restart)** 还是 inactive？」
+  「它的 **drop-in 目录**在哪（§12.25.3 要落点）？」「它 **enabled** 了吗？」
+  这三件事 `svc.list` 一件都答不了（`list-units` 的输出里**没有 enabled 这一列**）。
+
+  ★★ **三个状态来源、三件不同的事**（别混）：
+  · `systemctl is-active`  → **当前跑没跑**（active / inactive / failed / activating），★ 结论落在 **stdout**；
+  · `systemctl is-enabled` → **开机自启**（enabled / disabled / static / masked），★ 结论也落在 **stdout**；
+  · `systemctl show`       → **systemd 内存里那份定义**（`ActiveState` / `SubState` / `UnitFileState` /
+    `FragmentPath` / `DropInPaths`）—— ★ 这是 §12.25.2 说的"**单元定义确实变了**"的取证入口。
+  ⇒ 三者要**一起看**：例如 `is-active=activating` + `SubState=auto-restart` = **在反复重启**
+  （T8 侦察时 kubelet 就是这个样子：容器运行时不在，它起不来又一直在重试）。
+
+  ★ 本动作**只读**：不 start/stop/restart/enable/disable（那些是 T3 的变更动作）。
+  ★ `unit` 不存在时 `systemctl show` 仍返回 0 并给出 `LoadState=not-found` ——
+  那是**结论**（这台机器没这个单元），不是错误。
+
+params:
+  - name: unit
+    label: 单元名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9@._-]{1,64}\.(service|socket|timer|target|mount|path)$'
+    placeholder: kubelet.service
+    help: '要带类型后缀，如 kubelet.service / containerd.service / cri-docker.socket'
+
+steps:
+  - name: show
+    title: systemd 内存里的那份定义（★ 定义取证入口）
+    run:
+      - systemctl
+      - show
+      - "{{ unit }}"
+      - -p
+      - LoadState
+      - -p
+      - ActiveState
+      - -p
+      - SubState
+      - -p
+      - UnitFileState
+      - -p
+      - FragmentPath
+      - -p
+      - DropInPaths
+      - -p
+      - ActiveEnterTimestamp
+      - -p
+      - ExecMainPID
+      - -p
+      - NRestarts
+    parser: shell_kv
+    timeout: 30
+    note: >
+      输出是 `Key=Value` 逐行（→ `shell_kv`）。★ 读的是 **systemd 内存里那份**，
+      所以它是"`daemon-reload` 到底吃进去了没有"的取证入口（§12.25.2 第二重自证的 ①）。
+
+  - name: is_active
+    title: 当前跑没跑（★ 结论在 stdout）
+    run: [systemctl, is-active, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [0, 3, 4]
+    timeout: 20
+    note: >
+      退出码 0=active / 3=inactive 或 failed / 4=单元未知 —— **三个都是正常报告**（§9.6 同族：
+      退出码是它的一句话结论，不是错误码）。★ 答案写在 **stdout**，所以它能当自证来源
+      （对比 `firewall-cmd --state` 把答案写在 stderr —— T8·S2 抓到的那个假红）。
+
+  - name: is_enabled
+    title: 开机自启（★ 结论在 stdout）
+    run: [systemctl, is-enabled, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [0, 1, 3, 4]
+    timeout: 20
+    note: 输出 enabled / disabled / static / masked / not-found；★ `list-units` 里**没有**这一列。
+
+  - name: cat
+    title: 单元文件与 drop-in 原文（人看的证据）
+    run: [systemctl, cat, "{{ unit }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1]
+    timeout: 30
+    note: >
+      输出里会用 `# /etc/systemd/system/kubelet.service.d/10-kubeadm.conf` 这样的注释行
+      标出"这一段来自哪个文件" —— 落 drop-in 之前先用它看清既有结构（§12.25.3）。
+
+  - name: brief
+    title: 人的那一版（status 摘要）
+    run: [systemctl, status, "--no-pager", "-l", "{{ unit }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1, 3, 4]
+    timeout: 30
+
+verify:
+  - name: 必须拿到 systemd 的定义（★ 这一步问不出来才算故障）
+    from: show
+    on_missing: >
+      `systemctl show` 没有给出任何键值 —— 目标机可能不是 systemd 系统（或权限不足）。
+      ★ 反过来：`LoadState=not-found` / `ActiveState=inactive` **都不算故障**，那是结论。
+  - name: 必须能读出"跑没跑"
+    from: is_active
+    severity: warn
+    on_missing: is-active 没给出结论 —— 只能靠上面的 show 段判读
+
+conclusion: |
+  【{host.name}】单元状态（只读）
+  单元：{unit}
+  · 加载状态 LoadState：{show.LoadState} ｜ 单元文件状态 UnitFileState：{show.UnitFileState}
+  · 运行状态 ActiveState / SubState：{show.ActiveState} / {show.SubState}
+  · 自启（is-enabled）：{is_enabled} ｜ 在跑（is-active）：{is_active}
+  · 主进程 PID：{show.ExecMainPID} ｜ 自动重启次数 NRestarts：{show.NRestarts}
+  · 上次进入 active 的时刻：{show.ActiveEnterTimestamp}
+  · 单元文件：{show.FragmentPath}
+  · drop-in 目录：{show.DropInPaths}
+  · 单元文件与 drop-in 原文：
+  {cat}
+
+  判读：
+    · `ActiveState=activating` + `SubState=auto-restart` ⇒ ★ **在反复重启**：
+      通常是它依赖的东西不在（例：`kubelet` 依赖容器运行时的 socket 没在）；
+    · `LoadState=not-found` ⇒ 这台机器**没有**这个单元（结论，不是错误）；
+    · `UnitFileState=disabled` ⇒ 开机不会自己起（T3 的「启用」/「停用」管它）；
+    · ★ 改了主单元或 drop-in 之后，`FragmentPath` / `DropInPaths` 会告诉你**改的地方对不对**；
+      而"改完生效没有"要**同时**看这里（定义）与 `is-active` / 探针（实际）—— 见规范 §12.25.2；
+    · 本动作只读：不启停、不改单元定义、不动 drop-in。

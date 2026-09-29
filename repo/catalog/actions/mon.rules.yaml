@@ -1,0 +1,135 @@
+# ============================================================
+# 动作：监控 · 规则生效面（T10）
+# 来源：开题单 §7 验收 #4（"规则在判"）
+# 形态：**声明式与生效面分开** —— 文件里写了不算，`/api/v1/rules` 读得到才算
+# 风险：green
+# ============================================================
+
+id: mon.rules
+title: 监控 · 告警规则生效面（写了 vs 在跑）
+summary: 读 /api/v1/rules：几条规则在跑、有没有"没带 for 的"、以及文件与生效面是否逐条对得上
+domain: J
+risk: green
+priority: P0
+tags: [只读, 监控, 告警规则, 判据, T10]
+
+note: |
+  ★★ 规范 v1.13 §12.55「**声明式与生效面要分开**」：
+    规则文件是**声明**，`/api/v1/rules` 是**生效面**。**只改文件不 reload ⇒ 生效面读不到** ——
+    本动作的 `assert_file_matches_api` 就是钉这一条的：文件里的条数必须等于 API 读回来的条数。
+  ★★ 「每一条都带 `for`」也有机器判据：`/api/v1/rules` 里 `duration` 就是 `for` 的秒数，
+    没写 `for` 的规则 `duration = 0` ⇒ **只要出现一条 `"duration": 0` 就判红**。
+    ★ 判据从"文件里有没有 for 这个字"升级成"**生效面里有没有一条 for 为 0 的规则**"。
+
+params:
+  - name: prom_base
+    label: Prometheus 地址
+    type: str
+    required: true
+    default: http://127.0.0.1:9090
+    pattern: '^http://127\.0\.0\.1:[0-9]{2,5}$'
+  - name: rules_file
+    label: 规则文件在目标机上的路径
+    type: str
+    required: true
+    default: /opt/aoc-monitoring/etc/rules.yml
+    pattern: '^/opt/aoc-monitoring/[A-Za-z0-9._/-]{1,80}$'
+    help: ★ 白名单钉在 /opt/aoc-monitoring/ 下 —— 本动作不该去读别处的文件。
+  - name: min_rules
+    label: 至少几条规则
+    type: int
+    required: true
+    min: 1
+    max: 200
+    default: 12
+    help: 总纲要求 ≥12；T10 实际交付 14 条（留 2 条给抑制对）。
+
+steps:
+  - name: fetch
+    title: 取 /api/v1/rules（生效面）
+    run: [curl, -sS, --max-time, "15", -o, /opt/aoc-monitoring/_out/rules.json, "{{ prom_base }}/api/v1/rules"]
+    parser: raw
+    timeout: 40
+
+  - name: pretty
+    title: 整理成稳定文本
+    run: [python3, -m, json.tool, /opt/aoc-monitoring/_out/rules.json, /opt/aoc-monitoring/_out/rules.pretty.json]
+    parser: raw
+    timeout: 40
+
+  - name: count_api
+    title: 生效面里有几条告警规则
+    run: [grep, -c, '"type": "alerting"', /opt/aoc-monitoring/_out/rules.pretty.json]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+
+  - name: count_file
+    title: 规则文件里声明了几条
+    run: [grep, -c, -E, "^[[:space:]]*- alert:", "{{ rules_file }}"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+
+  - name: count_no_for
+    title: 生效面里有几条"没带 for"
+    run: [grep, -c, -E, '"duration": 0,?$', /opt/aoc-monitoring/_out/rules.pretty.json]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+
+  - name: assert_all_have_for
+    title: ★★ 判据：不许有"没带 for"的规则
+    run: [grep, -q, -E, '"duration": 0,?$', /opt/aoc-monitoring/_out/rules.pretty.json]
+    parser: raw
+    ok_exit_codes: [1]
+    timeout: 20
+    note: >
+      ★ 只接受 rc=1（一条都没命中）。命中 ⇒ 有规则 for 为 0 ⇒ 这一步判红。
+      ★ 它成功时**没有输出**，所以**不进 verify**（否则是 100% 假红，规范 §12.49）。
+
+  - name: assert_file_matches_api
+    title: ★★ 判据：文件条数 == 生效面条数，且不低于 {min_rules}
+    run:
+      - awk
+      - "FNR==NR && /- alert:/{f++} FNR!=NR && /\"type\": \"alerting\"/{a++} END{exit (f==a && f>={{ min_rules }}?0:1)}"
+      - "{{ rules_file }}"
+      - /opt/aoc-monitoring/_out/rules.pretty.json
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: >
+      ★★ 这就是"**只改文件不 reload** 会红"的机器判据：文件写了 15 条、生效面还是 14 条 ⇒ `f != a` ⇒ 判红。
+      ★ 同时也是"**少写了几条**"的判据：`f >= min_rules` 不成立 ⇒ 判红。
+
+  - name: names
+    title: 生效面里的规则名（人读）
+    run: [grep, -e, '"name": "Aoc', -e, '"duration": ', -e, '"state": ', /opt/aoc-monitoring/_out/rules.pretty.json]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    optional: true
+    note: ★★ rc=1 也算成功：**"生效面里一条规则名都没有"是结论**（那说明 reload 没做，或者规则文件根本没被读到）—— 陈列型步骤必须接受 rc=1（§12.51 同族）。
+    timeout: 20
+
+verify:
+  - name: 必须读到生效面
+    from: count_api
+    on_missing: /api/v1/rules 没有返回内容 —— Prometheus 在不在？
+  - name: 必须数得清文件声明了几条
+    from: count_file
+    on_missing: 规则文件不存在或读不到（路径对不对？）
+
+conclusion: |
+  【{host.name}】监控 · 告警规则生效面
+  Prometheus：{prom_base} ｜ 规则文件：{rules_file}
+  文件里声明 **{count_file}** 条 ｜ 生效面 **{count_api}** 条 ｜ 其中没带 for 的 **{count_no_for}** 条 ｜ 要求 ≥ {min_rules}
+
+  生效面摘要（规则名 / for 秒数 / 状态）：
+  {names}
+
+  判读：
+  · **文件条数 ≠ 生效面条数** ⇒ 只有一种解释：**改完文件没有 reload**（`mon.reload` 那一步没跑）；
+  · **"没带 for" > 0** ⇒ 那条规则会"一到就响"，与总纲要求的"带 for 抑制"不符；
+  · `state` 是**当前**状态（inactive / pending / firing），**它是会变的**——
+    要看"会不会真的响"，用 `mon.alerts` 在**造条件前后各查一次**（规范 §12.55.2）；
+  · 本动作只读：不改文件、不触发 reload。

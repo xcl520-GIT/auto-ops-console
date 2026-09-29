@@ -1,0 +1,139 @@
+# ============================================================
+# 动作：防火墙规则
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 F（P0 · 只读）
+# 形态：一次给全结论（状态 + 默认 zone + 放行清单 + 运行时与持久化的差异）
+# 风险：green
+# ★ T8·S2 修订（规范 §12.29）：状态来源从 `firewall-cmd --state` 换成 `systemctl is-active`
+#   —— 详见下面 `unit` 步的 note（那是一次真跑抓到的**假红**）。
+# ============================================================
+
+id: net.firewall
+title: 防火墙规则
+summary: firewalld 状态、当前放行的服务与端口，以及"改了没持久化"的差异
+domain: F
+risk: green
+priority: P0
+tags: [只读, 网络, 防火墙, 安全]
+note: |
+  只读：只做查询，绝不 add/remove 规则（放行与撤销属 T3 的变更动作）。
+  ★ 特意同时查「运行时」与「持久化（--permanent）」两份配置：
+    两者不一致 = 有人用 firewall-cmd 改了运行时但没加 --permanent，**重启就会丢**。
+    这是排障里非常常见的"昨天还好好的"的成因。
+
+  ★★ **T8·S2 修订（规范 §12.29）**：**firewalld 未运行是一条结论，不是故障**。
+    修订前，本动作在 firewalld 未运行的机器上**整条判 `VERIFY_FAILED`** ——
+    根因不是"判据口径"，而是**"结论落在 stderr"**：
+    `firewall-cmd --state` 未运行时把 `not running` 写到 **stderr**、退出码 252，
+    而 `raw` 解析器**只看 stdout** ⇒ stdout 为空 ⇒ 自证（判"有没有值"）必然失败。
+    ⇒ 状态来源改用 **`systemctl is-active firewalld`**（结论落在 **stdout**），
+    `firewall-cmd --state` 降为**原文证据**（optional，不做自证）。
+
+params: []
+
+steps:
+  - name: unit
+    title: firewalld 单元状态（★ 状态来源：结论落在 stdout）
+    run: ["systemctl", "is-active", "firewalld"]
+    parser: raw
+    ok_exit_codes: [0, 3, 4]
+    timeout: 20
+    note: >
+      ★★ 为什么状态来源是它、而不是 `firewall-cmd --state`（T8·S2 真跑抓到的假红）：
+      firewalld 未运行时 `firewall-cmd --state` 把 "not running" 写到 **stderr**、退出码 252 ——
+      而 `raw` 解析器只看 stdout ⇒ stdout 为空 ⇒ 自证（判"有没有值"）必然失败 ⇒
+      **"firewalld 没跑"这个正常结论被整条判成 `VERIFY_FAILED`**。
+      换成 `systemctl is-active` 后，结论落在 **stdout**（active / inactive / failed / unknown），
+      且 0 / 3 / 4 三个退出码都是"正常报告"（§9.6 同族：退出码是结论，不是错误码）。
+
+  - name: state
+    title: firewalld 自报状态（原文证据；★ 未运行时答案在 stderr）
+    run: ["firewall-cmd", "--state"]
+    parser: raw
+    ok_exit_codes: [0, 252]
+    optional: true
+    timeout: 20
+    note: >
+      ★ 保留它作为**原文证据**，但**不许拿它做自证**（见上一步 note）。
+      ★ 注意：未运行时它的 "not running" 在 **stderr** 里，所以结论里这一行可能是（无）——
+      那是"它没跑"的证据之一，**不是**"问不出来"。
+
+  - name: default_zone
+    title: 默认 zone
+    run: ["firewall-cmd", "--get-default-zone"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 252]
+
+  - name: active_zones
+    title: 生效中的 zone
+    run: ["firewall-cmd", "--get-active-zones"]
+    parser: lines
+    optional: true
+    ok_exit_codes: [0, 252]
+
+  - name: runtime
+    title: 运行时规则
+    run: ["firewall-cmd", "--list-all"]
+    parser: colon_kv
+    pick:
+      "target": target
+      "interfaces": interfaces
+      "sources": sources
+      "services": services
+      "ports": ports
+      "protocols": protocols
+      "masquerade": masquerade
+      "forward": forward
+      "forward-ports": forward_ports
+      "rich rules": rich_rules
+    optional: true
+    ok_exit_codes: [0, 252]
+
+  - name: permanent
+    title: 持久化规则（重启后生效）
+    run: ["firewall-cmd", "--permanent", "--list-all"]
+    parser: colon_kv
+    pick:
+      "interfaces": interfaces
+      "services": services
+      "ports": ports
+      "masquerade": masquerade
+      "rich rules": rich_rules
+    optional: true
+    ok_exit_codes: [0, 252]
+
+verify:
+  - name: ★ 必须读到一个 firewalld 单元状态（状态来源是 systemctl，不是 firewall-cmd）
+    from: unit
+    on_missing: >
+      `systemctl is-active` 给不出结论 —— 这时才该判红（命令本身都执行不了）。
+      ★ 反过来：单元状态是 **inactive / failed / unknown 都不算故障**（§12.29）——
+      "firewalld 在不在跑"是**结论**，不是错误。
+  - name: 必须能读出运行时规则
+    from: runtime
+    severity: warn
+    on_missing: firewalld 未运行，读不到规则（此时端口是否开放要看 nftables 的原始规则）
+
+conclusion: |
+  【{host.name}】防火墙规则
+  firewalld 单元状态：**{unit}** ｜ 自报状态（firewall-cmd --state）：{state} ｜ 默认 zone：{default_zone}
+  生效中的 zone（zone: 网卡）：
+  {active_zones}
+  运行时规则（当前生效）：
+    网卡 {runtime.interfaces} ｜ 放行的服务 {runtime.services}
+    放行的端口 {runtime.ports} ｜ 放行的协议 {runtime.protocols}
+    target={runtime.target} ｜ forward={runtime.forward} ｜ masquerade={runtime.masquerade}
+    端口转发 {runtime.forward_ports} ｜ rich rules {runtime.rich_rules}
+  持久化规则（重启后真正生效的那份）：
+    网卡 {permanent.interfaces} ｜ 放行的服务 {permanent.services}
+    放行的端口 {permanent.ports} ｜ masquerade {permanent.masquerade}
+    rich rules {permanent.rich_rules}
+
+  判读：
+  · 首行状态：`active` = 在跑；**`inactive` = 没在跑，这是结论不是故障**（§12.29）——
+    firewalld 没启用时，端口是否开放改由 nftables/iptables 的原始规则决定
+    （用「已装软件」确认 nftables 是否装了，用「端口占用」看谁真的在听）；
+    `unknown` / `not-found` = 这台机器**没有**这个单元；
+  · 核心三行：services（按服务名放行）、ports（按端口放行）、interfaces（哪个网卡在这个 zone）；
+  · ⚠️ 运行时 ≠ 持久化 → 有人用 firewall-cmd 改了但**没加 --permanent**，重启后会回到持久化那份；
+  · 本动作只读，不会添加或删除任何规则；放行/撤销请用 T3 的变更动作（带改动前备份与二次确认）。

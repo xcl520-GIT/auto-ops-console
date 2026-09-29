@@ -1,0 +1,36 @@
+# ============================================================
+# 反例配方 3：引用不存在的动作 + 期望指向未登记来源
+# ★ 期望：装载期被拒，并**点名**「动作不存在」与「不是已登记的来源」
+# ============================================================
+
+id: bad-ref
+name: 反例·引用了不存在的东西
+version: "1"
+summary: 故意写错：steps 引用了不存在的动作
+risk: yellow
+params: []
+
+steps:
+  - name: s1
+    title: 引用一个不存在的动作
+    action: myapp.start
+    args: { unit: myapp }
+
+health:
+  - expect:
+      absent: { action: net.port, args: {} }      # net.port 不是存在性来源（规范 §12.2）
+  - expect:
+      responds: { action: net.ping, args: {} }    # net.ping 不是探活动作（规范 §12.11.3）
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: myapp }
+  disable: []
+  remove_config: []
+  purge_paths: []
+  keep_data: []
+  remove_packages: []
+  stop_confirm_text: 我已确认要停止服务
+  purge_confirm_text: 我已确认全删
+  health: []

@@ -1,0 +1,68 @@
+# ============================================================
+# 动作：虚拟机状态
+# 来源：设计\05-虚拟化层-架构设计.md §3 · 总纲 §4.2 第六阶段 T16
+# 形态：一台虚拟机现在的电源状态 + 快照链 + 归属（判据问被管的那一方）
+# 风险：green ｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.status
+title: 虚拟机状态
+summary: 这台虚拟机现在是跑是停（问 VMware 自己）、快照链上有哪些、归谁管
+domain: M
+risk: green
+priority: P0
+channel: local
+tags: [只读, 虚拟化, 状态]
+note: |
+  ★★ 判据问**被管的那一方**（规范 §12.117）：电源状态取自 `vmrun list`
+  —— ★ 不是"vmx 文件在不在"，也不是"venv 里那个时间戳"。
+  ★ 快照链那一查询是 `optional`：读不到快照链**不该**让"它现在跑没跑"这件事失去结论。
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名；★ 只有"已登记"或"当次点名"的才允许操作
+
+steps:
+  - name: state
+    title: 问 VMware：这台现在是什么状态
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "state", "--vmx", "{{ vm_vmx }}"]
+    parser: json
+    timeout: 60
+
+  - name: snaps
+    title: 读快照链（读不到不影响"跑没跑"的结论）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "snapshots", "--vmx", "{{ vm_vmx }}"]
+    parser: json
+    timeout: 60
+    optional: true
+
+verify:
+  - name: 必须拿到电源状态
+    from: state
+    field: state
+    on_missing: 读不到这台虚拟机的状态（vmrun 不可用，或 vmx 路径不对）
+  - name: 必须交代"状态是从哪儿问来的"
+    from: state
+    field: checked
+    on_missing: 探针没有交代它的判据来源 —— 「问不到」就不许看起来像「问到了」（规范 §12.122）
+
+conclusion: |
+  【{vm_name}】虚拟机状态
+  · 电源：{state.state}（在运行 = running）
+  · 归属：{state.managed_by}（不是"没查看"，只有登记过或当次点名过的机器才会出现在这里）
+  · vmx：{state.vmx}
+  · 快照：{snaps.count} 条
+  {snaps.table}
+
+  判据来源（★ 谁回答的这件事）：{state.checked}
+
+  判读：
+  · 状态是 **VMware 自己**说的（`vmrun list`）——★ 不是"文件在不在"，也不是"上次任务成功过"；
+  · 「已关机」是一条**结论**，不是故障：要在里面查东西，先 `vm.start`（yellow，需要人点头）；
+  · ★ 「起来了」与「能 ssh 进去」是**两件事**（规范 §12.117）：前者看这里 / `vm.wait-guest`，
+    后者要真的 ssh 一次才知道（例如「一键体检」）。

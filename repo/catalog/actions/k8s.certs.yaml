@@ -1,0 +1,127 @@
+# ============================================================
+# 动作：集群证书到期体检
+# 来源：T9·S2 —— 规范 §12.37.2（判据）· 开题单 §10.2 #8（★ **只读**，不做 renew）
+# 形态：**只读**（green）
+# ============================================================
+
+id: k8s.certs
+title: 集群证书到期体检
+summary: kubeadm 的证书到期表（剩余天数 / 到期日 / CA）一次取全 —— ★ 只读，不做续期
+domain: J
+risk: green
+priority: P1
+tags: [只读, K8s, 证书]
+
+note: |
+  ★★ **本动作明确"只读"**（T9 开题单 §10.2 拍板 #8）：**不做** `kubeadm certs renew`。
+  理由两条：① `renew` 之后要**重启控制面静态 Pod** 才生效 —— 那是**变更**（会动 apiserver / etcd），
+  不该藏在"体检"里；② 本集群才几个小时，**没有任何续期压力**。
+  ⇒ ★ 结论里给"**什么时候该续**"的判读，**不给一键续期的按钮**（承诺兑现不了比不承诺更坏）。
+
+  ★★ **为什么不用 `openssl`**：T7 的只读侦察已经确认 —— **这三台 K8s 机器都没装 `openssl`**
+  （`sec.cert` 当年就是被这条限制咬过的）。⇒ 证书到期这件事只能走 **`kubeadm certs check-expiration`**
+  （它自己解析 PEM，不依赖 openssl）。★ 这条限制写在结论里，免得下一个人去"优化"成 openssl 版本。
+
+  ★ 判据两条：`check_expiration` **必须给出非空的表**（拿不到表 = 这不是一个 kubeadm 控制面）；
+  `api_alive` **必须应答**（表读得出来，但 API 不通的话，"证书还有效"这件事对用户没有意义）。
+
+params:
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+precheck:
+  - name: kubeadm_present
+    title: 确认这台机器上有 kubeadm（没有它就没有这张表）
+    run: [ls, -l, /usr/bin/kubeadm]
+    parser: raw
+    timeout: 20
+    note: >
+      ★ 缺工具 ⇒ 整条动作 aborted，并给出"这台机器不是控制面（没有 kubeadm）"的结论。
+      ★ 它**不声明** `means_done`：缺 kubeadm **永远不是**"已达终态"（规范 §12.33 规矩 3）。
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在（★ 工作节点上没有它 —— 那是**结论**）
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+
+steps:
+  - name: check_expiration
+    title: ★ 证书到期表（`kubeadm certs check-expiration`）
+    run:
+      - kubeadm
+      - certs
+      - check-expiration
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 180
+    note: >
+      ★ 它是"**这些证书还剩多久**"的**一手判据**：表里每行给出 `CERTIFICATE` /
+      `EXPIRES` / `RESIDUAL TIME` / `CERTIFICATE AUTHORITY`。
+      ★ **不接 `--kubeconfig`**：kubeadm 自己读 `/etc/kubernetes/pki`，与 kubectl 那把是两件事
+      （混在一起会让人以为"kubeconfig 不对 = 证书过期了"）。
+
+  - name: api_alive
+    title: ★ 集群 API 必须应答（**表读得出来 ≠ 集群可用**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: pki_dir
+    title: "pki 目录的现状（对照用：表里提到的证书都在盘上）"
+    run:
+      - ls
+      - -l
+      - /etc/kubernetes/pki
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 2]
+    timeout: 30
+    note: >
+      ★ 声明 `ok_exit_codes: [0, 2]`：**"这个目录不在"（rc=2）本身是一个结论**
+      （这台机器不是控制面），不是失败 —— 与 `file.manifest` 同族（§12.30.2 / 清单 80）。
+
+verify:
+  - name: ★★ 证书到期表必须读得出来（拿不到它 = 这不是一个 kubeadm 控制面）
+    from: check_expiration
+    on_missing: >
+      `kubeadm certs check-expiration` 没有给出任何一行 —— 常见原因：这台机器**不是控制面**、
+      或 `kubeadm` 与集群版本不匹配。★ **不要**据此说"证书坏了"，那是另一件事。
+  - name: ★★ 集群 API 必须应答（证书"有效"的前提是集群真的在）
+    from: api_alive
+    on_missing: >
+      `kubectl get namespaces` 没有给出任何一行 —— ★ 这时"证书还有效"对用户**没有意义**：
+      先解决 API 不可达（那是 `k8s.nodes` 与 `k8s.diagnose` 的事），再看证书。
+
+conclusion: |
+  【{host.name}】集群证书到期体检（只读）
+  kubeconfig：{kubeconfig} ｜ ★ 本动作**不做续期**（`renew` 会重启控制面，属变更）
+
+  ── 证书到期表（kubeadm certs check-expiration）──
+  {check_expiration}
+  ── /etc/kubernetes/pki ──
+  {pki_dir}
+  ── 集群 API 是否应答 ──
+  {api_alive}
+  ── 原文结束 ──
+
+  判读：
+    · ★★ **看 `RESIDUAL TIME`（剩余时间）那一列**：< 30 天就该规划续期；< 7 天要立即安排；
+    · ★ **控制面证书一年一到期**（kubeadm 默认）⇒ "还有 300 多天"是**正常**的，不是"没读到"；
+    · ★ `CERTIFICATE AUTHORITY` 列指向的 CA（`ca.crt` / `front-proxy-ca.crt` / `etcd-ca.crt`）
+      **默认 10 年**，它们才是"到期=灾难"的那一类；
+    · ★★ **续期怎么做**：`kubeadm certs renew <名>` ＋ **重启对应的静态 Pod**（apiserver / etcd…）——
+      ★ 那是**变更**，本工作台目前**不提供**（没有动作，也没有配方）⇒ **按本节读到的剩余时间提前规划**，
+      不要等到期；要做的话请把它当成一次**有窗口的变更**（先备份 `/etc/kubernetes/pki` 与 etcd 快照）；
+    · ★ **不要试图换成 `openssl` 版本**：这三台机器**没装 openssl**（T7 只读侦察的结论），
+      而 `kubeadm` 自己会解析 PEM —— 换写法只会多一个"缺工具"的失败路径；
+    · ★ 本动作**只读**：不写文件、不重启任何东西（`changed` 恒 false）。

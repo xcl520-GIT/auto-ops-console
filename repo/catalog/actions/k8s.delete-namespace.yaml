@@ -1,0 +1,184 @@
+# ============================================================
+# 动作：删除命名空间（★ 它会连带删掉里面的一切）
+# 来源：T9·S4 —— 规范 §12.37.1 ①、§12.44（靶子收尾的判据）
+# 形态：**破坏性**（🔴 red + 手输确认词 + 禁止批量）
+# ============================================================
+
+id: k8s.delete-namespace
+title: 删除命名空间（连带里面的一切）
+summary: ★🔴 删掉一个命名空间 —— 里面的**所有**对象一起没；名字白名单只放行 `aoc-*` / `t9-*`
+domain: J
+risk: red
+priority: P1
+tags: [破坏性, K8s, 清理]
+
+note: |
+  ★★ **为什么它是 `red`**（规范 §12.32.4 同族）：
+  · 它**级联删除**整个命名空间里的对象 —— 一个"点一下就没了"的操作必须有人**当下知道并同意**；
+  · "回不去"：命名空间里的对象**全部**消失（重建是另一批新对象）；
+  · ★ 所以它**禁止批量**（`red` 一律禁批量，v1.8 起的闸门）。
+
+  ★★ **名字白名单是本动作的第一道闸门**（结构性防护）：
+  参数 `namespace` 的 pattern 只放行 `^(aoc-|t9-)[a-z0-9-]*$` ——
+  ★★ 于是它**结构上不可能**删掉 `kube-system` / `default` / `kube-public` / `kube-node-lease`
+  （★ 这条不是"我们小心一点"，是"**做不到**"）。
+
+  ★★ **判据是终态**（规范 §12.37.1 ①）：`kubectl get ns <名>` **退出码非 0** ——
+  ★ 不是"我发了删除命令"，也不是"delete 返回 0"（命名空间常年卡在 `Terminating`）。
+  ★ 这正是 T8 那句"**"拆"必须有一个所有权落点**"的同一把尺子用在对象上。
+
+params:
+  - name: namespace
+    label: 要删的命名空间
+    type: str
+    required: true
+    pattern: '^(aoc-|t9-)[a-z0-9-]*$'
+    placeholder: aoc-t9
+    help: '★★ **只放行 `aoc-*` / `t9-*`**：本动作**结构上做不到**删 `kube-system` / `default`（这是第一道闸门）。'
+  - name: wait_seconds
+    label: 等删除完成超时（秒）
+    type: int
+    required: true
+    min: 10
+    max: 600
+    default: 180
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 🔴 确认删除命名空间
+  body: |
+    ★★ 即将删除命名空间「{namespace}」—— 它会**连带删掉里面的一切**：
+    所有的 Pod / Deployment / Service / ConfigMap / PVC **一起消失**。
+    · 能不能撤：❌ **回不去**（里面的对象全部消失；重建是另一批新对象）。
+      ★ 唯一的事后路径是任务详情里的历史输出（那是"证据"，不是"备份"）。
+    · 影响面：★★ **整片环境没了**（若里面有别人在用的东西，也一起没）。
+    · 会不会删 `kube-system` / `default`：★ **不会** —— 本动作的命名空间白名单只放行 `aoc-*` / `t9-*`。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认删除这个命名空间
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: ns_exists
+    title: ★ 命名空间必须存在（否则"删了一个空气"也会报成功）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - ns
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: contents_before
+    title: ★★ 里面有什么（**留证：删之前先看清自己要删掉多少东西**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - all,configmap,pvc
+      - "-n"
+      - "{{ namespace }}"
+      - -o
+      - name
+    parser: lines
+    optional: true
+    ok_exit_codes: [0, 1]
+    timeout: 60
+
+  - name: act
+    title: 提交删除（★ 只说明"请求被接受了"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - delete
+      - ns
+      - "{{ namespace }}"
+      - --wait=true
+      - "--timeout={{ wait_seconds }}s"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 620
+
+  - name: after
+    title: "★★ **判据：它真的不在了**（`get ns` 这条命令**必须失败**，`ok_exit_codes: [1]`）"
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - ns
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    ok_exit_codes: [1]
+    timeout: 60
+    note: >
+      ★★ 命名空间**常年卡在 `Terminating`**（有 finalizer 在等）⇒
+      "`delete` 返回 0" **完全不能**说明"它没了"。本步的退出码才是判据：
+      **1 = NotFound = 真的没了**；**0 = 还在（红）**。
+
+  - name: namespaces_left
+    title: ★ 删完之后还剩哪些命名空间（旁证：`kube-system` / `default` 必须还在）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对），本次没有改任何东西。
+  # ★★ §12.49（T9·S4 真跑抓到的**真缺陷 ⑨**）：这里**原先还有一条** `from: after` 的"内容非空"自证 ——
+  #   **已删掉**，与 `k8s.delete-workload` 同形同害：`after` 是「**必须失败型**」步骤
+  #   （`ok_exit_codes: [1]`，不含 0），**成功态就是"命令报错"**，而 stdout 本来就是空的
+  #   ⇒ 叠一条非空断言 = **100% 假红**（收尾删 `aoc-t9` 时必然会撞上）。
+  # ★ 判据由 `ok_exit_codes: [1]` 承担（§12.36 唯一准绳）：**它还在 ⇒ `get ns` 返回 0 ⇒ 那一步红**。
+
+conclusion: |
+  【{host.name}】🔴 删除命名空间 · {namespace}（**破坏性变更**）
+  · 删之前里面的对象（留证）：{contents_before}
+  · 删之后 `get ns` 的原文（★ **NotFound 的报错在 stderr 上，stdout 本来就空** —— 这一格显示"（无）"
+    是**预期**，**不是**"没取到"；真正的判据是那一步的**退出码 = 1**）：{after}
+  ── 还剩哪些命名空间（★ `kube-system` / `default` 必须还在）──
+  {namespaces_left}
+
+  ★★ 回得去 / 回不去（规范 §12.38）：
+    · ❌ **回不去**：命名空间里的对象**全部消失**；重建是另一批新对象（新 UID / 新 IP）；
+    · ❌ **数据**：命名空间里 PVC 背后的存储按各自的回收策略处理（`Delete` 会真的删存储）——
+      ★ 本动作**不替存储做决定**，但也不救它；
+    · ✅ **唯一的事后材料**：本任务的**历史输出**（那是证据，不是备份）。
+
+  判读：
+    · ★★ 判据是 **`get ns` 退出码为 1**（真的没了），**不是** `delete` 的返回；
+    · ★★ 它删的**不只是对象列表** —— 命名空间是"整片环境的边界"，动手前先看清留证那一段；
+    · ★ 若它卡在 `Terminating`：先 `k8s.describe`（kind 枚举里没有 namespace，用 `k8s.kubectl` 的
+      `describe` 也行）看 `finalizers`，再决定是等还是清；
+    · ★ 本动作**不碰** `kube-system` / `default` / `kube-public` / `kube-node-lease`（白名单结构上排除）。

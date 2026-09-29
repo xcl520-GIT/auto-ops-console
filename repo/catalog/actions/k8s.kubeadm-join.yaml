@@ -1,0 +1,205 @@
+# ============================================================
+# 动作：工作节点入列（kubeadm join）
+# 来源：T8·S6 —— 规范 §12.32.1 / §12.32.3 第 4 条
+# 形态：**变更**（yellow）—— 让一个节点入列（它的旧集群态已由 reset 清掉）
+# ============================================================
+
+id: k8s.kubeadm-join
+title: 工作节点入列（kubeadm join）
+summary: 把一台机器加进已有集群 —— token 与 CA 指纹由参数给（不做"上一步输出喂下一步"），自证挂 kubelet.conf 与 kubelet 的 active 态
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, K8s, kubeadm, 工作节点]
+
+note: |
+  ★★ **token 与 CA 指纹为什么是"参数"而不是"从上一步的输出里抓"**（规范 §12.32.3 第 4 条）：
+  平台**没有** output→input 的管道，**也不该有** —— 那等于把命令拼装权交回给运行期。
+  ⇒ 做法是：用 `kubeadm token create <指定串>`（或 `token list`）**造一个已知的 token**，
+  连同 CA 指纹一起当**参数**填进来。★ 代价如实写：**参数值会进报告**，
+  所以它**只适用于实验环境**；换生产要走"短期 token + 手动确认"的路子（**留档，不是没想到**）。
+
+  ★★ **判据是"终态"**（规范 §12.32.2）：
+  · `kubelet.conf` **在**（kubeadm 把节点凭据写下来了）；
+  · `kubelet.service` **active**（它拿着新凭据真的起来了）。
+  ★ 不看"`kubeadm join` 返回 0" —— join 会在最后打印 kubelet 的警告并照样返回 0。
+
+  ★★ **幂等守卫**（规范 §12.33）：预检 `not_yet` 声明"`kubelet.conf` 已在 ⇒ 已经入列过 ⇒ 已达终态"。
+  ⇒ 配方第二次跑这一步会判「跳过」而不是失败，也不会把一个已经入列的节点再 join 一遍
+  （★ `kubeadm join` 在已加入的节点上**必然拒绝**，那是它的设计 —— 我们不去绕它，而是**换一个判读**）。
+
+  ★★ **加入之前要先把 `kube-proxy` 镜像拿到手**（配方里那一大步）：
+  工作节点上 `kubelet` 会在 `kube-proxy` 那个 DaemonSet 调度过来时才去拉镜像 ——
+  那时它在**引导流程之外**，失败只会体现成"Pod 一直 ImagePullBackOff"。
+  ⇒ 把不确定性**提到前面**（`container.pull`，S5 那只手），与本动作的 prepull 分工一致。
+
+confirm:
+  title: 确认工作节点入列
+  body: |
+    即将在「{host.name}」（{host.address}）上执行 **`kubeadm join`**：
+
+      kubeadm join {{ control_plane_endpoint }}:6443 \
+                   --token {{ token }} \
+                   --discovery-token-ca-cert-hash {{ ca_cert_hash }} \
+                   --cri-socket unix:///run/containerd/containerd.sock
+
+    **会发生什么**：
+    · 用 token 从控制面换到节点凭据（写 `/etc/kubernetes/kubelet.conf`）；
+    · 写 `/var/lib/kubelet/config.yaml` 与 `kubeadm-flags.env`，然后**重启 kubelet**；
+    · 节点出现在 `kubectl get nodes` 里（★ 装 Calico **之前**会是 `NotReady`，正常）。
+
+    **回得来吗**：reset 一次即可把节点退回"未入列"（`k8s.kubeadm-reset`）；
+    ★ 但**控制面那一侧的 Node 对象**要等它自己超时消失（或由人删除）。
+
+    **幂等**：★ 已经入列过的机器会被 `not_yet` 判「已达终态」跳过 —— **不会**重复 join。
+  confirm_text: 我已确认工作节点入列
+
+backup:
+  - path: "/etc/kubernetes/aoc-owned.json"
+    label: "本工作台的所有权标记（首次创建时不存在，属正常）"
+    required: false
+
+params:
+  - name: control_plane_endpoint
+    label: 控制面端点（★ 写 IPv4 地址）
+    type: str
+    required: true
+    pattern: '^(\d{1,3}\.){3}\d{1,3}$'
+    default: 192.0.2.11
+    help: '★ 与 `k8s.kubeadm-init` 用的是同一个值（硬约束③：写 IPv4，别写主机名）。'
+  - name: token
+    label: 入列 token
+    type: str
+    required: true
+    pattern: '^[a-z0-9]{6}\.[a-z0-9]{16}$'
+    help: '★ 形如 `abcdef.0123456789abcdef`（kubeadm 的固定形状：6 位 + 点 + 16 位）。★ 它**会出现在报告里** —— 只用于实验环境。'
+  - name: ca_cert_hash
+    label: 控制面 CA 指纹
+    type: str
+    required: true
+    pattern: '^sha256:[a-f0-9]{64}$'
+    help: '★ 形如 `sha256:<64 位小写十六进制>`；由 `openssl x509 -in /etc/kubernetes/pki/ca.crt -pubkey …` 那一路算出。★ 它是**公开信息**，不是秘密。'
+
+precheck:
+  - name: kubeadm_present
+    title: 确认这台机器上有 kubeadm（★ 缺工具必须中止）
+    run: [ls, -l, /usr/bin/kubeadm]
+    parser: raw
+    timeout: 20
+    note: ★ 不声明 `means_done`：它是"工具在不在"，不是"目标达成了没有"（规范 §12.33 规矩 3）。
+
+  - name: cri_socket_present
+    title: 确认容器运行时的 CRI socket 在
+    run: [ls, -l, /run/containerd/containerd.sock]
+    parser: raw
+    timeout: 20
+    note: ★ 同样不声明守卫：socket 不在是**真故障**（多半 containerd 没起来）。
+
+  - name: not_yet
+    title: 这台机器**还没入列**吗（★ 已入列 ⇒ 已达终态）
+    run: [ls, -ld, /etc/kubernetes/kubelet.conf]
+    parser: raw
+    ok_exit_codes: [2]
+    timeout: 20
+    means_done: true
+    means_done_why: >
+      `kubelet.conf` 已在 ⇒ 这台机器**已经入列过** ⇒ `kubeadm join` 想达成的终态
+      （"这台机器是集群的一员"）**已经达成**。
+    note: >
+      ★★ 它**只问"是不是已经入列"**。工具在不在、运行时 socket 在不在由另外两步回答，
+      它们失败时照旧中止（规范 §12.33 规矩 3）。
+      ★ 旧集群留下的 `kubelet.conf` 也会命中这一步 ⇒ 判「已达终态」跳过；
+      ★ **这是故意的**：拆旧集群是 `k8s.kubeadm-reset` 的职责（red、要人确认），
+      配方 `k8s-join` 会把 reset 排在它前面。
+
+steps:
+  - name: kubelet_conf_before
+    title: 入列之前的 `kubelet.conf` 条数（★ 幂等判据的"前"）
+    run: [ls, -1, /etc/kubernetes/kubelet.conf]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+
+  - name: join
+    title: ★★ 入列（显式 --cri-socket；token 与 CA 指纹由参数给）
+    run:
+      - kubeadm
+      - join
+      - "{{ control_plane_endpoint }}:6443"
+      - --token
+      - "{{ token }}"
+      - --discovery-token-ca-cert-hash
+      - "{{ ca_cert_hash }}"
+      - --cri-socket
+      - unix:///run/containerd/containerd.sock
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 900
+    note: >
+      ★ 成功时它打印 "This node has joined the cluster"，并以**非零**退出码提示
+      "kubelet 的配置会在稍后生效"（不同版本行为不同）⇒ ★ **不拿它的输出去做非空断言**，
+      自证挂在下面两步（静态事实 + 活的终态）。
+
+  - name: kubelet_conf_after
+    title: ★★ 自证① 节点凭据**写下来了**（`kubelet.conf` 条数 1）
+    run: [ls, -1, /etc/kubernetes/kubelet.conf]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+
+  - name: kubelet_active
+    title: ★★ 自证② `kubelet.service` 真的 **active**（拿着新凭据起来了）
+    run: [systemctl, is-active, kubelet.service]
+    parser: raw
+    ok_exit_codes: [0, 3]
+    timeout: 30
+    note: >
+      ★ 接受 0 与 3（active / inactive）**都是正常报告**（§9.6 同族：结论本身就是答案），
+      判定交给 `verify` 与结论。
+      ★★ 但**这里不会**把 "activating" 当失败去抛错 —— join 刚跑完时 kubelet 可能还在爬起，
+      真正的终态由配方的 `k8s.nodes` 那一步（等 Ready）来判。
+
+  - name: marker
+    title: 写所有权标记（★ 它决定"以后再点一次要不要拆这台机器"）
+    write_file:
+      path: "/etc/kubernetes/aoc-owned.json"
+      content: |
+        {
+          "owner": "auto-ops-console",
+          "stage": "T8",
+          "note": "本工作台建的工作节点。★ 它的存在 = 「这台机器上的集群是我们建的」，因此 k8s.kubeadm-reset 会按已达终态跳过。kubeadm reset 会把它一起删掉（拆完就没主了）。",
+          "role": "worker",
+          "control_plane_endpoint": "{{ control_plane_endpoint }}"
+        }
+      mode: "0644"
+    parser: raw
+
+verify:
+  - name: ★★ 节点凭据必须真的写下来了（判据是"条数"，不是"命令返回 0"）
+    from: kubelet_conf_after
+    on_missing: >
+      `ls -1 /etc/kubernetes/kubelet.conf` 连行数都数不出来 ——
+      无法判定"入列"到底发生了没有。★ 先看 `join` 那一步的远端原文
+      （token 过期 / CA 指纹不对 / 连不上控制面，各有各的原文）。
+
+conclusion: |
+  【{host.name}】工作节点入列（变更）
+  · 控制面：{control_plane_endpoint}:6443
+  · token（★ 实验环境专用，会留痕）：{token}
+  · CA 指纹：{ca_cert_hash}
+  · `kubelet.conf`：入列前 **{kubelet_conf_before}** 条 → 入列后 **{kubelet_conf_after}** 条
+  · `kubelet.service` 当前态：{kubelet_active}
+  · kubeadm 原文：
+  {join}
+
+  判读：
+    · ★★ **两件终态一起看才算"入列了"**（规范 §12.32.2）：
+      ① `kubelet.conf` **在**（静态事实）；② `kubelet` **active**（拿着新凭据真的起来了）。
+      ★ **不看"`kubeadm join` 返回 0"**；
+    · ★ **入列之后节点是 `NotReady`** —— 还没有 CNI。这是**顺序**不是缺陷：
+      先 join，再装 Calico（或先装 Calico 再 join，两种都行），最后用「集群节点树」那一步等 Ready；
+    · ★ **归因**：`NotReady` 时按两段查 ——
+      `kubelet` 起来了吗（本动作的自证②）｜ 网络插件装了吗（`kube-system` 里有 calico-node 吗）；
+    · ★ **回得去**：跑一次「退出集群（kubeadm reset）」把节点退回"未入列"；
+      ★★ **回不去**：控制面那一侧的 **Node 对象**不会立刻消失（要等它超时，或由人删除）；
+    · ★ **幂等**：已经入列过的机器会被 `not_yet` 判「已达终态」跳过 —— **不会**重复 join。

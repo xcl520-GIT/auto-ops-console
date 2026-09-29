@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>auto-ops-console · 运维工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">auto-ops-console</span>
+  <span class="stage" id="stage">…</span>
+  <span class="spacer"></span>
+  <label>目标机
+    <select id="hostSelect"></select>
+  </label>
+  <button class="ghost tiny" id="btnCheckHost">连通性自检</button>
+  <button class="ghost tiny" id="btnTrustHost">信任此主机</button>
+  <span class="cov" id="covTip">覆盖率 —</span>
+  <button class="ghost tiny" id="btnChangePw" title="改控制台口令（需先输当前口令）">改口令</button>
+  <button class="ghost tiny" id="btnLogout" title="清掉本页的令牌并回到登录门">锁定</button>
+</header>
+
+<main>
+  <aside class="sidebar">
+    <div class="tabs">
+      <button class="tab active" data-tab="actions">动作</button>
+      <button class="tab" data-tab="recipes">服务目录</button>
+      <button class="tab" data-tab="checkup">体检</button>
+      <button class="tab" data-tab="history">历史</button>
+      <button class="tab" data-tab="batches">批次</button>
+      <button class="tab" data-tab="gaps">覆盖率与缺口</button>
+      <button class="tab" data-tab="k8s">K8s 管理台</button>
+      <button class="tab" data-tab="mon">监控告警</button>
+      <button class="tab" data-tab="chat">对话</button>
+      <!-- ★★ T14·S4：人在环的那一下 —— 「请求」是 AI 的权利，「执行」不是（规范 §12.96） -->
+      <button class="tab" data-tab="pending">待确认<span class="tab-badge hidden" id="pendingBadge">0</span></button>
+      <!-- ★★ T15：报告与知识沉淀 —— 一次对话 = 一份**带证据链**的报告（规范 §12.104） -->
+      <button class="tab" data-tab="reports">报告</button>
+      <!-- ★★ T16：虚拟机 —— 把工作台的手伸到「机器的开关」（规范 §12.115~§12.118） -->
+      <button class="tab" data-tab="vm">虚拟机</button>
+    </div>
+    <div class="pane" id="pane-actions"></div>
+    <div class="pane hidden" id="pane-recipes"></div>
+    <div class="pane hidden" id="pane-checkup"></div>
+    <div class="pane hidden" id="pane-history"></div>
+    <div class="pane hidden" id="pane-batches"></div>
+    <div class="pane hidden" id="pane-gaps"></div>
+    <div class="pane hidden" id="pane-k8s"></div>
+    <div class="pane hidden" id="pane-mon"></div>
+    <div class="pane hidden" id="pane-chat"></div>
+    <div class="pane hidden" id="pane-pending"></div>
+    <div class="pane hidden" id="pane-reports"></div>
+    <div class="pane hidden" id="pane-vm"></div>
+  </aside>
+
+  <section class="content" id="content">
+    <div class="placeholder">← 从左侧选一个动作</div>
+  </section>
+</main>
+
+<!-- ★★ T14：登录门（规范 §12.97；红线 11）
+     ★ 这一层只是"把服务端那道闸变成人能用的一张门" —— **闸不在前端**：
+       拦截发生在 app/server.py 的唯一漏斗上，绕开这个页面照样会被 401。
+     ★ 首次运行（从没设过口令）时服务端**全拒**，这里会变成「设置口令」。 -->
+<div id="login" class="login-wrap hidden">
+  <form class="login-box" id="loginForm" autocomplete="off">
+    <div class="login-brand">auto-ops-console <span id="loginStage"></span></div>
+    <h3 id="loginTitle">登录</h3>
+    <p class="login-help" id="loginHelp"></p>
+    <label id="loginPwOldWrap" class="hidden"><span>当前口令</span>
+      <input type="password" id="loginPwOld" autocomplete="current-password">
+    </label>
+    <label id="loginPw1Wrap"><span id="loginPw1Label">口令</span>
+      <input type="password" id="loginPw" autocomplete="current-password">
+    </label>
+    <label id="loginPw2Wrap" class="hidden"><span>再输一次</span>
+      <input type="password" id="loginPw2" autocomplete="new-password">
+    </label>
+    <div class="login-err hidden" id="loginErr"></div>
+    <button class="primary" type="submit" id="loginBtn">登录</button>
+    <div class="login-note" id="loginNote"></div>
+  </form>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<div id="modal" class="hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

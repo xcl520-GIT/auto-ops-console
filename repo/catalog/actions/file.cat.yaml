@@ -1,0 +1,111 @@
+# ============================================================
+# 动作：读文件原文（路径白名单）
+# 来源：T8·S2 —— T8·S3「旧集群全量留证」缺的那只手（规范 §12.27）
+# 形态：**只读**（green）—— 只把声明过的目录里的单个文件原文交出来
+# ============================================================
+
+id: file.cat
+title: 读文件原文
+summary: 读一个配置文件/脚本的原文（只允许白名单目录；密钥类永不读）
+domain: C
+risk: green
+priority: P1
+tags: [只读, 文件, 留证]
+
+note: |
+  ★ 为什么需要它（规范 §12.27）：T8·S3 要留证 `/etc/sysctl.d/*`、`/etc/yum.repos.d/*`、
+  `/etc/containerd/*` 的**原文**，而当时平台只有 `file.stat`（在不在）与 `file.grep`（找一行）。
+
+  ★★ **两条硬规矩**：
+  ① **路径白名单**（参数 `pattern`，安全契约第一层）—— 只放行**声明过的**目录；
+  ② ★★ **密钥类永不读**：路径里出现 `id_*` / `authorized_keys` / `shadow` / `gshadow`，
+     或以 `.key` / `.pem` / `.kubeconfig` 结尾 —— 一律**按参数校验拒绝**（负向前瞻写在 `pattern` 里）。
+  ★ 越界时是**拒绝并说原因**，不是"返回空" —— §10.6.3 同族：
+  「不能给你看」与「这里什么都没有」是两件事。
+
+  ★ 只读**单个普通文件**（预检 `test -f` 把目录与不存在挡在门外，给出的建议是去看「路径状态」）。
+  ★ 有输出上限（沿用 `exec.max_output_bytes`），**截断会被标记**。
+
+params:
+  - name: path
+    label: 文件路径
+    type: str
+    required: true
+    pattern: '^(?!.*(^|/)(id_[a-z]|authorized_keys|shadow|gshadow)|.*\.(key|pem|kubeconfig)$)/etc/(sysctl\.d|modules-load\.d|yum\.repos\.d|yum\.conf\.d|containerd|cni/net\.d)/[A-Za-z0-9_@+][A-Za-z0-9._@+-]*(/[A-Za-z0-9_@+][A-Za-z0-9._@+-]*)*$'
+    placeholder: /etc/sysctl.d/99-kubernetes-cri.conf
+    help: '只允许 /etc/ 下这几个目录：sysctl.d / modules-load.d / yum.repos.d / yum.conf.d / containerd / cni/net.d；每段不得以点开头（于是 .. 一律被拒）'
+
+precheck:
+  - name: is_file
+    title: 确认这是一个普通文件（不是目录、也不缺失）
+    run: [test, -f, "{{ path }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    note: >
+      `test -f` 对"目录 / 不存在 / 不可达"都给非零 ⇒ 预检不通过 ⇒ 整条动作 aborted、目标机零改动。
+      ★ 这是刻意的：本动作用的命令是 `cat`，对目录会报 "Is a directory" ——
+      与其让它跑到一半再红，不如在预检里就说清"你要看目录请用「路径状态」"。
+
+steps:
+  - name: stat
+    title: 路径原文（人看的那一行；不存在时这里是空的）
+    run: [ls, -ld, "{{ path }}"]
+    parser: raw
+    ok_exit_codes: [0, 2]
+    timeout: 20
+    note: >
+      ★ 与 `count` 是**同一条命令、两个解析器**（§12.23 / `file.stat` 的同一个做法）：
+      `raw` 对空输出给"无"（给人看），`line_count` 对空输出给 **0**（那是**结论**）。
+      ★ 这一行**不许用来做自证** —— verify 判的是"有没有值"（§9.6）。
+
+  - name: count
+    title: 它在不在（★ 数行数：1 = 在、0 = 不在；本步是自证来源）
+    run: [ls, -ld, "{{ path }}"]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+    note: >
+      ★ 自证必须挂在这一步上：**空文件是合法结论**，所以**不能**拿 `content` 去做"非空断言"，
+      否则一个 0 字节的配置文件会让整条动作假红（§9.6 / §10.6.3 同族）。
+
+  - name: bytes
+    title: 字节数（区分"空文件"与"读不到"）
+    run: [wc, -c, "{{ path }}"]
+    parser: raw
+    optional: true
+    timeout: 20
+    note: 输出形如 `1234 /etc/...`；★ 0 字节是**合法结论**（空文件），不是"读不到"。
+
+  - name: content
+    title: 文件原文
+    run: [cat, "{{ path }}"]
+    parser: raw
+    timeout: 30
+    note: 原文照给、平台不改写不摘要；★ 超过 `exec.max_output_bytes` 会截断并标记。
+
+verify:
+  - name: 文件必须在（★ 数行数这一步必须问得出来）
+    from: count
+    on_missing: >
+      ls 的退出码既不是 0 也不是 2，而且连行数都数不出来（权限不足 / 路径不可达）
+      —— 这时**无法判定它在不在**，不要当成"不存在"。
+  - name: 必须拿到字节数（拿不到说明不可读）
+    from: bytes
+    severity: warn
+    on_missing: 拿不到字节数 —— 文件可能存在但当前用户读不了（权限 / SELinux），原文段也不可信
+
+conclusion: |
+  【{host.name}】文件原文（只读）
+  查询路径：{path}
+  · 它在不在：{count}（1 = 在 ｜ 0 = 不在）｜ 字节数：{bytes}
+  · ls -ld 原文：{stat}
+  ── 文件原文 ──
+  {content}
+  ── 原文结束 ──
+
+  判读：
+    · 本动作的输出就是**磁盘上那份原文**，直接可作为留证（平台不改写、不摘要）；
+    · ★ 字节数为 0 而文件在 ⇒ **空文件**（合法结论），不是"读不到"；
+    · ★ 越界路径根本到不了这里 —— 参数白名单会在动作开始前拒绝，
+      且**密钥类永不读**（`id_*` / `*.key` / `*.pem` / `authorized_keys` / `shadow` / `*.kubeconfig`）；
+    · 要看"某个路径在不在/多大"用「路径状态」；要在多个文件里**找一行**用「文件内容搜索」。

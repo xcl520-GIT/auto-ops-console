@@ -1,0 +1,84 @@
+# T13 · S0 建立的「真实问句样本集」（★ 供 S6 词表回归用；S0 只建不回归）
+#
+# 目的：T12 踩过「主机词表漏了单独的『各』」⇒ 该懂的话被问回了人（遗留 #7）。
+# 本文件是**回归用例**：每一条都写明「期望的平台行为」，任何一条走错就算红。
+#
+# 期望行为取值：
+#   all      = 应自动铺全部**登记**主机（不反问；★ 受 `ai.max_hosts_per_action` 上限约束 ——
+#              T17 起登记主机 5 台而上限 4 台 ⇒ 「全部」会被**截断到 4 台**，这是承诺过的行为，
+#              §12.92「上限与截断」；判据只钉「不反问 ＋ 恰好是前 cap 台 ＋ 不许退化成一台」）
+#   named    = 应只铺点名的那台（不反问）
+#   ask      = 应该回问「要查哪台」（★ 这是正确行为，不是缺陷）
+#   subset   = 应按角色/标签收窄（例如只在控制面）
+#
+# ★ 本文件里的机器名/IP 都是**真实拓扑**，属项目内部资料，公开前必须脱敏（沿用 T11 纪律）。
+
+meta:
+  topic: T13
+  built_at: "2026-09-27"
+  source: "T13·S0（对标 T12 遗留 #7：建一组真实问句样本当回归用例）"
+  runtime_hint_source: "app/ai/runtime.py · _ALL_HINTS（现有词表：哪台/哪个/哪些/所有/全部/每台/各/都/全量/几台）"
+
+samples:
+  - id: P01
+    text: "各台机器的磁盘使用率是多少"
+    expect: all
+    why: "「各台」必须命中 —— T12 就是漏了单独的「各」"
+  - id: P02
+    text: "所有节点上有没有装 tree 这个包"
+    expect: all
+    why: "「所有」+「节点」"
+  - id: P03
+    text: "每一台机器上 22 端口是不是都在听"
+    expect: all
+    why: "「每一台」"
+  - id: P04
+    text: "统统查一下 /var/log 里有没有 OOM"
+    expect: all
+    why: "「统统」= 口语化的全量说法（★ 现有词表**没有**它 —— 预判会走 ask，属缺陷）"
+  - id: P05
+    text: "四台机器的系统时间对不对"
+    expect: all
+    why: "数量词「四台」（★ 现有词表没有数量词 —— 预判会走 ask）"
+  - id: P06
+    text: "node-01 上 /etc/ssh 里有没有 PermitRootLogin"
+    expect: named
+    why: "点名主机 → 只铺一台，不许铺全量"
+  - id: P07
+    text: "docker-01 的防火墙开了哪些端口"
+    expect: named
+    why: "点名主机"
+  - id: P08
+    text: "看下日志"
+    expect: ask
+    why: "既没点名主机、也没有全量词 ⇒ 回问才是对的"
+  - id: P09
+    text: "查一下 nginx 的状态"
+    expect: ask
+    why: "同上：机器没交代"
+  - id: P10
+    text: "三台 K8s 节点的 kubelet 状态"
+    expect: subset
+    why: "按角色收窄（控制面 + 工作节点 = 3 台，不含 docker-01）"
+  - id: P11
+    text: "哪台机器把 SELinux 关掉了"
+    expect: all
+    why: "「哪台」在词表里 —— 但语义上是找一台，仍需铺全量才能答"
+  - id: P12
+    text: "在每一台机器上找一下 selinux 的配置"
+    expect: all
+    why: "全量 + 检索意图"
+  - id: P13
+    text: "node-01 和 node-02 上有没有 nfs 服务"
+    expect: named
+    why2: "★ S0 起草时写 subset；S3 定判定口径时改为 named（点名 N 台 = 真子集，与 subset 同判）"
+    why: "点名两台 → 只铺这两台"
+  - id: P14
+    text: "全部机器上 crontab 里有什么任务"
+    expect: all
+    why: "「全部」"
+
+# ★ S0 预判（待 S6 实测修正，不许当成结论）：
+#   预期**会走 ask 但应该走 all** 的：P04（统统）、P05（四台）
+#   预期**应该走 subset 但可能走 all** 的：P10（三台 K8s 节点）、P13（点名两台）
+#   ⇒ 这正是"词表回归"要盯的三类错法：该懂的没懂 / 该收窄的没收窄 / 该回问的瞎猜

@@ -1,0 +1,88 @@
+id: svc.disable
+title: 取消服务开机自启
+summary: systemctl disable（幂等），并自证 is-enabled 真的是 disabled
+domain: E
+risk: yellow
+priority: P0
+tags: [变更, 服务]
+
+note: |
+  ★ 与 svc.enable **相反**的退出码期望：探针实测 is-enabled 对"未启用"的服务返回 **1**
+  （stdout 是 disabled）。所以本动作的 after 步骤只接受 1 —— 若返回 0（还是 enabled），
+  说明 disable 没生效，整步失败。
+
+confirm:
+  title: 确认取消开机自启
+  body: |
+    即将在「{host.name}」（{host.address}）上取消服务「{unit}」的**开机自启**。
+
+    影响面：
+      · 只影响"下次开机"的行为，**当前仍在运行的服务不受影响**
+      · 风险在"以后"：机器重启后该服务不会自动起来 —— 如果它是关键服务，
+        这台机器重启后业务就不会自己恢复
+
+    可撤回：用「设置服务开机自启」即可恢复。
+  confirm_text: 我已确认要取消自启
+
+params:
+  - name: unit
+    label: 服务名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9@._:-]+$'
+    normalize: systemd_unit
+    default: aoc-lab.service
+    placeholder: aoc-lab 或 nginx
+    help: '不含「.」时自动补 .service'
+
+precheck:
+  - name: unit_exists
+    title: 确认服务存在
+    run: [systemctl, cat, "{{ unit }}"]
+    parser: lines
+
+steps:
+  - name: before
+    title: 记录当前自启状态
+    run: [systemctl, is-enabled, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+
+  - name: disable
+    title: 取消开机自启
+    run: [systemctl, disable, "{{ unit }}"]
+    parser: raw
+    timeout: 60
+
+  - name: after
+    title: 自证：再次查询自启状态（★ 只接受 1=disabled）
+    run: [systemctl, is-enabled, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [1]
+    note: |
+      退出码 1 = disabled（探针实测）。把 1 声明为"正常报告"，
+      于是"还是 enabled（rc=0）"就变成了失败 —— 这就是"取消自启确实生效"的自证。
+
+  - name: detail
+    title: 读取自启状态字段
+    run: [systemctl, show, -p, UnitFileState, -p, UnitFilePreset, "{{ unit }}"]
+    parser: shell_kv
+
+verify:
+  - name: 查询自启状态有返回
+    from: after
+    on_missing: is-enabled 没有返回内容，无法确认自启状态
+  - name: 自启状态字段可读
+    from: detail
+    field: UnitFileState
+    on_missing: 读不到 UnitFileState
+
+conclusion: |
+  「{unit}」取消开机自启结果
+  · 现在：{after}（UnitFileState={detail.UnitFileState}）
+  · 之前：{before}
+  · 当前运行状态不受本动作影响
+
+  判读：
+    · 应该显示 disabled；
+    · ⚠️ 如果这是关键服务，请记住：**这台机器下次重启时它不会自动起来**。

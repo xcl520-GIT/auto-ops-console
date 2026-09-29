@@ -1,0 +1,225 @@
+# ============================================================
+# 动作：排障结论化（成因清单）
+# 来源：T9·S3 —— ★★ 总纲 §4 T9 的原话「**排障结论化**（Pending / CrashLoopBackOff 直接给成因清单）」
+# 形态：**只读**（green）
+# ★ 本动作的判据不是"命令返回 0"，也不是"有没有发现坏东西"——
+#   它是"**成因清单必须给得出来**"，且**随数据变**（规范 §12.39.3）。
+# ============================================================
+
+id: k8s.diagnose
+title: 排障结论化（成因清单）
+summary: 扫全集群的 Pod，直接给**成因清单**（Pending / CrashLoopBackOff / ImagePullBackOff / OOMKilled 各自点名）—— 不用自己读 describe
+domain: J
+risk: green
+priority: P0
+tags: [只读, K8s, 排障, 结论化]
+
+note: |
+  ★★ **什么叫"结论化"**（规范 §12.39.1）：**不是**把 `kubectl describe` 的整段原文丢给人，
+  而是给出 —— **现象 → 成因 → 去哪一行复核 → 下一步** 四件。
+  ★ 判读成本从"读 200 行"降到"看 3~5 行"；而每一条成因都挂着**可复核的证据字段**。
+
+  ★★ **它的判据是"清单随数据变"，不是"发现了坏东西"**（规范 §12.39.3）：
+  真跑验收里做**对照** —— 把靶子的成因**换一种**，清单必须**跟着换**。
+  ★ 写死文案的动作在那一对照上**立刻红**。
+  ★★ **"没发现异常"是结论，不是失败**（规范 §12.39.2）：一个故障都没有时本动作**判 ok**，
+  并明说"未发现不健康对象" —— 把"没有坏事"判成红，等于教用户忽略这个动作。
+
+  ★★★ **为什么输入是"紧凑表"而不是 `-o json`**（T9·S3 **真跑抓到的缺陷**，§12.39.4 的真跑补记）：
+  第一版用 `kubectl get pods -A -o json`，结果**撞上平台的单步输出上限**
+  （`config.yaml: exec.max_output_bytes = 262144`）⇒ JSON **被从中间截断** ⇒
+  解析器报"不是合法 JSON"、整条动作红。
+  ★ "调大上限"是**错的解法**（一个真实集群的 PodList 轻松上兆，落库与报告都会被撑爆）；
+  ⇒ 正解是**别把整对象倒进输出通道**：只取判据真正需要的字段（本动作的 `custom-columns`）。
+  ★★ 而"紧凑表"有一条**格式约束**：**最多只能有一个"含空格的列"，且必须放最后**
+  （列是靠空白切的）⇒ 所以"容器等待信息"（`WAITINGMSG`，带拉镜像失败原文）与
+  "调度器原文"（`.status.message`）**必须分两次取**：前者在 `pods_cols`，后者在 `pending_msgs`。
+  ★★ **截断必须可见**：行被切断时 `parse_rows` **直接抛错**（"不许拿一半当全部"）；
+  再配一条 `pods_count` **对账**（扫了几行 vs 一共几个）—— "少看了一半"不会被伪装成"没发现问题"。
+
+  ★★ **本动作有一处平台代码扩展**（本话题唯一一处）：`app/k8s_diag.py` —— 纯函数，
+  以**解析器**（`parser: k8s_diag` + `parser_arg` 选模式）的形式接进引擎
+  （解析器与 `parser_arg` 都是**已登记的扩展点**，引擎一个字没改）。三条判定与四条边界见规范 §12.39.5。
+
+  ★ 与 `k8s.pods` 的分工：**`k8s.pods` 给你"现在什么样"，本动作给你"为什么变成这样"**。
+
+params:
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答（**这一步必然有输出**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: pods_cols
+    title: ★★ 成因清单的第一段：每个 Pod 的**判据字段**（紧凑表 —— 只取需要的列）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - --no-headers
+      - "-o"
+      - "custom-columns=NS:.metadata.namespace,POD:.metadata.name,PHASE:.status.phase,RESTARTS:.status.containerStatuses[*].restartCount,WAITING:.status.containerStatuses[*].state.waiting.reason,LASTREASON:.status.containerStatuses[*].lastState.terminated.reason,LASTEXIT:.status.containerStatuses[*].lastState.terminated.exitCode,LIMITS:.spec.containers[*].resources.limits.memory,IMAGE:.spec.containers[*].image,WAITINGMSG:.status.containerStatuses[*].state.waiting.message"
+    parser: k8s_diag
+    parser_arg: pods
+    ok_exit_codes: [0]
+    timeout: 120
+    note: |
+      ★★ 这一段是**成因**的来源，只取判据真正需要的字段：
+      `restarts` / `waiting.reason` / `lastState.terminated.{reason,exitCode}` / `limits.memory` /
+      `image` / `waiting.message`。★ 整对象 JSON **不行**（会撞平台输出上限，见动作 note）。
+      ★★ **`WAITINGMSG` 必须放最后一列**：它是唯一可能含**空格**的列
+      （`failed to pull image ...: manifest unknown`），而列是按空白切的。
+      ★ `OOMKilled` **不在** `get pods` 的表格里 —— 只有 `lastState` 记得它（§12.37.1 ③）。
+
+  - name: pending_msgs
+    title: ★ 成因清单的第二段：`Pending` 的**调度器原文**（第二段清单单独成块）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - --field-selector=status.phase=Pending
+      - "-o"
+      - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\t"}{.status.containerStatuses[*].state.waiting.reason}{"\t"}{.status.conditions[*].message}{"\n"}{end}'
+    parser: k8s_diag
+    parser_arg: pending
+    ok_exit_codes: [0]
+    timeout: 60
+    note: |
+      ★★ 为什么要单独一段：`Pending` 的 Pod **还没被调度**，它的容器状态是空的，
+      而"为什么调度不上"只写在**调度器给的原文**里 —— 那是一段**含空格（甚至含换行）**的文本，
+      塞不进上一段（紧凑表只能有一个含空格的列）。
+      ★ 取哪一段原文：`.status.conditions[*].message` —— ★ **不是** `.status.message`
+      （真跑实测：后者在"调度不上"这种 Pod 上**根本不存在**，于是这一段会**空着**）。
+      ★★ 中间还夹了一列 `containerStatuses[*].state.waiting.reason`：**它是必需的** ——
+      `phase=Pending` 的 Pod 里有一部分是**卡在镜像/容器那一层**的（`ImagePullBackOff` 的 Pod
+      同样是 `Pending`），它们的成因**第一段已经给了** ⇒ 本段按这一列**跳过**它们，
+      否则同一个对象会在两段里各出现一次、而且第二段还会配上一句毫无意义的原文。
+      这里只选 `Pending` 的 Pod ⇒ 用 `[*]` 就够（连 `?(@.type==...)` 过滤器都不需要，少一层语法风险）。
+      ★★ **这一步故意不是 `optional`**（T9·S3 真跑抓到的第二个缺陷）：
+      上一版它是 optional，于是"**这一步没跑成/被跳过**"与"**这次真的没有 Pending 的 Pod**"
+      在结论里**长得一模一样**（都显示成"这次没有 Pending 的 Pod"）——
+      ★★ 那是报告在**说假话**（本项目最怕的那一类：不是漏报，是**误报**）。
+      ⇒ 拿不到这一屏就**不该给结论**：要么真读出"没有"，要么整条动作红。
+
+  - name: pods_count
+    title: ★ 对账：一共几个 Pod（与上面清单里"扫了几个"比 —— 截断就不会被当成"没问题"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - "-o"
+      - name
+    parser: line_count
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ 它是**判据的一部分**（§12.39.4）：上面那份紧凑表若被平台截断（或漏行），
+      "扫了 N 个"就会**小于**这里的数字 —— 结论里那两个数必须相等。
+      ★ 解析器已经是 `line_count`（空输出给 **0**，一个**值**）—— 不用 `raw`（§12.32.2 的补丁）。
+
+  - name: pods_table
+    title: Pod 表格（`-o wide`，给人看的现状 —— 与成因清单对读）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - --all-namespaces
+      - "-o"
+      - wide
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: warnings
+    title: Warning 事件（成因的补充证据：调度失败 / 拉镜像失败 / 反复重启都会留下）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - events
+      - --all-namespaces
+      - --field-selector=type=Warning
+      - --no-headers
+      - "-o"
+      - "custom-columns=TIME:.lastTimestamp,NS:.metadata.namespace,REASON:.reason,OBJECT:.involvedObject.name,MESSAGE:.message"
+    parser: lines
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: >
+      `kubectl get namespaces` 没有给出任何一行 —— API server 没在应答，或这把 kubeconfig 不对。
+      ★ 这时**不要**去找"哪个 Pod 坏了"：先解决集群不可达（那是 `k8s.nodes` 的事）。
+  # ★★ 这里**故意没有第二条自证**（规范 §12.37.2 的真跑补记 / 清单 115）：
+  #   "成因清单非空"**不是**判据 —— 一个健康的集群里清单本来就可能是空的（那是**结论**）。
+  #   ★ 而"清单被截断"这件事由 `parse_rows` 的**硬校验**（抛 STEP_FAILED）与 `pods_count`
+  #   的**对账**各自承担 —— 都不是"非空断言"。
+
+conclusion: |
+  【{host.name}】排障结论化 · 成因清单（只读）
+  kubeconfig：{kubeconfig}
+
+  ══════════ ★★ 成因清单 · 第一段（容器级与状态级）══════════
+  {pods_cols}
+  ══════════════════════════════════════════════
+
+  ── ★★ 成因清单 · 第二段（`Pending` 的调度器原文）──
+  {pending_msgs}
+
+  ── ★ 对账（截断就不会被当成"没问题"）──
+  上面清单里"扫了 N 个"必须等于：**一共 {pods_count} 个 Pod**
+  ★ 两个数**不等** ⇒ 这一屏被截断/漏行了 ⇒ **不许**把"没发现问题"当成结论，先去看原始输出。
+
+  ── Pod 现状（-o wide，供复核）──
+  {pods_table}
+  ── Warning 事件（成因的补充证据）──
+  {warnings}
+  ── 原文结束 ──
+
+  怎么用：
+    · ★★ **每条成因都带"证据"那一行** —— 它是**可逐字复核**的字段路径（不是推测）；
+      有疑问就拿那条证据去 `k8s.describe` / `k8s.pods` 里对上；
+    · ★ **"未发现不健康对象"是结论，不是失败**：判据是**正向白名单**
+      （`phase ∈ {Running, Succeeded}` 且容器级无 waiting / OOMKilled）；
+    · ★★ **本动作不去枚举"坏状态"**（规范 §12.37.1 ②）：那份名单永远列不全，
+      而漏一个的后果是"坏的被当成好的"（假绿）；
+    · ★ 成因后面那一步（"下一步"）**指向的都是本工作台里已有的动作** ——
+      不需要回到终端去敲 `kubectl`；
+    · ★ 本动作**只读**：不创建、不修改、不删除、不重启任何对象（`changed` 恒 false）。

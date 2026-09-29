@@ -1,0 +1,86 @@
+id: svc.enable
+title: 设置服务开机自启
+summary: systemctl enable（幂等），并自证 is-enabled 真的是 enabled
+domain: E
+risk: yellow
+priority: P0
+tags: [变更, 服务]
+
+note: |
+  ★ 自证用的是 `systemctl is-enabled` 的**退出码**（探针实测：enabled→0、disabled→1、
+  not-found→4）。enable 之后只接受 0 —— 若它仍是 disabled，整步失败。
+  这比"enable 命令返回 0"强得多：enable 命令返回 0 只说明它写链接时没报错。
+
+confirm:
+  title: 确认设置开机自启
+  body: |
+    即将在「{host.name}」（{host.address}）上把服务「{unit}」设为**开机自启**。
+
+    影响面：只改变"下次开机是否自动启动"，**不影响当前运行状态**。
+    可撤回：用「取消服务开机自启」即可撤销。
+  confirm_text: 我已确认要设置自启
+
+params:
+  - name: unit
+    label: 服务名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9@._:-]+$'
+    normalize: systemd_unit
+    default: aoc-lab.service
+    placeholder: aoc-lab 或 nginx
+    help: '不含「.」时自动补 .service'
+
+precheck:
+  - name: unit_exists
+    title: 确认服务存在
+    run: [systemctl, cat, "{{ unit }}"]
+    parser: lines
+
+steps:
+  - name: before
+    title: 记录当前自启状态
+    run: [systemctl, is-enabled, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    note: |
+      enabled → 0、disabled → 1，两者都是**有效报告**（不是错误）。
+      若不声明 ok_exit_codes，未启用的服务会让"记录现状"这一步失败 —— 这是典型的
+      "退出码语义不可假设"（规范 §8.7 #5）。
+
+  - name: enable
+    title: 设置开机自启
+    run: [systemctl, enable, "{{ unit }}"]
+    parser: raw
+    timeout: 60
+
+  - name: after
+    title: 自证：再次查询自启状态（★ 退出码就是结论）
+    run: [systemctl, is-enabled, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    note: 只接受 0（enabled）；若仍是 1（disabled）→ 本步失败，动作判失败
+
+  - name: detail
+    title: 读取自启状态字段
+    run: [systemctl, show, -p, UnitFileState, -p, UnitFilePreset, "{{ unit }}"]
+    parser: shell_kv
+
+verify:
+  - name: 查询自启状态有返回
+    from: after
+    on_missing: is-enabled 没有返回内容，无法确认自启状态
+  - name: 自启状态字段可读
+    from: detail
+    field: UnitFileState
+    on_missing: 读不到 UnitFileState
+
+conclusion: |
+  「{unit}」开机自启设置结果
+  · 现在：{after}（UnitFileState={detail.UnitFileState}）
+  · 之前：{before}
+  · 当前运行状态不受影响，仍为：{host.name} 上的原状（本动作只改开机行为）
+
+  判读：
+    · 应该显示 enabled；若显示 disabled，说明 enable 没生效（看原始输出）；
+    · 撤销：执行「取消服务开机自启」。

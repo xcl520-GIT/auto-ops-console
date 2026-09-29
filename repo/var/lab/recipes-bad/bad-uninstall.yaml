@@ -1,0 +1,26 @@
+# ============================================================
+# 反例配方 2：卸载段不完整（只写了"停服"，没想过"删配置 / 卸包"）
+# ★ 期望：装载期被拒，且**点名** `uninstall` 里缺什么
+# ============================================================
+
+id: bad-uninstall
+name: 反例·卸载段不完整
+version: "1"
+summary: 故意写错：uninstall 只写了 stop
+risk: yellow
+params: []
+
+steps:
+  - name: s1
+    title: 起服务
+    action: svc.start
+    args: { unit: nginx }
+
+health:
+  - expect:
+      state: { unit: nginx, equals: active }
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: nginx }

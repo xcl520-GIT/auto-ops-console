@@ -1,0 +1,14 @@
+[
+  {
+    "targets": [
+      "{{ target_k8s01 }}",
+      "{{ target_k8s02 }}",
+      "{{ target_k8s03 }}",
+      "{{ target_docker01 }}"
+    ],
+    "labels": {
+      "stack": "aoc-monitoring",
+      "role": "lab-node"
+    }
+  }
+]

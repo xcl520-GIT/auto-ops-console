@@ -1,0 +1,97 @@
+# ============================================================
+# 动作：证书到期检查
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 G（P1 · 只读）
+# 形态：一次给全结论（主体/签发者 + 绝对到期时间 + 30 天/7 天是否到期）
+# 风险：green
+# ============================================================
+
+id: sec.cert
+title: 证书到期检查
+summary: 检查一个 PEM 证书的主体、签发者与到期时间（含 30 天 / 7 天预警）
+domain: G
+risk: green
+priority: P1
+tags: [只读, 安全, 证书]
+note: |
+  ★ 关键技巧：用 `openssl x509 -checkend <秒>` 让 **openssl 自己做"还有多少天"的判断**，
+    而不是我们解析日期再算差值 —— 结论模板不能做运算，而 -checkend 会把结论直接打印出来：
+      "Certificate will not expire" / "Certificate will expire"
+    同时这也天然处理了"证书已过期"的情况，退出码会告诉你（声明为正常报告，不算步骤失败）。
+  默认路径用系统 CA 包（默认存在），保证动作开箱即用；换路径即可检查业务证书。
+
+params:
+  - name: path
+    label: 证书文件路径
+    type: str
+    required: true
+    default: /etc/pki/tls/certs/ca-bundle.crt
+    pattern: '^/[A-Za-z0-9._/-]{1,200}$'
+    placeholder: /etc/pki/tls/certs/localhost.crt
+    help: PEM 格式证书（.crt/.pem）。默认是系统 CA 包；TLS 服务证书常在 /etc/pki/tls/certs/、/etc/nginx/ssl/ 下。
+
+steps:
+  - name: path_check
+    title: 文件存在性
+    run: ["ls", "-l", "{{ path }}"]
+    parser: raw
+    note: 先确认文件在不在、大小与时间 —— 避免"证书解析失败"和"路径写错"混在一起。
+
+  - name: subject
+    title: 证书主体
+    run: ["openssl", "x509", "-subject", "-noout", "-in", "{{ path }}"]
+    parser: raw
+    optional: true
+
+  - name: issuer
+    title: 签发者
+    run: ["openssl", "x509", "-issuer", "-noout", "-in", "{{ path }}"]
+    parser: raw
+    optional: true
+
+  - name: notafter
+    title: 到期时间
+    run: ["openssl", "x509", "-enddate", "-noout", "-in", "{{ path }}"]
+    parser: raw
+
+  - name: check30
+    title: 是否 30 天内到期
+    run: ["openssl", "x509", "-checkend", "2592000", "-noout", "-in", "{{ path }}"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    note: 2592000 秒 = 30 天。退出码 1 表示"会到期"—— 这是结论，不是执行失败。
+
+  - name: check7
+    title: 是否 7 天内到期
+    run: ["openssl", "x509", "-checkend", "604800", "-noout", "-in", "{{ path }}"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    optional: true
+    note: 604800 秒 = 7 天。两条 -checkend 配合，就能读出"30 天以上 / 30 天内 / 7 天内"三档。
+
+verify:
+  - name: 证书文件必须存在
+    from: path_check
+    on_missing: 指定路径上没有这个文件 —— 先确认证书放在哪里（/etc/pki/tls/certs/ 或服务自己的目录）
+  - name: 必须读出到期时间
+    from: notafter
+    on_missing: openssl 没能读出到期时间 —— 该文件可能不是 PEM 证书（例如 .p12/der 格式）
+
+conclusion: |
+  【{host.name}】证书到期检查
+  文件：{path}
+    文件信息：{path_check}
+    主体：{subject}
+    签发者：{issuer}
+    到期时间：{notafter}
+  预警判断（openssl -checkend）：
+    30 天内是否到期：{check30}
+    7 天内是否到期：{check7}
+
+  判读：
+  · notAfter 是绝对到期时间（GMT 时区，减 8 小时为北京时间）；
+  · "Certificate will not expire" = 在指定窗口内不会到期。所以：
+    30 天那条显示 not expire → 还有 30 天以上；30 天显示 expire 而 7 天显示 not expire → 剩 7~30 天，该安排续签了；
+  · 显示（无）或报错 → ① 文件不是 PEM 格式（`file <路径>` 可以确认，DER/p12 要先用 openssl 转换）；
+    ② 路径写错；③ openssl 没装（用「已装软件」确认）；
+  · 续签/换证书后别忘了**重启加载它的服务**（否则内存里还是旧证书）；
+  · 本动作只读：只读取证书内容，不做任何签发或替换。

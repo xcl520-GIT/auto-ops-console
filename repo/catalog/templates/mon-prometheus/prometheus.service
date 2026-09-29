@@ -1,0 +1,17 @@
+[Unit]
+Description=AOC Monitoring · Prometheus
+Documentation=https://prometheus.io/docs/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aocmon
+Group=aocmon
+ExecStart=/opt/aoc-monitoring/prometheus/prometheus --config.file=/opt/aoc-monitoring/etc/prometheus.yml --storage.tsdb.path=/opt/aoc-monitoring/data/prometheus --web.listen-address={{ prom_listen }} --storage.tsdb.retention.time={{ retention_time }} --storage.tsdb.retention.size={{ retention_size }} --web.enable-lifecycle
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

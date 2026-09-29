@@ -1,0 +1,194 @@
+# ============================================================
+# 动作：Pod 日志快照
+# 来源：T9·S2 —— ★★ 规范 §12.42（**这是"快照"，不是"流式"**）
+# 形态：**只读**（green）
+# ============================================================
+
+id: k8s.logs
+title: Pod 日志快照
+summary: 一次取一段（最近 N 行 / 上一个已退出的容器）★ 快照式，不是流式
+domain: J
+risk: green
+priority: P0
+tags: [只读, K8s, 日志, 排障]
+
+note: |
+  ★★ **这个动作的名字与结论里都必须有"快照"两个字**（规范 §12.42）：
+  它 **不是流式**、**不会跟随**、**不会自动刷新** —— 它是"**取一次，拿回来一段**"。
+  想看更多，是**人再点一次**（把 `tail` 调大，或者换一个"上一个容器"）。
+
+  ★★ **为什么不做流式**（规范 §12.42.2，三条）：① 真流式要**长连接**（SSE / WebSocket）＋
+  **取消语义** ＋ **断线重连** ＋ **落库策略** —— 那是**整套执行模型**的架构事件，
+  **不该塞进一个"加个动作"的话题里**；② 它会**动摇"留证"这件事**（流式的输出没有终点，
+  而本项目要求"每条结论都能点回任务 ID 与原始输出"）；③ **排障的真实需求是"取到那几行"**，
+  不是"盯着它流" —— 快照式**今天就能满足**，而且它的判据（退出码 + 非空）**现在就能真跑**。
+
+  ★★ **`--previous` 是本动作最值钱的那个选项**：`CrashLoopBackOff` 的排障**必须**看
+  "**上一个已经退出的那个容器**"的日志 —— 当前容器的日志往往是空的（它刚起来就又要死了）。
+  ⇒ 所以它放在**显眼的位置**（不是藏在高级选项里）。规范 §12.39.2 的 `CrashLoopBackOff` 成因①就是这个。
+
+  ★ 判据：`pod_exists` 那一步（预检）＋ `logs` 那一步（退出码）。★ 日志**为空是可能的结论** ——
+  一个刚起来还没输出的容器就是这样；本动作对日志**不做非空断言**，
+  但会**明确报出"日志是空的"**，让人知道"拿到了、里面没东西"，而不是以为"没取到"。
+
+params:
+  - name: pod
+    label: Pod 名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: aoc-net-probe-xxxxx
+    help: '★ 名字从 `k8s.pods` 或 `k8s.workloads` 里复制。'
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+    help: '★ 我们自己的靶子对象都在 `aoc-t9`；集群自带组件在 `kube-system`。'
+  - name: mode
+    label: 取哪一份
+    type: enum
+    required: true
+    choices:
+      - 当前容器（最近 N 行）
+      - ★ 上一个已退出的容器（CrashLoop 排障用）
+      - 指定容器名
+    values: [current, previous, named]
+    default: 当前容器（最近 N 行）
+    help: '★★ `CrashLoopBackOff` 的排障请选第二项：当前容器往往刚起来就又要死了，日志是空的。'
+  - name: container
+    label: 容器名（仅"指定容器名"时用）
+    type: str
+    required: false
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    help: '★ 从 `k8s.describe` 的容器段里复制。多容器 Pod 必须指定，否则 `kubectl` 用第一个容器。'
+  - name: tail
+    label: 取最近多少行
+    type: int
+    required: true
+    min: 1
+    max: 10000
+    default: 200
+    help: '★ 快照式：这是在**一次**取回来多少行。想看更早的日志，把行数调大或改用日志文件（`file.grep`）。'
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: pod_exists
+    title: ★ 确认这个 Pod 在（不存在时，本动作**中止**而不是"取了个空"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pod
+      - "{{ pod }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+    note: >
+      ★★ 这一条是**判据**（规范 §12.37.2）：它的输出（"这个 Pod 存在"）是本动作唯一"必然有输出"的事实。
+      ★ 名字拼错、命名空间选错、Pod 刚被删掉 —— 三种情况都在这里被拦住，
+      而不是让 `kubectl logs` 报一句 `pods "xxx" not found` 后再去猜是"日志空的"还是"Pod 不在"。
+      ★ 它**不声明** `means_done`：Pod 不在**不是**"已达终态"（规范 §12.33 规矩 3）。
+
+steps:
+  - name: pod_wide
+    title: 这个 Pod 的现状（节点 / IP / 状态 —— 与日志对读）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pod
+      - "{{ pod }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - wide
+      - --no-headers
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: logs
+    title: ★ 日志快照（一次取一段）
+    run_by:
+      param: mode
+      cases:
+        current:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - logs
+          - "{{ pod }}"
+          - "-n"
+          - "{{ namespace }}"
+          - --tail={{ tail }}
+        previous:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - logs
+          - "{{ pod }}"
+          - "-n"
+          - "{{ namespace }}"
+          - --tail={{ tail }}
+          - --previous
+        named:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - logs
+          - "{{ pod }}"
+          - "-n"
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --tail={{ tail }}
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 120
+    note: |
+      ★★ **`run_by` 的静态 argv 表**（规范 §12.10）：`mode` 只用来**选段**，
+      命令本身写死在 YAML 里 —— **参数永远不许拼进 argv**。
+      ★ `--previous` 那一段是 `CrashLoopBackOff` 排障的正路（规范 §12.39.2 的成因①）。
+      ★ **不做** `--follow` / `-f`：那是流式（§12.42），本动作明确不提供。
+
+verify:
+  - name: ★ 这个 Pod 必须存在（**这就是本动作"必然有输出"的那一步**）
+    from: pod_exists
+    on_missing: >
+      在 <命名空间> 里没找到这个 Pod —— 名字拼错 / 命名空间选错 / 它刚被删掉，
+      三种都在这里一句话说清。★ 先跑 `k8s.pods` 拿到准确的名字与命名空间。
+  # ★★ **这里故意没有第二条自证**（T9·S2 真跑抓到的缺陷，规范 §12.37.2 的真跑补记）：
+  #   原来第二条写的是"`logs` 那一步必须有输出"—— 而 busybox 这类容器**合法地什么都不往 stdout 写**，
+  #   于是"日志是空的"被自证判成 VERIFY_FAILED（★ 与我在 note 里写的"不做非空断言"**自相矛盾**）。
+  #   ★ 正确的写法：`kubectl logs` **自己的退出码**就是那一步的判据（步骤失败 ⇒ 动作失败），
+  #   不需要、也不许再叠一条"内容非空"的断言（清单 80 / 115）。
+
+conclusion: |
+  【{host.name}】Pod 日志**快照** · {namespace}/{pod}
+  取哪一份：{mode} ｜ 最近 {tail} 行 ｜ ★★ **这是快照，不是流式**（不会跟随、不会自动刷新）
+  Pod 现状：{pod_wide}
+
+  ── 日志原文（快照）──
+  {logs}
+  ── 原文结束 ──
+
+  怎么用（★ 快照式的正确用法）：
+    · 要看更多：把「取最近多少行」调大，**再点一次**（这是**再取一段**，不是"跟随"）；
+    · ★★ **`CrashLoopBackOff` 请选「上一个已退出的容器」**：当前容器往往刚起来就又要死了，
+      它的日志常常是空的；而"上一份"里才有**崩溃前最后那几行**（规范 §12.39.2 成因①）；
+    · ★ **日志为空本身是结论**：说明"拿到了，但里面没东西"（容器刚起、或它压根不往 stdout 写）；
+      ≠ "没取到"（那会在自证里报出来）；
+    · ★ 想知道"它为什么退出的"：看 `k8s.pods` 的重启段（`exitCode` / `reason`）与 `k8s.diagnose` 的成因清单；
+    · ★ 本动作**只读**：`changed` 恒 false。

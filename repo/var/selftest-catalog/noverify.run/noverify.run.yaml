@@ -1,0 +1,11 @@
+id: noverify.run
+title: 坏动作-无自证
+summary: 故意违规
+domain: A
+risk: green
+priority: P0
+steps:
+  - name: s1
+    title: x
+    run: ["true"]
+    parser: raw

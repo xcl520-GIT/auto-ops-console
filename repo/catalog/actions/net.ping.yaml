@@ -1,0 +1,76 @@
+# ============================================================
+# 动作：连通性与路径
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 F（P0 · 只读）
+# 形态：一次给全结论（ping 统计 + 路径追踪 + 丢包判读）
+# 风险：green
+# ============================================================
+
+id: net.ping
+title: 连通性与路径
+summary: ping 目标并追踪路径，直接给出丢包/延迟判读
+domain: F
+risk: green
+priority: P0
+tags: [只读, 网络, 连通性]
+note: |
+  ① ping 返回 1 表示"100% 丢包"，这也是**结论**（不是执行失败），所以声明 ok_exit_codes: [0, 1]，
+     否则"目标不可达"会被显示成步骤失败，反而看不出丢包统计。
+  ② traceroute / mtr 在 RHEL 10 最小安装里**没有**（实测），所以路径追踪是可选步骤：
+     缺命令时该栏显示（无），并在判读里直接给出安装命令。
+     这正好覆盖了验收标准 #3「失败时给原因 + 建议」里"工具缺失"这一类。
+
+params:
+  - name: target
+    label: 目标地址
+    type: str
+    required: true
+    default: 198.51.100.2
+    pattern: '^[A-Za-z0-9._:-]{1,253}$'
+    placeholder: 198.51.100.2
+    help: IP 或域名。默认填的是本环境 NAT 网关（一定能通，便于先确认工具本身正常）。
+  - name: count
+    label: ping 包数
+    type: int
+    min: 1
+    max: 20
+    default: 4
+    help: 包越多统计越准，但耗时也越长（每包最多等 2 秒）。
+
+steps:
+  - name: ping
+    title: ping 连通性
+    run: ["ping", "-c", "{{ count }}", "-W", "2", "{{ target }}"]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    timeout: 40
+    note: -W 2 = 每个包最多等 2 秒，避免网络黑洞时卡满超时。
+
+  - name: trace
+    title: 路径追踪
+    run: ["traceroute", "-n", "-w", "2", "-q", "1", "-m", "15", "{{ target }}"]
+    parser: lines
+    optional: true
+    timeout: 90
+    note: >
+      目标机没装 traceroute 时本步会以 TOOL_MISSING 明确报出"缺什么命令、怎么装"，
+      而不是甩一句裸 stderr。想用 mtr 的话同理（dnf install -y mtr）。
+
+verify:
+  - name: 必须拿到 ping 统计
+    from: ping
+    on_missing: ping 没有任何输出 —— 连"是否可达"都判断不了（检查 ping 是否存在、权限是否足够）
+
+conclusion: |
+  【{host.name}】连通性与路径（目标 {target}，{count} 个包）
+  ping 结果：
+  {ping}
+  路径追踪（traceroute，-n 不反解、最多 15 跳）：
+  {trace}
+
+  判读：
+  · 丢包 0%、延迟稳定 → 通，无需处理；
+  · 丢包 10%~90% → 链路拥塞或虚拟交换/无线抖动：重复跑几次看是否稳定，再看「内核日志」有无网卡报错；
+  · 丢包 100% 或出现 Destination Host Unreachable → ① 目标机是否开机 ② 是否同网段、网关对不对
+    （用「路由与邻居」）③ 目标机防火墙是否挡 ICMP；
+  · 延迟首跳就很大 → 先怀疑虚拟机/宿主机的 CPU 或网络队列（用「进程总览」看负载）；
+  · 路径追踪显示（无）→ 多数是目标机没装 traceroute（RHEL 10 默认没有）：dnf install -y traceroute。

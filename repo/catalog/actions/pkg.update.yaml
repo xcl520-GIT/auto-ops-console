@@ -1,0 +1,83 @@
+id: pkg.update
+title: 更新指定软件包
+summary: 只更新**指定的那个包**（不做全量 dnf update），并给出更新前后版本对照
+domain: H
+risk: yellow
+priority: P1
+tags: [变更, 包管理]
+
+note: |
+  ★ 有意**不做**全量 `dnf update`：那会一次改动几十上百个包，
+  在缺少维护窗口的环境里等于"把所有风险一次释放"。
+  要全量更新，请自己明确执行，并先做快照 —— 工作台不替你按这个按钮。
+
+confirm:
+  title: 确认更新软件包
+  body: |
+    即将在「{host.name}」（{host.address}）上更新包「{package}」到软件源里的最新版本。
+
+    会发生什么：只影响这一个包（及其依赖）。
+    可撤回：`dnf history undo <事务号>` 可回退到更新前版本。
+  confirm_text: 我已确认要更新
+
+params:
+  - name: package
+    label: 包名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9._+-]+$'
+    default: bc
+    placeholder: bc
+    help: '只更新这一个包；不做全量更新（刻意的设计，不是遗漏）'
+
+steps:
+  - name: ver_before
+    title: 更新前版本
+    run: [rpm, -q, "{{ package }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1]
+
+  - name: update
+    title: 更新（可能较慢）
+    run: [dnf, update, -y, "{{ package }}"]
+    parser: lines
+    timeout: 300
+
+  - name: ver_after
+    title: 更新后版本（★ 这一步的退出码等于"包存在"）
+    run: [rpm, -q, "{{ package }}"]
+    parser: raw
+    ok_exit_codes: [0]
+
+  - name: history
+    title: 取最近的事务记录（回退依据）
+    run: [dnf, history]
+    parser: head_lines
+    optional: true
+
+verify:
+  - name: 包在更新后仍可查询到
+    from: ver_after
+    on_missing: rpm -q 查不到该包 —— 更新过程出了问题的可能性很大
+  - name: 更新步骤有输出
+    from: update
+    on_missing: dnf 没有任何输出，更新过程不可信
+
+conclusion: |
+  「{package}」更新结果（{host.name}）
+  · 更新前：{ver_before}
+  · 更新后：{ver_after}
+  · 最近事务（回退依据）：
+  {history}
+
+  判读：
+    · 前后版本**相同**是正常结果 —— 说明本来就已经是最新版（dnf 会明说 "Nothing to do"）；
+    · ★★ **"升级"有两层，别把它们混在一起**（规范 §12.15.1）：
+        – **包版本**（本动作管的这一层）：机器上这个 `rpm` 的版本变没变；
+        – **配方版本**（配方 YAML 里的 `version`）：**我们改了自己的编排**（步骤/模板/参数默认值）。
+      ★ 一句话口径：**配方版本管"我们改了什么"，包版本管"机器上变了什么"，两者互不代管。**
+    · ★★ **升完必须验幂等**：紧接着重跑一次对应配方（「部署 / 收敛」）——
+      应当**零变更**；若不为空，那是**判据**把"包版本变了"误判成了"我们的配置变了"（规范 §12.15.1）；
+    · 回退：`dnf history undo <ID>` —— ★ 现在有动作兜底了：用「回退软件包事务」按事务号回退
+      （规范 §12.15.3；它会把"回退前 / 回退后"的版本逐字摆出来）。

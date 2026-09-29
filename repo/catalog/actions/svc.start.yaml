@@ -1,0 +1,90 @@
+id: svc.start
+title: 启动服务
+summary: 启动一个 systemd 服务，并自证它真的处于 active（不是"命令返回 0"就算成功）
+domain: E
+risk: yellow
+priority: P0
+tags: [变更, 服务]
+
+note: |
+  「启动成功」的判据不是 start 命令返回 0，而是**服务真的 active**。
+  所以本动作在 start 之后单独跑一条 `systemctl is-active`：
+  **它的退出码就是结论**（0=active、3=非 active），非 0 会让整条动作判失败。
+  探针实测（2026-09-25，4 台一致）：start 幂等、start 不存在的 unit → rc=5。
+
+confirm:
+  title: 确认启动服务
+  body: |
+    即将在「{host.name}」（{host.address}）上启动服务「{unit}」。
+
+    影响面：该服务开始对外提供服务（一般无破坏性）。
+    可撤回：可以再执行「停止服务」把它停掉。
+
+params:
+  - name: unit
+    label: 服务名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9@._:-]+$'
+    normalize: systemd_unit
+    default: aoc-lab.service
+    placeholder: aoc-lab 或 nginx
+    help: '不含「.」时自动补 .service；只允许字母、数字与 @ . _ : - 这些字符'
+
+precheck:
+  - name: unit_exists
+    title: 确认服务存在（避免"名字打错"被当成"启动失败"）
+    run: [systemctl, cat, "{{ unit }}"]
+    parser: lines
+    note: |
+      ★ 必须用 `systemctl cat` 做存在性检查。探针实测：`systemctl show -p X <不存在的 unit>`
+      返回 **0 且输出为空** —— 拿 show 判断存在性会得出"服务存在"的错误结论（T1 那类
+      "退出码 0、程序不报错、结论却是错的"陷阱的又一次实例）。
+
+steps:
+  - name: before
+    title: 记录启动前的状态
+    run: [systemctl, show, -p, ActiveState, -p, SubState, -p, ActiveEnterTimestamp, -p, MainPID, "{{ unit }}"]
+    parser: shell_kv
+
+  - name: start
+    title: 启动服务
+    run: [systemctl, start, "{{ unit }}"]
+    parser: raw
+    timeout: 60
+    note: start 对已在运行的服务是幂等的（返回 0），所以要把 before 的状态一并放进结论说明
+
+  - name: isactive
+    title: 检查服务是否真的 active（★ 这一步的退出码就是结论）
+    run: [systemctl, is-active, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    note: |
+      退出码语义（探针实测）：0=active、3=非 active、4=不存在。
+      只接受 0 —— 服务没起来就让整条动作失败，而不是给出一条"执行成功"的假结论。
+
+  - name: after
+    title: 读取启动后的状态与时间戳
+    run: [systemctl, show, -p, ActiveState, -p, SubState, -p, ActiveEnterTimestamp, -p, MainPID, -p, ExecMainStatus, "{{ unit }}"]
+    parser: shell_kv
+
+verify:
+  - name: 服务处于 active
+    from: isactive
+    on_missing: is-active 没有返回内容，无法证明服务已启动
+  - name: 能读到启动时间戳（证明确实进入过 active）
+    from: after
+    field: ActiveEnterTimestamp
+    on_missing: 读不到 ActiveEnterTimestamp —— 服务可能根本没起来（看原始输出与 journalctl）
+
+conclusion: |
+  「{unit}」启动结果
+  · 现在状态：{after.ActiveState} / {after.SubState}
+  · 主进程 PID：{after.MainPID}
+  · 进入 active 的时间：{after.ActiveEnterTimestamp}
+  · 启动前状态：{before.ActiveState}（时间戳 {before.ActiveEnterTimestamp}）
+
+  判读：
+    · ActiveState=active 才算启动成功；
+    · 若「启动前」已是 active 且时间戳未变，说明它**本来就在跑**（本次是幂等操作，没有真的启动）；
+    · 若失败：用「日志查看器」看该 unit 的日志，或用「服务总览」看失败原因。

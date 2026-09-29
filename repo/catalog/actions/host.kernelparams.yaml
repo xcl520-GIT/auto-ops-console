@@ -1,0 +1,100 @@
+# ============================================================
+# 动作：内核参数与已加载模块
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 A（P1 · 只读）
+# 形态：一次给全结论（关键参数 + 参数总量 + 模块数与前 N 条）
+# 风险：green
+# ============================================================
+
+id: host.kernelparams
+title: 内核参数与模块
+summary: 关键内核参数（转发 / 内存 / 并发三件套 / 安全开关）+ 参数总量 + 已加载模块数与前几条（只读）
+domain: A
+risk: green
+priority: P1
+tags: [只读, 内核, sysctl, 模块]
+note: |
+  ★ 为什么挑这几个键：它们属于"**看一眼就知道这台机器被谁调过**"的类型 ——
+  转发动向（k8s 节点 / 网关 / 容器网络）、swappiness（数据库主机常被调）、
+  pid_max / somaxconn / file-max（高并发三件套）、tcp_syncookies / randomize_va_space（安全开关）。
+  想看得更全就把键名加进第一个步骤的 `run`（`sysctl` 允许一次给多个键）。
+
+  ★ `sysctl <key> …`（**不加 `-a`**）的输出是 `KEY = VALUE` —— 用 `shell_kv` 解析（`=` 契约），
+  再把带点的键名 `pick` 成短名字：★ 结论模板的 `{core.ip_forward}` 是"点号取字段"，
+  键名里再带点就会被当成嵌套路径 —— 所以**必须**先改名（规范 §12.6 的模板约定）。
+
+  ★ 参数总条数用 `sysctl -a` + `line_count`：动作层**禁止管道**，`sysctl -a | wc -l` 那种写法不存在，
+  所以"数行数"只能由解析器做（规范 §12.9 / T4 那条"空输出对它是 0 行"的补记）。
+
+  ★ 模块**计数**走 `/proc/modules`（一行一个模块、**没有表头**），**显示**走 `lsmod`（给人看的形态）——
+  这样"数行数"拿到的是精确条数，而不是 `lsmod` 那个「N + 表头 1 行」。
+  两者都是结构化/半结构化来源，不解析人读表格。
+
+params:
+  - name: top_n
+    label: 模块清单显示条数
+    type: int
+    min: 1
+    max: 60
+    default: 15
+    help: 只影响"模块清单列前几条"（T4 起可调，规范 §10.5）；"共多少个模块"是精确值，不受它影响。
+
+steps:
+  - name: core
+    title: 关键内核参数（sysctl）
+    run: ["sysctl", "net.ipv4.ip_forward", "vm.swappiness", "kernel.pid_max",
+          "net.core.somaxconn", "fs.file-max", "net.ipv4.tcp_syncookies",
+          "kernel.randomize_va_space"]
+    parser: shell_kv
+    pick:
+      "net.ipv4.ip_forward": ip_forward
+      "vm.swappiness": swappiness
+      "kernel.pid_max": pid_max
+      "net.core.somaxconn": somaxconn
+      "fs.file-max": file_max
+      "net.ipv4.tcp_syncookies": tcp_syncookies
+      "kernel.randomize_va_space": randomize_va_space
+
+  - name: total
+    title: 内核参数总条数（sysctl -a）
+    run: ["sysctl", "-a"]
+    parser: line_count
+
+  - name: modules
+    title: 已加载模块（前 N 条，含 lsmod 表头）
+    run: ["lsmod"]
+    parser: head_lines
+    parser_arg: "{{ top_n }}"
+
+  - name: modules_count
+    title: 已加载模块数（/proc/modules）
+    run: ["cat", "/proc/modules"]
+    parser: line_count
+
+verify:
+  - name: 关键参数必须读得出来
+    from: core
+    field: ip_forward
+    on_missing: >
+      sysctl 没给出 net.ipv4.ip_forward —— 要么内核不支持这个键，
+      要么 `shell_kv` 与它的输出格式对不上（这正是这条自证要拦的事：**不许把"解析失败"说成"参数是（无）"**）。
+  - name: 模块数必须读得出来
+    from: modules_count
+    on_missing: /proc/modules 读不到 —— 目标机可能禁用了模块（或是无模块的裁剪内核）
+
+conclusion: |
+  【{host.name}】内核参数与已加载模块
+
+  转发 / 安全开关：ip_forward={core.ip_forward} ｜ tcp_syncookies={core.tcp_syncookies} ｜ 地址随机化={core.randomize_va_space}
+  内存与并发：swappiness={core.swappiness} ｜ pid_max={core.pid_max} ｜ somaxconn={core.somaxconn} ｜ file-max={core.file_max}
+  内核参数总量（sysctl -a）：{total} 条
+  已加载内核模块：{modules_count} 个（下面列前 {top_n} 行，含 lsmod 表头）
+  {modules}
+
+  判读：
+  · ip_forward=1 → 这台在**转发**（k8s 节点 / 网关 / 跑着容器网络，正常）；=0 → 纯客户端角色；
+  · swappiness：数据库主机常见 1~10（宁可回收 page cache 也不把进程换出去）；60（或 100）= 没被调过；
+  · pid_max / somaxconn / file-max 是**高并发三件套** —— 容器主机上的 pid_max 常被调到七位数，
+    这三项保持默认值而机器上又跑着很多容器，是"以后会卡在哪个上限"的第一号线索；
+  · tcp_syncookies=1、randomize_va_space=2 是**安全开关的期望值**；=0 要问清为什么被关了；
+  · 模块清单只列前几条（完整输出在本动作的步骤留证里）；`lsmod` 的 `Used by` 列能看出谁在依赖它；
+  · 本动作只读：不改任何内核参数，也不装卸模块。

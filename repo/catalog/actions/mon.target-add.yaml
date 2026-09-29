@@ -1,0 +1,129 @@
+# ============================================================
+# 动作：监控 · 注册一个抓取目标（T10 · 扩展点）
+# 来源：开题单 §2 块2（"为其它系统预留扩展点"）＋ §7 验收 #8（可正可反）
+# 形态：往 file_sd 目录里**写一个小文件** —— 不需要 reload，Prometheus 每 10 秒自己重读
+# 风险：yellow（在 /opt/aoc-monitoring 白名单目录里新增一个文件）
+# ============================================================
+
+id: mon.target-add
+title: 监控 · 注册一个抓取目标（扩展点）
+summary: 往 /opt/aoc-monitoring/etc/targets/ 写一个 aoc-mon-*.json，把某台机器的 exporter 纳入采集
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, 监控, 采集面, 扩展点, T10]
+
+confirm:
+  title: 确认注册这个抓取目标
+  body: |
+    即将在「{host.name}」（{host.address}）上写一个文件：
+      /opt/aoc-monitoring/etc/targets/{name}.json
+    内容里把 {address} 纳入采集（标签 role={role}）。
+
+    会发生什么：
+      · Prometheus 的 file_sd **每 10 秒自动重读**该目录 ⇒ **不需要 reload**，也不打断采集；
+      · 若同名文件已存在，**会被覆盖**（覆盖前自动备份，可恢复）。
+
+    可撤回：用「监控 · 注销一个抓取目标」删掉它。
+  confirm_text: 我已确认要注册这个目标
+
+note: |
+  ★★ 这就是总纲要的那个「**为"其它系统"预留扩展点**」：Prometheus 用 `file_sd_configs`
+    盯着 `etc/targets/*.json`，**每 10 秒自动重读** —— 所以注册/注销目标**根本不需要 reload**，
+    也不会打断正在跑的采集。★ 这也是"注册一个 target"能被做成"可正可反"的原因。
+  ★ **命名纪律**：本动作写的文件**一律**叫 `aoc-mon-<name>.json`（前缀写死在模板里，不由参数决定）——
+    于是它**可枚举、可删净**：`ls /opt/aoc-monitoring/etc/targets/aoc-mon-*.json` 一句话收干净。
+  ★ **地址白名单**：`address` 只许 `内网地址:端口` 形态，**不许 0.0.0.0、不许写域名** ——
+    否则这个扩展点就变成了"往任意地方发请求"的通道。
+  ★ `changed` 判据 = 那个文件的 **sha256 变了没有**（写同一份内容 ⇒ `False`，这是幂等的正面证据）。
+
+params:
+  - name: name
+    label: 目标名（用来组成文件名）
+    type: str
+    required: true
+    default: aoc-mon-demo
+    pattern: '^aoc-mon-[a-z0-9][a-z0-9-]{1,32}$'
+    help: ★ **必须**以 `aoc-mon-` 开头 —— 靶子纪律（规范 §12.44 同口径）：自己铺的自己能一眼认出来。
+  - name: address
+    label: 目标地址（内网 IP:端口）
+    type: str
+    required: true
+    default: 192.0.2.13:9100
+    pattern: '^(10|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{2,5}$'
+    help: 只许内网 IPv4 + 端口，例如 192.0.2.13:9100。★ 写 0.0.0.0 或域名一律被拒。
+  - name: role
+    label: 角色标签
+    type: str
+    required: true
+    default: lab-node
+    pattern: '^[a-z][a-z0-9-]{1,24}$'
+    help: 会写进 labels.role，用来在 PromQL 里分组。
+
+backup:
+  - path: "/opt/aoc-monitoring/etc/targets/{{ name }}.json"
+    label: "被覆盖前的目标文件"
+    required: false
+
+steps:
+  - name: before
+    title: 记下这个目标文件现在的指纹
+    run: [sha256sum, "/opt/aoc-monitoring/etc/targets/{{ name }}.json"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+    note: rc=1 = 还没有这个文件（首次注册）；两种都算"跑过了"。
+
+  - name: write
+    title: 写入目标文件
+    write_file:
+      path: "/opt/aoc-monitoring/etc/targets/{{ name }}.json"
+      content: |
+        [
+          {
+            "targets": ["{{ address }}"],
+            "labels": {
+              "stack": "aoc-monitoring",
+              "role": "{{ role }}",
+              "aoc_target": "{{ name }}",
+              "added_by": "auto-ops-console"
+            }
+          }
+        ]
+      mode: "0644"
+    parser: raw
+    note: ★ 写盘走引擎的**幂等写**（sha256 相同则不写，规范 §12.4）—— 所以"写同一份内容"不产生变更。
+
+  - name: after
+    title: 复读指纹
+    run: [sha256sum, "/opt/aoc-monitoring/etc/targets/{{ name }}.json"]
+    parser: raw
+    timeout: 20
+
+  - name: list
+    title: 当前扩展点目录里都有什么（可枚举的证据）
+    run: [ls, -1, /opt/aoc-monitoring/etc/targets]
+    parser: lines
+    timeout: 20
+
+verify:
+  - name: 目标文件必须真的写下来了
+    from: list
+    on_missing: 扩展点目录是空的 —— 目录不存在？权限不对？
+
+conclusion: |
+  【{host.name}】监控 · 注册抓取目标
+  目标名：{name} ｜ 地址：{address} ｜ 角色：{role}
+  落点：/opt/aoc-monitoring/etc/targets/{name}.json
+  指纹：写前 {before} → 写后 {after}
+  目录现状：
+  {list}
+
+  判读：
+  · ★ **不需要 reload** —— Prometheus 的 `file_sd_configs` 每 10 秒自动重读该目录；
+    等一个周期后用「监控 · 抓取目标健康度」查它，应当出现且 `health = up`（验收 #8 的"正方向"）；
+  · ★★ **回得去 / 回不去**（规范 §12.38）：
+    - **完全回得去**：用「监控 · 注销抓取目标」把 `{name}.json` 删掉即可；本动作覆盖旧文件时还留了备份；
+    - **回不去**：**已经抓进 TSDB 的那段样本不会消失** —— 删掉目标只是"不再抓"，
+      历史数据仍在（且受 `retention.time` / `retention.size` 约束）。这是数据层的"回不去"。
+  · 本动作只往自己的白名单目录里写一个文件，不碰 Prometheus 的其它配置。

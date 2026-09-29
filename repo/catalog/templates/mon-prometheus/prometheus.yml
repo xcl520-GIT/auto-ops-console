@@ -1,0 +1,43 @@
+# ============================================================
+# managed by auto-ops-console (T10) —— 请勿手工编辑
+# 落点：/opt/aoc-monitoring/etc/prometheus.yml
+# 渲染参数：scrape_interval / site / target_k8s01 / target_k8s02 /
+#           target_k8s03 / target_docker01
+#
+# ★ 口径（规范 v1.13 §12.54）：本文件里**不写监听地址** ——
+#   `--web.listen-address` 由 systemd unit 显式给出（那是"监听面收窄"的落点）。
+# ★ 抓取目标分两处：
+#   ① targets/node-base.json —— 由配方渲染（本环境固定的四台）；
+#   ② targets/aoc-mon-*.json —— **扩展点**（`mon.target-add` / `mon.target-remove` 增删，
+#      file_sd 每 10 秒自动重读，**不需要 reload**）。
+# ============================================================
+
+global:
+  scrape_interval: {{ scrape_interval }}s
+  evaluation_interval: {{ scrape_interval }}s
+  external_labels:
+    stack: aoc-monitoring
+    site: {{ site }}
+
+rule_files:
+  - /opt/aoc-monitoring/etc/rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  - job_name: node
+    file_sd_configs:
+      - files: ["/opt/aoc-monitoring/etc/targets/*.json"]
+        refresh_interval: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: instance
+        replacement: "$1"

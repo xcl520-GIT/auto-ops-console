@@ -1,0 +1,108 @@
+# ============================================================
+# 动作：登录审计
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 B（P0 · 只读）、域 G 登录审计
+# 形态：一次给全结论（谁在线 / 最近登录 / 失败登录 / 各账号最后登录）
+# 风险：green
+# ============================================================
+
+id: host.logins
+title: 登录审计
+summary: 当前在线、最近登录、失败登录与各账号最后登录时间（含异常登录判读）
+domain: B
+risk: green
+priority: P0
+tags: [只读, 用户, 审计, 安全]
+note: |
+  「失败登录」读的是 /var/log/btmp（lastb）。本机在免密改造期间真实产生过失败记录，
+  所以这一栏不是空跑 —— 它正是"异常登录识别"的价值所在。
+  任一子步骤不可用（btmp 缺失 / 权限不足）只会让该栏显示（无），其余结论照常给。
+
+params:
+  - name: lines
+    label: 每个列表显示条数
+    type: int
+    min: 1
+    max: 50
+    default: 10
+
+  - name: days
+    label: 最后登录时间看最近几天
+    type: int
+    min: 1
+    max: 3650
+    default: 30
+    help: 只列出最近 N 天内有登录记录的账号（避免系统账号刷屏）。
+
+steps:
+  - name: who_now
+    title: 当前登录会话
+    run: ["who"]
+    parser: lines
+    optional: true
+
+  - name: w_now
+    title: 当前会话明细
+    run: ["w", "-h"]
+    parser: lines
+    optional: true
+    note: 含空闲时间与正在执行的命令 —— 判断"这个会话是不是有人在干活"比 who 更有用。
+
+  - name: last_ok
+    title: 最近成功登录
+    run: ["last", "-n", "{{ lines }}"]
+    parser: lines
+    optional: true
+
+  - name: last_bad
+    title: 最近失败登录
+    run: ["lastb", "-n", "{{ lines }}"]
+    parser: lines
+    optional: true
+    note: 需要 /var/log/btmp 可读（root 一般可以）。无失败记录时输出为空 → 结论显示（无），这是好消息。
+
+  - name: lastlog
+    title: 各账号最后登录时间
+    run: ["lastlog", "-t", "{{ days }}"]
+    parser: head_lines
+    timeout: 30
+    optional: true
+    note: >
+      用 -t 限定"只显示最近 N 天内有登录记录的账号"，否则系统账号会刷出一屏
+      "**Never logged in**"（实测 20 行里 19 行是噪声）。
+      再用 head_lines 截断到前 20 行 —— 动作层禁止管道，截断只能由解析器做。
+
+  - name: sessions
+    title: 登录会话（loginctl）
+    run: ["loginctl", "list-sessions"]
+    parser: lines
+    optional: true
+
+verify:
+  - name: 必须能列出最近登录记录
+    from: last_ok
+    on_missing: last 无输出 —— wtmp 可能被清空或权限不足，登录历史不可判断
+  - name: 当前会话必须可读
+    from: w_now
+    severity: warn
+    on_missing: w 无输出
+
+conclusion: |
+  【{host.name}】登录审计
+  当前登录会话 {who_now.count} 个：
+  {who_now}
+  会话明细（USER / TTY / 来源 / 空闲 / 正在执行的命令）：
+  {w_now}
+  登录会话（loginctl）：
+  {sessions}
+  ⚠️ 最近失败登录（重点看来源 IP 与频率）：
+  {last_bad}
+  最近成功登录：
+  {last_ok}
+  各账号最后登录时间（前 20 行）：
+  {lastlog}
+
+  判读：
+  · 失败登录栏若出现**你不认识的来源 IP**，或短时间密集重试 → 有人在撞密码：
+    考虑只允许密钥登录（PasswordAuthentication no）并对来源做限制；
+  · 失败登录显示（无）→ /var/log/btmp 为空，属好事；
+  · 显示的**条数**由参数控制（当前 {lines} 条）。

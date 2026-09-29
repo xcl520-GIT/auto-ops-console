@@ -1,0 +1,198 @@
+# ============================================================
+# 动作：镜像仓库可达性
+# 来源：T8·S2 —— S0 侦察撞到的环境事实（规范 §12.28）
+# 形态：**只读**（green）—— 一次探测一组 registry，给一张对照表
+# ============================================================
+
+id: registry.probe
+title: 镜像仓库可达性
+summary: 一次探测一组容器镜像仓库（401 = 仓库活着 / 000 = 不可达），并给一张对照表
+domain: J
+risk: green
+priority: P1
+tags: [只读, 容器, 镜像, 网络]
+
+note: |
+  ★★ **为什么必须"先 probe 再写进配方"**（规范 §12.28）：T8 侦察撞到一条环境事实 ——
+  **同一个 registry 地址，在三台 K8s 上不可达、在 docker-01 上可达**；
+  而公网 `docker.io` / `quay.io` 全线不可达（Calico 的官方源一个都通不了）。
+  任何"照抄别人文档"的镜像地址都可能把一次部署卡死在拉镜像那一步。
+
+  ★★ **判读口径（本动作存在的全部理由）**：
+  · **`401` = 仓库活着** —— registry v2 对"未带 token 的 `/v2/`"就是这么答的，
+    **它不是"鉴权失败"**（这是最容易读错的一档）；
+  · `200` / `307` / `308` = 活着（有的仓库/反代直接给重定向）；
+  · **`000` = 不可达**（没有拿到任何 HTTP 响应：DNS / 连接 / TLS / 超时）；
+  · `404` = 仓库路径不对（**"不可达"与"没有这个仓库"是两件事** —— §10.6.3 / §12.15.2 同族）。
+
+  ★ 本动作**只回答可达性**，**不做**完整的"这个镜像存在吗"判定 ——
+  拉 manifest 需要先走 token 流程，动作层不做那件事（§12.28 规矩 5）。
+  ★ 只读：不拉镜像、不推镜像、不改任何仓库配置。
+
+params:
+  - name: harbor
+    label: 内网仓库地址
+    type: str
+    required: false
+    pattern: '^https?://[A-Za-z0-9._:-]{4,80}/?$'
+    default: http://192.0.2.60
+    placeholder: http://192.0.2.60
+    help: '留空 = 跳过"内网仓库"那一步；填了就按这个地址探 /v2/'
+  - name: timeout
+    label: 每个仓库的超时（秒）
+    type: int
+    min: 1
+    max: 30
+    default: 8
+
+steps:
+  - name: k8s_registry
+    title: registry.k8s.io（★ kubeadm 的默认源）
+    run:
+      - curl
+      - -sS
+      - -o
+      - /dev/null
+      - -w
+      - "HTTP %{http_code} ｜ 建连 %{time_connect}s ｜ 总耗时 %{time_total}s ｜ TLS校验 %{ssl_verify_result}"
+      - --max-time
+      - "{{ timeout }}"
+      - https://registry.k8s.io/v2/
+    parser: raw
+    ok_exit_codes: [0, 5, 6, 7, 28, 35, 51, 60]
+    timeout: 45
+    note: >
+      ★ 本步**不标 optional**，它是自证来源：连它都问不出来（比如没装 curl）才算故障。
+      ★ 而"HTTP 000 / 连不上"只是它报出来的**结论**，动作照旧 ok（见结论段判读）。
+
+  - name: aliyun_registry
+    title: registry.aliyuncs.com（国内常用的 k8s 镜像镜像站）
+    run:
+      - curl
+      - -sS
+      - -o
+      - /dev/null
+      - -w
+      - "HTTP %{http_code} ｜ 建连 %{time_connect}s ｜ 总耗时 %{time_total}s ｜ TLS校验 %{ssl_verify_result}"
+      - --max-time
+      - "{{ timeout }}"
+      - https://registry.aliyuncs.com/v2/
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 5, 6, 7, 28, 35, 51, 60]
+    timeout: 45
+
+  - name: cn_hangzhou
+    title: registry.cn-hangzhou.aliyuncs.com（阿里云容器镜像服务）
+    run:
+      - curl
+      - -sS
+      - -o
+      - /dev/null
+      - -w
+      - "HTTP %{http_code} ｜ 建连 %{time_connect}s ｜ 总耗时 %{time_total}s ｜ TLS校验 %{ssl_verify_result}"
+      - --max-time
+      - "{{ timeout }}"
+      - https://registry.cn-hangzhou.aliyuncs.com/v2/
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 5, 6, 7, 28, 35, 51, 60]
+    timeout: 45
+
+  - name: docker_hub
+    title: registry-1.docker.io（公网 Docker Hub）
+    run:
+      - curl
+      - -sS
+      - -o
+      - /dev/null
+      - -w
+      - "HTTP %{http_code} ｜ 建连 %{time_connect}s ｜ 总耗时 %{time_total}s ｜ TLS校验 %{ssl_verify_result}"
+      - --max-time
+      - "{{ timeout }}"
+      - https://registry-1.docker.io/v2/
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 5, 6, 7, 28, 35, 51, 60]
+    timeout: 45
+
+  - name: quay
+    title: quay.io（Calico 的官方源之一）
+    run:
+      - curl
+      - -sS
+      - -o
+      - /dev/null
+      - -w
+      - "HTTP %{http_code} ｜ 建连 %{time_connect}s ｜ 总耗时 %{time_total}s ｜ TLS校验 %{ssl_verify_result}"
+      - --max-time
+      - "{{ timeout }}"
+      - https://quay.io/v2/
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 5, 6, 7, 28, 35, 51, 60]
+    timeout: 45
+
+  - name: ghcr
+    title: ghcr.io（GitHub 容器仓库）
+    run:
+      - curl
+      - -sS
+      - -o
+      - /dev/null
+      - -w
+      - "HTTP %{http_code} ｜ 建连 %{time_connect}s ｜ 总耗时 %{time_total}s ｜ TLS校验 %{ssl_verify_result}"
+      - --max-time
+      - "{{ timeout }}"
+      - https://ghcr.io/v2/
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 5, 6, 7, 28, 35, 51, 60]
+    timeout: 45
+
+  - name: harbor_probe
+    title: 内网仓库（参数 harbor，留空则整步跳过）
+    run:
+      - { when: harbor, value: curl }
+      - { when: harbor, value: -sS }
+      - { when: harbor, value: -o }
+      - { when: harbor, value: /dev/null }
+      - { when: harbor, value: -w }
+      - { when: harbor, value: "HTTP %{http_code} ｜ 建连 %{time_connect}s ｜ 总耗时 %{time_total}s" }
+      - { when: harbor, value: --max-time }
+      - { when: harbor, value: "{{ timeout }}" }
+      - { when: harbor, value: "{{ harbor }}/v2/" }
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 5, 6, 7, 28, 35, 51, 60]
+    timeout: 45
+    note: '★ 全部元素挂 when ⇒ 参数留空时渲染出空 argv ⇒ 引擎整步跳过（规范 §8.3）。'
+
+verify:
+  - name: ★ 必须拿到 k8s 官方源那一档的结果
+    from: k8s_registry
+    on_missing: >
+      curl 没有输出任何指标 —— 探测链路本身异常（目标机可能没装 curl）。
+      ★ 注意：探测结果是"00 / 连不上"**不算故障** —— 那是这条链路的**结论**
+      （§10.6.3："不可达"与"没有这个仓库"是两件事）。
+
+conclusion: |
+  【{host.name}】镜像仓库可达性（只读）
+  超时 {timeout}s ｜ 内网仓库 {harbor}
+  ── 对照表（HTTP 码 ｜ 建连 ｜ 总耗时 ｜ TLS校验）──
+  · registry.k8s.io（kubeadm 默认源）      ：{k8s_registry}
+  · registry.aliyuncs.com                 ：{aliyun_registry}
+  · registry.cn-hangzhou.aliyuncs.com     ：{cn_hangzhou}
+  · registry-1.docker.io（公网 Docker Hub）：{docker_hub}
+  · quay.io（Calico 官方源之一）           ：{quay}
+  · ghcr.io                               ：{ghcr}
+  · 内网仓库 {harbor}                      ：{harbor_probe}
+
+  判读（★ 这一节是本动作的全部价值）：
+    · **401 = 仓库活着**（registry v2 对未带 token 的 `/v2/` 就是这么答的）—— **不是鉴权失败**；
+    · 200 / 307 / 308 = 活着；404 = **仓库路径不对**；其它 4xx/5xx 看服务端；
+    · **000 = 不可达**：DNS / 连接 / TLS / 超时里的一种，**不是"没有这个镜像"**；
+      要分清是哪一种，用「DNS 解析链路」（查名字是否解析得出）与「端口占用 / HTTP 探测」；
+    · ★★ **同一份地址在不同机器上结论可能不同**（本环境实测过：三台 K8s 与 docker-01 的
+      "能到哪几个 registry"恰好相反）⇒ **写配方之前，在"真正要拉镜像的那台"上跑一次本动作**；
+    · 本动作只读：不拉镜像、不推镜像、不改任何仓库配置。

@@ -1,0 +1,95 @@
+# ============================================================
+# 动作：目录体积排行
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 C（P0 · 只读）
+# 形态：一次给全结论（按体积降序的目录清单 + 判读）
+# 风险：green
+# ============================================================
+
+id: disk.topdir
+title: 目录体积排行
+summary: 指定路径的子目录体积排行（已按大小降序，可设深度与体积下限）
+domain: C
+risk: green
+priority: P0
+tags: [只读, 磁盘, 排行]
+note: |
+  `du -x -m --max-depth=N`：-x 不跨文件系统（否则会把挂载点当目录继续算），-m 固定 MB 单位。
+  排序在 du_rows 解析器里做（动作层禁止管道，`du | sort -rn` 写不了）——
+  见 repo/docs/动作规范.md v1.1 的解析器理由说明。
+  必须限深度 + 可设体积下限，否则 du 一屏能扫出几千行、还慢。
+
+params:
+  - name: path
+    label: 扫描路径
+    type: str
+    required: true
+    default: /var
+    pattern: '^/[A-Za-z0-9._/-]{0,200}$'
+    placeholder: /var
+    help: 绝对路径。只统计该路径下的子目录，不跨文件系统。
+  - name: depth
+    label: 统计深度
+    type: int
+    min: 1
+    max: 3
+    default: 1
+    help: 1 = 只看直属子目录；2~3 = 往下钻，适合定位深层占用大户。
+  - name: min_size
+    label: 体积下限
+    type: enum
+    choices: ["不限", "≥ 50MB", "≥ 200MB", "≥ 1GB"]
+    values: ["", "50M", "200M", "1G"]
+    default: "不限"
+    help: 只显示不低于该体积的目录。选了以后命令行会带上 --threshold（选"不限"则不带）。
+  - name: top_n
+    label: 排行显示条数
+    type: int
+    min: 1
+    max: 200
+    default: 20
+    help: 最多显示前 N 条（T4 起可调）。以前固定 20 条，会遇到"看不见第 21 个"的情况。
+
+steps:
+  - name: path_check
+    title: 路径存在性
+    run: ["ls", "-d", "{{ path }}"]
+    parser: raw
+    note: 先证明路径存在 —— 让"路径写错"以明确的原因暴露，而不是变成一句空结果。
+
+  - name: du
+    title: 目录体积
+    run:
+      - du
+      - -x
+      - -m
+      - --max-depth
+      - "{{ depth }}"
+      - { when: min_size, value: --threshold }
+      - { when: min_size, value: "{{ min_size }}" }
+      - "{{ path }}"
+    parser: du_rows
+    parser_arg: "{{ top_n }}"
+    timeout: 60
+    note: 深度上限 3 + 可选体积下限，是为避免在全盘 du 上卡死（超时 60 秒）。parser_arg 决定显示前几条（T4 起可调，见规范 §10.5）。
+
+verify:
+  - name: 扫描路径必须存在
+    from: path_check
+    on_missing: 指定路径在目标机上不存在 —— 检查拼写，或用「主机概览」确认根目录结构
+  - name: 路径必须能读出信息
+    from: du
+    severity: warn
+    on_missing: 该路径下没有达到体积下限的子目录（把下限调小、或把深度调到 2~3 再试）
+
+conclusion: |
+  【{host.name}】目录体积排行
+  扫描 {path} ｜ 深度 {depth} ｜ 体积下限 {min_size} ｜ 命中 {du.count} 条（按体积降序，最多 {top_n} 条）
+  {du}
+
+  判读：
+  · 单位 MB。**第一条通常就是你扫描的路径本身（即该路径的总占用）**，往下才是各子目录；
+  · 0 MB 的行已被过滤掉（du -m 是整数 MB，空目录一律算 0，留在排行里没信息量）；
+  · 优先看这几个常见大户：/var/log（日志未轮转）、/var/lib/mysql（数据文件）、
+    /var/lib/containers 或 /var/lib/docker（镜像与卷）、/var/cache（包缓存）、/home（用户数据）；
+  · 显示（无）= 该路径下没有达到下限的子目录 —— 把「体积下限」调小或深度调到 2 再试；
+  · 本动作只读，不会删除任何东西；清理请用专门的变更动作（T3）或手工确认后操作。

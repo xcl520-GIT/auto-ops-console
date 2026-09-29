@@ -1,0 +1,73 @@
+# ============================================================
+# 动作：SELinux 状态
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 G（P0 · 只读）
+# 形态：一次给全结论（当前模式 + 配置文件模式 + 策略 + 交叉验证）
+# 风险：green
+# ============================================================
+
+id: sec.selinux
+title: SELinux 状态
+summary: 当前模式与配置文件模式是否一致、策略名、是否 Enforcing
+domain: G
+risk: green
+priority: P0
+tags: [只读, 安全, SELinux]
+note: |
+  ★ 三重交叉验证：getenforce（运行时）、sestatus（运行时详情）、/etc/selinux/config（下次开机生效的配置）。
+  三者不一致本身就是最常见的"改了没生效"事故：
+    · 配置文件里是 enforcing 但 getenforce 是 Permissive → 临时改过没持久化（setenforce 0）；
+    · 配置文件里是 disabled 但当前 Enforcing → 改过配置但没重启。
+  RHEL 10 默认 Enforcing，做任何变更类动作前都该先看一眼本动作的结论。
+
+params: []
+
+steps:
+  - name: enforce
+    title: 当前模式（getenforce）
+    run: ["getenforce"]
+    parser: raw
+
+  - name: status
+    title: SELinux 详情（sestatus）
+    run: ["sestatus"]
+    parser: colon_kv
+    pick:
+      "SELinux status": selinux_status
+      "Loaded policy name": policy
+      "Current mode": current_mode
+      "Mode from config file": mode_from_config
+      "Policy MLS status": mls
+      "Policy deny_unknown status": deny_unknown
+      "SELinuxfs mount": selinuxfs
+
+  - name: config
+    title: 配置文件（下次开机生效）
+    run: ["cat", "/etc/selinux/config"]
+    parser: shell_kv
+    optional: true
+    note: /etc/selinux/config 是 KEY=VALUE 契约文件 → shell_kv 直接取（不用解析人读文本）。
+
+verify:
+  - name: 必须读出当前模式
+    from: enforce
+    on_missing: getenforce 无输出 —— 目标机可能没有 SELinux 支持（或被裁剪过）
+  - name: 必须读出策略名
+    from: status
+    field: policy
+    on_missing: sestatus 没有给出策略名 —— SELinux 可能未启用
+
+conclusion: |
+  【{host.name}】SELinux 状态
+  当前模式（getenforce）：{enforce}
+  详情：SELinux={status.selinux_status} ｜ 策略={status.policy} ｜ 当前模式={status.current_mode} ｜ 配置文件模式={status.mode_from_config}
+  MLS={status.mls} ｜ deny_unknown={status.deny_unknown} ｜ 挂载点={status.selinuxfs}
+  配置文件 /etc/selinux/config：SELINUX={config.SELINUX} ｜ SELINUXTYPE={config.SELINUXTYPE}
+
+  判读：
+  · 当前模式 = Enforcing → 策略在强制生效；任何变更（改配置、换端口、迁移目录）都可能被拦，
+    被拦的记录用「SELinux 拒绝记录」动作看；
+  · 当前模式（getenforce）与配置文件模式（/etc/selinux/config）**不一致**：
+    - 配置是 enforcing、当前是 Permissive → 有人 `setenforce 0` 临时关了，重启会变回 Enforcing；
+    - 配置是 disabled、当前是 Enforcing → 改过配置但**还没重启**，重启后才生效；
+  · 生产环境不建议设 disabled：正确做法是保留 Enforcing + 用 semanage/布尔值/自定义策略放行；
+  · 本动作只读：不会改动模式或策略。

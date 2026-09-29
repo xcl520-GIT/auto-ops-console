@@ -1,0 +1,147 @@
+# ============================================================
+# 动作：对象详情（describe）
+# 来源：T9·S2 —— 规范 §12.37.1（管理类动作的判读口径）、§12.43（Secret 不给值）
+# 形态：**只读**（green）
+# ============================================================
+
+id: k8s.describe
+title: 对象详情（describe）
+summary: 按名字取一个对象的详情：kind 白名单 + 名字 + 命名空间 —— ★ "去哪一行复核"的那只手
+domain: J
+risk: green
+priority: P1
+tags: [只读, K8s, 排障]
+
+note: |
+  ★★ **它在 T9 里的位置**：`k8s.diagnose` 给**成因清单**，每条成因都带"**去哪一行复核**"——
+  那只手就是本动作（规范 §12.39.1 的"证据"那一列）。
+  ⇒ 它不是"另一个 get"，它是**结论的落点**。
+
+  ★ `kind` 是**白名单枚举**（不许自由文本）：`kubectl describe` 会把对象里**所有**字段
+  展开给人看 —— 一个能填任意 kind 的框，等于给"读遍集群里的一切"开了一道门
+  （规范 §4 三层契约）。★ 枚举里**故意不含** `secret`：`describe secret` 只给键名不给值，
+  但把它放进**任意 kind** 的枚举里会让人以为"这个动作可以读凭据"（§12.43）。
+
+  ★ 判据是"`get` 得出来"（`target_exists` 那一步）：**对象不存在就中止**，
+  而不是让 `describe` 打印一句 `Error from server (NotFound)` 后由人去分辨
+  "是对象不在、还是集群连不上"（规范 §12.37.2）。
+
+params:
+  - name: kind
+    label: 对象类型
+    type: enum
+    required: true
+    choices:
+      - Pod
+      - Deployment
+      - StatefulSet
+      - DaemonSet
+      - Job
+      - CronJob
+      - Service
+      - Endpoints
+      - ConfigMap
+      - PersistentVolumeClaim
+      - PersistentVolume
+      - Node
+    values: [pod, deployment, statefulset, daemonset, job, cronjob, service, endpoints, configmap, persistentvolumeclaim, persistentvolume, node]
+    default: Pod
+    help: '★ 只需选"哪一类对象"，名字在下一个字段填。★ 集群级对象（`Node` / `PersistentVolume`）不需要命名空间。'
+  - name: name
+    label: 对象名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: aoc-net-probe-xxxxx
+    help: '★ 名字从 `k8s.pods` / `k8s.workloads` / `k8s.config` 里复制。'
+  - name: namespace
+    label: 命名空间（集群级对象留空）
+    type: str
+    required: false
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+
+steps:
+  - name: api_alive
+    title: ★★ 中枢判据：集群 API 在应答（**这一步必然有输出**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: target_exists
+    title: ★ 对象必须在（不在就中止：这是"我描述的是个存在的东西"的判据）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - { when: namespace, value: -n }
+      - { when: namespace, value: "{{ namespace }}" }
+      - --no-headers
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ 这一步**不是 optional** —— 对象不在就整条动作失败（而不是打印空详情）。
+      ★ 它同时把"名字对不对"与"集群通不通"两件事**分开**：集群不通在 `api_alive` 那一步就红了。
+
+  - name: describe
+    title: 详情（describe 原文 —— ★ 它的每一段都能被"成因清单"当作复核依据）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - describe
+      - "{{ kind }}"
+      - "{{ name }}"
+      - { when: namespace, value: -n }
+      - { when: namespace, value: "{{ namespace }}" }
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 90
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: >
+      `kubectl get namespaces` 没有给出任何一行 —— API server 没在应答，或这把 kubeconfig 不对。
+  - name: ★ 这个对象必须存在
+    from: target_exists
+    on_missing: >
+      在 <命名空间> 里没找到 <类型>/<名字> —— 先跑 `k8s.pods` / `k8s.workloads` / `k8s.config`
+      拿到准确的名字与命名空间，再来 describe。
+
+conclusion: |
+  【{host.name}】对象详情 · {kind}/{name}（命名空间：{namespace}）
+
+  ── 这个对象在不在（判据）──
+  {target_exists}
+  ── describe 原文 ──
+  {describe}
+  ── 原文结束 ──
+
+  判读（★ 这是"复核"该看的几处）：
+    · **`Events:` 段在最后** —— describe 的尾部就是**这个对象最近的事件**（与 `k8s.events` 同源）；
+    · **`Status:` / `State:` / `Reason:`** —— 容器为什么退出、退出码多少，都在这几行；
+    · **`Limits` / `Requests`** —— `OOMKilled` 的排障要看 `memory` 限额（它太小 ⇒ 被杀）；
+    · **`Conditions:`** —— `Ready` / `PodScheduled` 的 `False` 后面通常直接写着原因；
+    · ★ 本动作**只读**：`changed` 恒 false。★ 也**不读 Secret 的值**（枚举里没有 `secret`，规范 §12.43）。

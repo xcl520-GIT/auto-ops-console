@@ -1,0 +1,166 @@
+# ============================================================
+# 动作：写内核参数（T8·S2 · T7 起跑线 #4 的本体）
+# 来源：规范 §12.24 —— 三件事必须成套（现值留证 / 写入+复读 / 持久化后仍生效）
+# 风险：yellow（可回退，但"改错了会锁住自己"）
+# ============================================================
+
+id: sysctl.set
+title: 写内核参数
+summary: 写一个内核参数并自证生效，同时持久化到 /etc/sysctl.d/（★ 只增不降）
+domain: A
+risk: yellow
+priority: P0
+tags: [变更, 内核, sysctl, 集群前置]
+
+note: |
+  ★★ **为什么必须成套（规范 §12.24.1）** —— 少一件就等于没写：
+
+  | # | 这件事 | 只做它的后果 |
+  |---|---|---|
+  | ① | **现值留证**（写前先读一遍） | 回不到原样 |
+  | ② | **写入 + 复读自证** | "命令返回 0"被当成成功（`sysctl -w` 对某些情形**返回 0 却没生效**） |
+  | ③ | **持久化 + `sysctl --system` 后仍生效** | 重启即丢，或者被后加载的文件覆盖 |
+
+  ★★ **本动作总是持久化，不提供"仅运行时"**：一个没持久化的内核参数，
+  对着"重启后要能起来"的集群就是个地雷（§12.24.1 的"成套"要求）。
+
+  ★★ **「只增不降」**：动作只把你给的**期望值**写进去，**不带"我觉得应该是多少"**；
+  这三个键（`vm.swappiness` / `net.core.somaxconn` / `fs.file-max`）在上一个集群里
+  **已被故意调过**（实测 1 / 32768 / 2097152）—— 要"降"必须**显式把目标值填进来**，
+  留证里会出现"从 X 改到 Y"。已经在期望值上 ⇒ **幂等**（不写盘、结论照给）。
+
+  ★★ **顺序约束（§12.24.3）**：`net.bridge.bridge-nf-call-iptables` 这类键
+  **只有在 `br_netfilter` 加载之后才存在**。所以预检会先问"这个键读得到吗" ——
+  读不到就**停在这里**并提示"先用「加载内核模块」"，**不会**让你写一个"看起来成功其实没生效"的值。
+
+confirm:
+  title: 确认写内核参数
+  body: |
+    即将在「{host.name}」（{host.address}）上写内核参数：
+      {{ key }} = {{ value }}
+    并持久化到 `/etc/sysctl.d/99-aoc-{{ key }}.conf`，随后 `sysctl --system` 重新应用一遍。
+
+    会发生什么：该参数**立即生效**且**重启后仍在**（内核参数影响全机内核行为，
+    例如转发开关、连接队列、文件句柄上限）。
+    可撤回：把 `value` 填回原来的值再跑一次；写入前的原值会出现在结论里（现值留证）。
+  confirm_text: 我已确认要写这个内核参数
+
+backup:
+  - path: "/etc/sysctl.d/99-aoc-{{ key }}.conf"
+    label: "本工作台管理的持久化文件（首次创建时不存在，属正常）"
+    required: false
+
+params:
+  - name: key
+    label: 参数名
+    type: str
+    required: true
+    pattern: '^(net\.ipv4\.ip_forward|net\.ipv4\.conf\.all\.forwarding|net\.bridge\.bridge-nf-call-iptables|net\.bridge\.bridge-nf-call-ip6tables|vm\.swappiness|net\.core\.somaxconn|fs\.file-max|net\.netfilter\.nf_conntrack_max|kernel\.pid_max)$'
+    default: net.ipv4.ip_forward
+    placeholder: net.ipv4.ip_forward
+    help: '只放行建集群必需的这几个键（白名单，加了别的要升规范）；留空/其它值会被参数校验拒绝'
+  - name: value
+    label: 值
+    type: str
+    required: true
+    pattern: '^[0-9]{1,9}$'
+    default: "1"
+    help: '只允许数字（这几个键的值都是整数）；要"降"就把目标值直接填进来'
+
+precheck:
+  - name: key_readable
+    title: 确认这个键**现在读得到**（★ 顺序约束的落点：模块没加载 → 键不存在）
+    run: [sysctl, -n, "{{ key }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    note: >
+      ★★ `net.bridge.bridge-nf-call-iptables` 在 `br_netfilter` **没加载**时根本不存在，
+      `sysctl -n` 会以非零退出码报 "cannot stat" ⇒ 预检不通过 ⇒ 整条动作 aborted（**目标机零改动**）。
+      ★ 这不是刁难：若在这里放行，`sysctl -w` 可能**看起来成功**而实际不生效（§12.24.3 的假成功）。
+      正确顺序是**先加载模块**（「加载内核模块」动作）再回来写参数。
+
+steps:
+  - name: before
+    title: 写之前的现值（★ 现值留证 —— 回退的锚点）
+    run: [sysctl, -n, "{{ key }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+
+  - name: write
+    title: 写入（sysctl -w）
+    run: [sysctl, -w, "{{ key }}={{ value }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: 输出形如 `net.ipv4.ip_forward = 1`；★ 但**不拿它当成功证据** —— 证据是下一步的复读。
+
+  - name: after
+    title: ★★ 复读（写入后的值）—— 本步才是"写进去了没有"的判据
+    run: [sysctl, -n, "{{ key }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+
+  - name: persist
+    title: 持久化（写到 /etc/sysctl.d/，一键一文件）
+    write_file:
+      path: "/etc/sysctl.d/99-aoc-{{ key }}.conf"
+      content: |
+        # managed by auto-ops-console (T8) — 请勿手工编辑
+        # 一"键"一文件：避免与别人那份配置互相覆盖（规范 §12.24.1）
+        {{ key }} = {{ value }}
+      mode: "0644"
+    parser: raw
+    note: >
+      ★ 文件名带 `99-aoc-` 前缀 ⇒ **可枚举、可删净**；一"键"一文件 ⇒ 不会覆盖别人那份。
+      ★ 写盘走引擎的**幂等写**（sha256 相同则不写，规范 §12.4）。
+
+  - name: reload
+    title: 让持久化文件真的被应用（sysctl --system）
+    run: [sysctl, --system]
+    parser: raw
+    ok_exit_codes: [0]
+    optional: true
+    timeout: 60
+    note: >
+      ★ 它的意义是"把盘上那份重新应用一遍"——所以**跑完之后还要再复读一次**，
+      那一次才是"持久化真的成立"的证据（下一步）。
+
+  - name: verify_after
+    title: ★★ 持久化之后的复读（`--system` 走完，值必须还在）
+    run: [sysctl, -n, "{{ key }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+
+verify:
+  - name: ★★ 写入后的复读必须有值（判据是"值是多少"，不是"命令返回 0"）
+    from: after
+    on_missing: >
+      `sysctl -n` 写完之后读不出值 —— 这个键可能没真正生效（§12.24.1 的假成功）。
+  - name: ★★ 持久化之后的复读必须有值（说明盘上那份能被应用）
+    from: verify_after
+    on_missing: >
+      `sysctl --system` 之后读不出值 —— 持久化文件可能有语法问题，或值没能应用。
+
+conclusion: |
+  【{host.name}】写内核参数（变更）
+  参数：{key} ｜ 期望值：{value}
+  · 写之前的现值：{before}
+  · 写入命令回显：{write}
+  · ★★ 写入后复读：{after}
+  · 持久化文件：/etc/sysctl.d/99-aoc-{key}.conf（内容里就是 `{key} = {value}`）
+  · ★★ `sysctl --system` 之后复读：{verify_after}
+
+  判读：
+    · **三次读数应当一致**：现值 → 写入后 → 持久化后；任何一次与期望值不符，本动作都会判红；
+    · ★ 本次是**从 `{before}` 改到 `{after}`**（两者相同 = 本来就是这个值，本次是**幂等**）；
+    · ★★ **只增不降**：本动作只把「你给的期望值」写进去 —— **不会**顺手把别人调好的值
+      （`vm.swappiness` / `net.core.somaxconn` / `fs.file-max` 这些**上一个集群故意调过的**）恢复成默认；
+      要"降"必须**显式把目标值填进来**（规范 §12.24.2）；
+    · **回退**：把「值」填回 `{before}` 再跑一次即可（持久化文件会被同一条幂等写覆盖回去）；
+    · ★★ **回不去的**：内核参数**已经生效过的那一段历史**回不去 ——
+      例如 `ip_forward` 关闭期间被丢弃的转发、`somaxconn` 改动前后已经建立的连接队列。
+      这些不在回退范围内（规范 §12.19 同族：空也要说清）；
+    · 本动作**总是持久化**：不提供"仅运行时"（§12.24.1 要求三件事成套）。

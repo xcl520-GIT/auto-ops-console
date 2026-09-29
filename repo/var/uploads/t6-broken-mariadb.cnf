@@ -1,0 +1,16 @@
+# ============================================================
+# T6·S2 的**负例夹具**：故意写坏的 MariaDB 配置
+# 用途：验证 svc.configtest 的 mariadbd 预设**真的会失败**（规范 §12.9 检查清单 46）
+# 用法：file.push 到目标机 /etc/my.cnf.d/aoc.cnf → 跑 svc.configtest → **必须判红**
+# ★ 这不是给人用的配置，别照抄。
+# ============================================================
+
+[mysqld]
+port            = 3306
+bind-address    = 127.0.0.1
+
+# ↓ 错误一：值不是数字（类型错）
+innodb_buffer_pool_size = NOT_A_NUMBER
+
+# ↓ 错误二：根本没有这个变量（未知选项）
+this_option_does_not_exist_t6 = 1

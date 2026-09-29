@@ -1,0 +1,129 @@
+# ============================================================
+# 动作：回滚到快照
+# 来源：设计\05-虚拟化层-架构设计.md §4 · 总纲 §8.2 红线 15
+# 形态：把虚拟机退回到某条快照 —— ★ 会丢掉当前状态
+# 风险：🔴 red（不可逆的"丢现状"）｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.snapshot-revert
+title: 回滚到快照
+summary: 🔴 把虚拟机退回到某条快照 —— **当前状态会被丢掉**；手输确认词，禁止批量
+domain: M
+risk: red
+priority: P1
+channel: local
+tags: [变更, 虚拟化, 快照, 破坏性]
+
+note: |
+  ★★ 红线 15：**永远 red** —— 手输确认词（服务端逐字比对）+ **禁止批量**。
+    理由与"不做自动回滚"同源：回滚会**把"其实没坏"的现场也一起覆盖掉**。
+  ★★ **"回不去"要落在快照链上**（规范 §12.118）：回滚**之后**，那条"被丢掉的现状"
+    **没有任何快照能把它找回来**（除非它本来就在别的快照里）—— 下面结论里逐项写清。
+  ★★ 本动作**不断言**"回滚之后 guest 里是什么状态"（§12.117 的同一纪律）：
+    它只回答两件事：① `revertToSnapshot` 被 VMware 收下了；② 那条快照**仍在链上**。
+    至于"guest 里现在是什么样" —— 要另问 guest（跑一次「一键体检」或状态动作）。
+  ★ 名字**逐字**匹配（链上可能是中文与空格）⇒ 预检就先确认这个名字在链上，
+    名字写错**不许**动手。
+
+confirm:
+  title: 确认回滚到快照
+  body: |
+    即将把虚拟机「{vm_name}」（{vm_vmx}）**回滚到快照**：**{snapshot}**。
+
+    会发生什么：
+      · 虚拟机的**当前状态被快照那一刻的状态覆盖**（磁盘与（视配置）内存状态）
+      · 从这条快照之后做的**所有改动都会消失**（包括别人做的、以及与本项目无关的改动）
+
+    能不能撤回：
+      · ★★ **不能**：被覆盖掉的现状**没有回收站**。
+        除非它恰好被**另一条更晚的快照**记着 —— 动手前请先用「虚拟机快照链」看一眼整条链。
+      · 回滚这件事本身**再回滚一次也回不来**（你能回到的只有链上已有的那些点）。
+
+    判据（做完怎么算成）：
+      · ① VMware 收下了回滚请求；② 这条快照**仍在链上**。
+      · ★ **不**断言"guest 里变成了什么样" —— 那要另问 guest。
+  confirm_text: 我知道会丢掉当前状态，回滚
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名
+
+  - name: snapshot
+    label: 快照名
+    type: str
+    required: true
+    default: k8s集群搭建完成
+    pattern: '^[^\r\n]{1,80}$'
+    placeholder: 先用「虚拟机快照链」读一次，然后**逐字**照抄
+    help: ★ 逐字匹配（含空格与中文）；名字不在链上 ⇒ **预检就拒绝动手**
+
+  - name: timeout_sec
+    label: 最多等多少秒（等回滚被收下）
+    type: int
+    required: true
+    default: 300
+    min: 10
+    max: 1800
+
+precheck:
+  - name: vmx_ok
+    title: 确认这台虚拟机的 vmx 打得开
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "listSnapshots", "{{ vm_vmx }}"]
+    parser: raw
+    ok_exit_codes: [0]
+
+  - name: snap_exists
+    title: 确认这条快照**真的在链上**（★ 名字逐字匹配，写错就不许动手）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_vmx }}", "--expect", "snapshot", "--snapshot", "{{ snapshot }}"]
+    parser: json
+    ok_exit_codes: [0]
+    note: |
+      ★ 预检不成立 ⇒ 整个动作中止（`PRECHECK_FAILED`），**一步都不动**。
+      这是刻意的：回滚是不可逆的，**名字写错就必须在动手前拦住**。
+
+steps:
+  - name: revert
+    title: 回滚（★ 这一步只是**收条**）
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "revertToSnapshot", "{{ vm_vmx }}", "{{ snapshot }}"]
+    parser: raw
+    timeout: 600
+    note: |
+      ★ 它只说明 VMware 收下了回滚请求。★ 本动作**不**在这一步之后断言 guest 的状态
+        （"读不到 ≠ 没成功"，"收条 ≠ 事情全成了"）。
+
+  - name: still_there
+    title: 判据：这条快照仍在链上（回滚没有把链搞坏）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_vmx }}", "--expect", "snapshot", "--snapshot", "{{ snapshot }}",
+          "--wait", "{{ timeout_sec }}"]
+    parser: json
+    timeout: 1980
+    ok_exit_codes: [0]
+
+verify:
+  - name: 必须确认快照名仍在链上
+    from: still_there
+    field: snapshot
+    on_missing: 回滚之后读不到这条快照 —— 链的状态不明，本结论不可用
+
+conclusion: |
+  【{vm_name}】回滚结果（到快照：{snapshot}）
+  · VMware 是否收下回滚请求：见「revert」步骤的原始输出与退出码
+  · 回滚后链上快照数：{still_there.snapshot_count} 条（这条快照仍在）
+  · 判据来源：{still_there.checked}
+
+  ★ **回不去的东西**（逐项说清，没有也写「无」）：
+  · 这条快照**之后**对这台机器做的**所有改动** —— **回不来**（没有回收站）；
+  · 除非那部分改动恰好被**另一条更晚的快照**记着 —— 请先用「虚拟机快照链」自己核对。
+  · 回滚之后 guest 里的服务状态 —— 本动作**不做断言**（它只回答"请求被收下了 + 快照还在"）。
+
+  判读：
+  · ★ 这一步之后**必须**再跑一次「一键体检」：确认 guest 真的起来了、服务状态是你预期的；
+  · 若回滚后机器起不来：这本身就是一条结论 —— 用「虚拟机状态」确认 VMware 那边它在不在运行，
+    再决定要不要开机（`vm.start`，yellow，需要人点头）。

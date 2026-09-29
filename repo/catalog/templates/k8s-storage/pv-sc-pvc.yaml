@@ -1,0 +1,64 @@
+# ============================================================
+# 模板：存储类 + PV + PVC（T8 · S7）
+# ------------------------------------------------------------
+# ★★ 与实物口径的**有意偏离**，逐条说清（规范 §12.13.5 / §12.19 同族）：
+#   旧集群有两条 StorageClass：`nfs-dynamic`（默认，nfs-subdir-external-provisioner + Delete + Immediate）
+#   与 `nfs-storage-class`（no-provisioner + Retain + WaitForFirstConsumer）。
+#   ★ 我们**不复制 `nfs-dynamic`** —— 它会往导出根目录里**新建子目录**，而那条根目录是
+#     **`/data/nfs`（红线 B1：永远只读）**。
+#   ★ 我们**按 `nfs-storage-class` 的形状做一条**（provisioner / reclaimPolicy / volumeBindingMode
+#     **逐项同参**），只把后端从 **NFS** 换成**节点本地目录**：
+#     · 后端 = `{{ storage_path }}`（★ 本工作台自己的目录，不是别人的 NFS 导出）；
+#     · 访问模式 = `ReadWriteOnce`（本地卷的语义，NFS 那条是 RWX —— **这一项刻意不同，如实写明**）。
+#   ⇒ ★ 一句话：**形状照抄、后端换掉、差异写明**。
+#
+# ★ 为什么用 `no-provisioner` + 静态 PV：它**不需要**任何额外的 provisioner 工作负载，
+#   于是"存储类可用"这件事的判据只有一条 —— **PVC 真的 Bound 上，Pod 真的读写得动**。
+# ============================================================
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ storage_class }}
+# ★ `no-provisioner` = "不自动建卷"：卷由下面那份静态 PV 声明（与旧集群那条 `nfs-storage-class` 同参）
+provisioner: kubernetes.io/no-provisioner
+reclaimPolicy: Retain
+# ★ `WaitForFirstConsumer` = "等第一个消费者出现才绑定"：
+#   没有它，一个"还不能确定会被调度到哪台机器"的卷会被**过早绑定**（与旧集群那条同参）
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ pv_name }}
+spec:
+  capacity:
+    storage: {{ storage_size }}
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ storage_class }}
+  # ★ 后端：节点上的一个目录（不是 NFS —— 见文件头"有意偏离"）
+  local:
+    path: {{ storage_path }}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - {{ storage_node }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ pvc_name }}
+  namespace: {{ namespace }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ storage_class }}
+  resources:
+    requests:
+      storage: {{ storage_size }}

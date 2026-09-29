@@ -1,0 +1,66 @@
+# ============================================================
+# 动作：网卡与地址
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 F（P0 · 只读）
+# 形态：一次给全结论（每张网卡的地址/状态/MTU/MAC + 默认网关 + 连接名）
+# 风险：green
+# ============================================================
+
+id: net.addr
+title: 网卡与地址
+summary: 每张网卡的地址、状态、MTU、MAC，附默认网关与 NetworkManager 连接名
+domain: F
+risk: green
+priority: P0
+tags: [只读, 网络, 网卡]
+note: |
+  主数据源是 `ip -j addr`（首选**结构化源**：JSON），由 ip_addr 解析器把嵌套的 addr_info
+  展平成"一张网卡一行"，否则渲染出来会是一坨 Python 字典字面量。
+  默认网关单独用 `ip -j route show default` 查 —— 比在整张路由表里取第 0 行可靠。
+
+params: []
+
+steps:
+  - name: addr
+    title: 网卡与地址
+    run: ["ip", "-j", "addr"]
+    parser: ip_addr
+
+  - name: gw
+    title: 默认网关
+    run: ["ip", "-j", "route", "show", "default"]
+    parser: json
+
+  - name: conndev
+    title: NetworkManager 设备与连接
+    run: ["nmcli", "-t", "-f", "GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION", "device", "show"]
+    parser: lines
+    optional: true
+    note: >
+      连接名在这里看（改 IP/网关/DNS 时要指定连接名）。
+      实测坑：`nmcli -f DEVICE,...` 会报 invalid field，必须用 GENERAL.DEVICE 这种带前缀的字段名。
+
+  - name: forward
+    title: 转发开关
+    run: ["cat", "/proc/sys/net/ipv4/ip_forward"]
+    parser: raw
+    optional: true
+    note: 0 = 不转发。做网关/NAT/容器网络时要它等于 1，顺手带出来省一次查询。
+
+verify:
+  - name: 必须解析出网卡
+    from: addr
+    on_missing: ip -j addr 没有解析出任何网卡 —— 网络栈可能异常，本结论不可用
+
+conclusion: |
+  【{host.name}】网卡与地址（共 {addr.count} 张网卡）
+  {addr}
+  默认网关 {gw.0.gateway}（出口网卡 {gw.0.dev}）｜ 路由协议 {gw.0.protocol}
+  IPv4 转发 ip_forward = {forward}
+  NetworkManager 设备与连接（设备:类型:状态:连接名）：
+  {conndev}
+
+  判读：
+  · state=UP 且 ipv4 有地址 → 正常；state=DOWN 或 ipv4 显示（无）→ 该网卡没拿到地址；
+  · MAC 以 00:50:56 / 00:0c:29 开头的是 VMware 虚拟机网卡（前者为 ESXi/Workstation 常用段）；
+  · 默认网关显示（无）→ 没有默认路由，机器出不了网（先看「路由与邻居」确认路由表）；
+  · lo 没有 IPv6 属正常；同一网卡出现多个地址 = 配了辅助地址或 IPv6 自动配置。

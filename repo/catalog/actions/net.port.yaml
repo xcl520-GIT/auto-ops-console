@@ -1,0 +1,86 @@
+# ============================================================
+# 动作：端口占用
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 F（P0 · 只读）
+# 形态：**一次给全结论**：端口 → 进程 → 归属 systemd 服务（本动作是这条链路的样板）
+# 风险：green
+# ============================================================
+
+id: net.port
+title: 端口占用
+summary: 谁占了端口：端口 → 进程/PID → 归属 systemd 服务（可只查某一个端口）
+domain: F
+risk: green
+priority: P0
+tags: [只读, 网络, 端口, 排障]
+note: |
+  ★ 「一次给全结论」的核心动作：ss 只给到"哪个进程"，排障真正要的是"哪个服务"。
+    桥接办法：ss_rows 解析器取出每个 socket 的 PID，再用 `ps -o unit= -p <PID>` 反查 systemd 单元。
+    （实测：`systemctl show <PID>` **不可用**，会报 Unknown object —— 只有 ps 的 unit 列能反查。）
+  ① 指定端口时用 ss 自己的过滤表达式 `sport = :<端口>`，**不写管道**；
+  ② 「全部监听套接字」那一步只为自证 ss 可用（它一定非空），不往结论里铺原始表格。
+
+params:
+  - name: port
+    label: 只查这个端口
+    type: int
+    required: false
+    min: 1
+    max: 65535
+    placeholder: 22
+    help: 留空 = 列出全部监听套接字。填了就只看这个端口（含 IPv4 与 IPv6）。
+
+steps:
+  - name: listening
+    title: 全部监听套接字（自证 ss 可用）
+    run: ["ss", "-H", "-tuln"]
+    parser: lines
+    note: 这一步不往结论里铺数据，只用来证明 ss 本身可用（以及给出监听总数）。
+
+  - name: sockets
+    title: 监听套接字（含进程）
+    run:
+      - ss
+      - -H
+      - -tulnp
+      - { when: port, value: "sport = :{{ port }}" }
+    parser: ss_rows
+    note: >
+      过滤表达式作为**单独一个元素**传给 ss（实测 ss 接受 "sport = :22" 这种整串写法）。
+      它含 {{ port }} 模板，所以不会被"禁止 shell 元字符"的校验误伤。
+
+  - name: units
+    title: 归属 systemd 服务
+    run: ["ps", "-o", "unit=", "-p", "{{ pid }}"]
+    parser: raw
+    foreach: sockets.pid
+    as: pid
+    item_pattern: '^[0-9]{1,7}$'
+    optional: true
+    note: >
+      对每个 PID 反查它所属的 systemd 单元（输出形如 sshd.service）。
+      非 systemd 管理的进程（容器内进程、直接启动的进程）反查不到时本项自动略过。
+      同一服务同时监听 IPv4/IPv6 会出现两遍，属正常。
+
+verify:
+  - name: ss 必须能列出监听套接字
+    from: listening
+    on_missing: ss 无输出 —— 目标机可能缺少 iproute2，或内核无网络套接字信息
+  - name: 筛选结果必须可解析
+    from: sockets
+    severity: warn
+    on_missing: 没有匹配的监听套接字（若指定了端口，说明该端口当前无人监听）
+
+conclusion: |
+  【{host.name}】端口占用
+  查询条件：{port} ｜ 全部监听套接字 {listening.count} 条 ｜ 本次匹配 {sockets.count} 条
+  匹配结果（协议 状态 本地地址:端口 进程/PID）：
+  {sockets}
+  归属 systemd 服务（PID → 单元）：
+  {units}
+
+  判读：
+  · 排障顺序：本页给出「端口 → 进程 → 服务」三步，拿到服务名后直接 `systemctl status <单元>` 看细节；
+  · 进程显示「（无进程信息）」→ 通常是权限不足（非 root 看不到别人的 socket），或对端在内核/容器里；
+  · 指定端口后结果为（无）→ 该端口当前没有任何进程监听（这是**结论**，不是错误）；
+  · 同一服务在 IPv4 与 IPv6 各监听一次 → 匹配结果里会出现两行（0.0.0.0:22 与 [::]:22）；
+  · 想停掉占用端口的服务：属变更动作（T3），本动作只读。

@@ -1,0 +1,58 @@
+# ============================================================
+# 模板：存储读写验证 Job（T8 · S7）
+# ------------------------------------------------------------
+# ★★ 这一份是「**存储类可用**」这条验收的**判据本体**（不是"对象建出来了"）。
+#
+# 它做两件事，**两个方向各一次**，而且两边的结果都留在**宿主机能看到的地方**：
+#   ① **读**：把宿主机预先写进卷里的 `/data/from-host.txt` 读出来，
+#      原样写到 `/data/pod-receipt.txt` ⇒ ★ 平台在**宿主机**上读这份 receipt，
+#      内容与 host 那份一致 ⇒ **Pod 真的读到了这个卷**；
+#   ② **写**：自己写一份 `/data/pod-wrote.txt`（带 Pod 主机名与时间）
+#      ⇒ ★ 平台在**宿主机**上读得到它 ⇒ **Pod 真的写进了这个卷**。
+#
+# ★★ 为什么这么设计：`kubectl apply` 成功 / PVC 显示 `Bound` / Pod 显示 `Running`
+#   —— 这三件事**都证明不了**"卷真的能用"（都能在卷没挂上的情况下出现，
+#   只要 Pod 不等它）。⇒ 判据要选**只有真的读写成功才会出现**的那一个：
+#   **一个由 Pod 写、由宿主机读到的文件**。
+#
+# ★ `nodeSelector` 钉住宿主机 + `tolerations: [operator: Exists]`：
+#   `local` 卷必须落在它 `nodeAffinity` 指定的那台机器上；
+#   而控制面**带 NoSchedule 污点**，不容忍它就永远调度不上去。
+# ============================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ job_name }}
+  namespace: {{ namespace }}
+spec:
+  # ★ 失败就失败，不重试：这是"**证明卷能用**"的一次性判据，不是生产任务
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: {{ storage_node }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: rw
+          image: {{ storage_image }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "=== ① 读：把宿主机写进卷里的那份读出来 ==="
+              cat /data/from-host.txt
+              cat /data/from-host.txt > /data/pod-receipt.txt
+              echo "=== ② 写：写一份只有真挂上了才写得出来的文件 ==="
+              echo "written-by=$(hostname) at $(date -u +%FT%TZ)" > /data/pod-wrote.txt
+              cat /data/pod-wrote.txt
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ pvc_name }}

@@ -1,0 +1,151 @@
+# ============================================================
+# 配方：Valkey（T6 · 第二个服务）
+# ------------------------------------------------------------
+# 一次点击 = 从"机器上什么都没有"到"缓存服务可用且有**真探活**健康检查"：
+#   装包 → 渲染站点定制 → 启动 + 自启 → （配置变了才）重启 → 健康检查
+# 反向操作：停止 / 卸载（保留数据）/ 卸载（全删）
+#
+# ★ 设计宪法（规范 §12.0）：
+#   ① 本文件只声明"要什么"，**判定与分支一律走平台侧**（没有一处命令、没有一处表达式）
+#   ② 「没变」可断言：平台采集 changed → **第二次跑该清单为空**就是幂等证明
+#   ③ 每个正向步骤都有反向操作（见 uninstall）
+# ============================================================
+
+id: valkey
+name: Valkey
+version: "1"
+summary: 一键部署 Valkey（代 Redis：站点定制 + 真探活健康检查 + 幂等重跑 + 可卸载）
+risk: yellow
+
+note: |
+  ★ **为什么配方叫 `valkey` 而不是 `redis`**：
+  Rocky/RHEL 10 起 Redis 被 Valkey 取代，`redis` 包**不存在**（T6 开工前实测 `dnf repoquery`），
+  而且 `valkey` 包只提供 `valkey-*` 命令名、**没有 `redis-*` 兼容名**
+  ⇒ 探活命令必须写 `valkey-cli`（写 `redis-cli` 就是 rc=127）。
+
+  ★ **为什么配置写在 `/etc/sysconfig/valkey`**（而不是写我们自己的 `valkey.conf`）：
+  ① valkey 包**没有**配置 drop-in 目录 —— `/etc/valkey/valkey.conf` 里的 `include` **全是注释**，
+     没有一行生效（真机确认）；
+  ② 改包自带的 `valkey.conf` = T5 踩过的坑 —— `remove_config` **复原不了**包里的几十行默认值，
+     卸到一半就成"残缺的包"，配方自己还修不回来（规范 §12.13）；
+  ③ 而这个单元**自己就留了站点定制钩子**（真机读到的单元原文）：
+       `EnvironmentFile=-/etc/sysconfig/valkey` ＋ `ExecStart=... $OPTIONS`
+     并且这个文件**当前不存在**（实测）⇒ 它是**纯粹我们自造的文件**，写得进、删得掉、全删也删得掉。
+  ★ 备选方案**留档否掉**：写 `/etc/valkey/aoc.conf` ＋ 用 systemd drop-in 覆盖 `ExecStart` ——
+     要把包的 `ExecStart` 全文复刻一遍（含 `--supervised systemd`），包一升级就可能漂，
+     还多出一个目录要管；`OPTIONS` 这个钩子是包**专门留出来**的，更稳。
+
+  ★ **为什么本配方没有 `config_test` 步骤**（照 T6 开题单 §3.3 的结论）：
+  Valkey **没有独立的配置校验命令**（不像 nginx 有 `-t`、MariaDB 有 `--verbose --help`）。
+  ★ **宁可不写，也不拿 `svc.start` 去当语法检查器**（那是"拿服务当校验器"，
+  启动失败会连带把服务搞成 failed 状态）。真实失败靠**启动后紧跟的健康检查**暴露。
+
+  ★ **健康检查是"真问一句"，不是看单元在跑**：
+  `responds: {action: db.valkey-ping}` 走 `valkey-cli PING`，**全等** `PONG` 才通过
+  （子串不算 —— 规范 §12.11）；`state: active` 只是旁证。
+  `port_open` 则专门钉住"参数里填的端口到底生效没有"（`responds` 走的是命令行指定的端口，
+  但配置有没有被真正应用，仍要端口这一条来证）。
+
+  ★ 数据目录 `/var/lib/valkey` 是**数据**：`keep_data` 必须保住它（规范 §12.13.1）；
+  配置文件是我们自造的 `/etc/sysconfig/valkey`，只由 `remove_config` 删。
+
+params:
+  - name: port
+    label: 监听端口
+    type: int
+    required: true
+    min: 1024
+    max: 65535
+    default: 6379
+    help: '默认 6379。改端口后重跑一次配方即可：会写新配置并触发重启。'
+  - name: bind
+    label: 监听地址
+    type: enum
+    required: true
+    choices: [仅本机, 所有网卡]
+    values: ["127.0.0.1", "0.0.0.0"]
+    default: 仅本机
+    help: '默认只监听本机。★ 包自带的配置里 `protected-mode yes` 仍在生效，但「所有网卡」等于把它暴露到网络上，请想清楚再选。'
+  - name: maxmemory_mb
+    label: 最大内存（MB）
+    type: int
+    required: true
+    min: 64
+    max: 2048
+    default: 128
+    help: '★ 小内存别调大：靶机只有 3.6G 内存，128M 足够。超过上限 Valkey 会拒绝写入并报 OOM。'
+
+steps:
+  - name: install
+    title: 安装 valkey
+    action: pkg.install
+    args: { package: valkey }
+    note: >
+      ★ 客户端 `valkey-cli` 与 server **在同一个包里**（实测 `pkg.installed` 查文件归属确认），
+      不用额外装第二个包 —— 这一点与 MariaDB 不同（那边的 client 是独立包）。
+
+  - name: render_conf
+    title: 渲染站点定制（/etc/sysconfig/valkey）
+    template: valkey/sysconfig
+    dest: /etc/sysconfig/valkey
+    mode: "0644"
+    notify: [restart_valkey]
+    note: >
+      ★ 内容 sha256 与目标机现有一致时**不写盘**（规范 §12.4）—— 于是幂等的那一次
+      既不产生变更、也不触发重启。
+
+  - name: start
+    title: 启动服务
+    action: svc.start
+    args: { unit: valkey }
+    note: >
+      ★ 这是**唯一**能证明"我们那份 OPTIONS 被 systemd 正确展开、Valkey 也接受"的一步：
+      参数写错 → `valkey-server` 直接拒绝启动 → 这一步真实失败（不会静默变绿）。
+
+  - name: enable
+    title: 设为开机自启
+    action: svc.enable
+    args: { unit: valkey }
+
+  - name: restart_valkey
+    title: 重启 Valkey（仅当配置真的变了）
+    action: svc.restart
+    args: { unit: valkey }
+    trigger_only: true
+    note: '由 render_conf 的 notify 唤起；第二次跑（内容没变）**根本不会执行** —— 幂等靠这个成立。'
+
+health:
+  - expect:
+      state: { unit: valkey, equals: active }
+  - expect:
+      responds: { action: db.valkey-ping, args: { port: "{{ port }}" } }
+  - expect:
+      port_open: "{{ port }}"
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: valkey }
+  disable:
+    - action: svc.disable
+      args: { unit: valkey }
+  # ★ 只删**配方自己写出来的**那一个文件（它不属于任何包：实测装完后它并不存在）
+  remove_config:
+    - action: file.remove
+      args: { path: /etc/sysconfig/valkey }
+  # ★ 数据目录（RDB 就在里面）：只在「全删」时删
+  purge_paths:
+    - /var/lib/valkey
+  # ★ 「保留数据」是一条**承诺**，报告里必须念出来，而且要被真验（规范 §12.13.1）
+  keep_data:
+    - /var/lib/valkey
+  remove_packages:
+    - valkey
+  stop_confirm_text: 我已确认要停止服务
+  purge_confirm_text: 我已确认全删
+  # ★ 停止 / 「保留数据」卸载**之后**应当成立的事实（规范 §12.6.3）：
+  #   ★★ 用**端口没人听**这种"外部可观测"判据，**不用** `state: {equals: inactive}` ——
+  #     后者依赖"单元还驻留在 systemd 内存里"，`svc.disable` 之后它会从内存卸载（T5 真跑踩过）。
+  health:
+    - expect:
+        free_port: "{{ port }}"

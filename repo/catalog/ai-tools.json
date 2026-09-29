@@ -1,0 +1,995 @@
+{
+  "generated_from": "catalog/actions/*.yaml（risk: green）",
+  "rule": "★ 工具面只含 green；本文件由 tools/ai-export.py 生成，改动作后需重新生成（自检断言 ⑶ 会对账）",
+  "tool_total": 66,
+  "action_total": 118,
+  "request_tool": "request_action",
+  "request_rule": "★ `yellow` 只可**请求**（`request_action` ⇒ 一张待确认卡片）；`red` 连请求都不许发（§12.96.1）。",
+  "kb_tool": "kb_search",
+  "kb_rule": "★ `kb_search` 只**读**本地结构化记录（会话 / 人的问句 / 工具调用 / 变更请求 / 任务结论）；★ **不含** AI 自己的历史回答（不可核的散文，§12.106.2）；★ 命中不到会明说「没有记录」并交代查了哪些范围（§12.106.3）。",
+  "requestable": [
+    {
+      "id": "cron.upsert",
+      "title": "新增/更新定时任务",
+      "domain": "E",
+      "risk": "yellow",
+      "summary": "往 /etc/cron.d/ 写一条工作台管理的定时任务（不碰你自己的 crontab）"
+    },
+    {
+      "id": "file.push",
+      "title": "上传文件到目标机",
+      "domain": "C",
+      "risk": "yellow",
+      "summary": "从受控目录上传文件（覆盖前自动备份目标文件），并用 sha256 双向校验"
+    },
+    {
+      "id": "fw.port-open",
+      "title": "防火墙放行端口",
+      "domain": "F",
+      "risk": "yellow",
+      "summary": "firewall-cmd 放行端口（永久或仅运行时），并自证规则真的在运行时生效"
+    },
+    {
+      "id": "pkg.install",
+      "title": "安装软件包",
+      "domain": "H",
+      "risk": "yellow",
+      "summary": "dnf 安装指定包，装完用 rpm -q 自证版本，并给出可回退的事务号"
+    },
+    {
+      "id": "svc.daemon-reload",
+      "title": "重载 systemd 单元定义",
+      "domain": "E",
+      "risk": "yellow",
+      "summary": "systemctl daemon-reload —— 让 systemd 重新读盘上的单元文件与 drop-in（★ 它不重启服务）"
+    },
+    {
+      "id": "svc.enable",
+      "title": "设置服务开机自启",
+      "domain": "E",
+      "risk": "yellow",
+      "summary": "systemctl enable（幂等），并自证 is-enabled 真的是 enabled"
+    },
+    {
+      "id": "svc.reset-failed",
+      "title": "清除单元失败状态",
+      "domain": "E",
+      "risk": "yellow",
+      "summary": "systemctl reset-failed —— 把 failed 状态清掉（★ 它不修根因、不启停服务、不清日志）"
+    },
+    {
+      "id": "svc.restart",
+      "title": "重启服务",
+      "domain": "E",
+      "risk": "yellow",
+      "summary": "重启一个 systemd 服务，并用「启动时间戳变了」自证真的重启了（不是\"命令返回 0\"）"
+    },
+    {
+      "id": "svc.start",
+      "title": "启动服务",
+      "domain": "E",
+      "risk": "yellow",
+      "summary": "启动一个 systemd 服务，并自证它真的处于 active（不是\"命令返回 0\"就算成功）"
+    },
+    {
+      "id": "sysctl.set",
+      "title": "写内核参数",
+      "domain": "A",
+      "risk": "yellow",
+      "summary": "写一个内核参数并自证生效，同时持久化到 /etc/sysctl.d/（★ 只增不降）"
+    },
+    {
+      "id": "vm.snapshot-create",
+      "title": "拍摄快照（变更前护栏）",
+      "domain": "M",
+      "risk": "yellow",
+      "summary": "给虚拟机打一条快照 —— 比文件级备份更强的一层：整机回滚"
+    },
+    {
+      "id": "vm.start",
+      "title": "启动虚拟机",
+      "domain": "M",
+      "risk": "yellow",
+      "summary": "把一台关机的虚拟机开起来 —— ★ 返回 0 只是\"VMware 收下了\"，判据在后面那条探针上"
+    },
+    {
+      "id": "vm.stop",
+      "title": "关闭虚拟机（优雅关机）",
+      "domain": "M",
+      "risk": "yellow",
+      "summary": "请 guest 自己关机（soft）—— 会等服务停完再断电，不是拔电源"
+    }
+  ],
+  "tools": [
+    {
+      "id": "block.overview",
+      "model_name": "block__overview",
+      "domain": "D",
+      "risk": "green",
+      "title": "磁盘与分区总览",
+      "summary": "块设备 → 分区 → 挂载点一屏看清（含文件系统类型与容量）",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "container.overview",
+      "model_name": "container__overview",
+      "domain": "J",
+      "risk": "green",
+      "title": "容器总览",
+      "summary": "容器引擎版本、容器（含已停止）、镜像、卷与网络一屏看清（docker / podman，全部只读）",
+      "param_count": 1,
+      "required": [
+        "engine"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：目标机要有容器运行时与容器"
+    },
+    {
+      "id": "container.runtime",
+      "model_name": "container__runtime",
+      "domain": "J",
+      "risk": "green",
+      "title": "容器运行时真探活",
+      "summary": "走 containerd 的 API 真问一句（ctr version，看得到 Server 段才算通）+ 本地镜像缓存清单",
+      "param_count": 1,
+      "required": [
+        "images_limit"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：目标机要有容器运行时（ctr）"
+    },
+    {
+      "id": "db.mariadb-ping",
+      "model_name": "db__mariadb_ping",
+      "domain": "E",
+      "risk": "green",
+      "title": "MariaDB 探活",
+      "summary": "真问一句 MariaDB 活着吗（mariadb-admin ping），只读、不改任何状态",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": "★ 依赖：目标机要装过 mariadb（没装 = 结论「没装」，不是故障）"
+    },
+    {
+      "id": "db.valkey-ping",
+      "model_name": "db__valkey_ping",
+      "domain": "E",
+      "risk": "green",
+      "title": "Valkey 探活",
+      "summary": "真问一句 Valkey 活着吗（valkey-cli PING → PONG），只读、不改任何状态",
+      "param_count": 1,
+      "required": [
+        "port"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：目标机要装过 valkey（没装 = 结论「没装」，不是故障）"
+    },
+    {
+      "id": "disk.bigfiles",
+      "model_name": "disk__bigfiles",
+      "domain": "C",
+      "risk": "green",
+      "title": "大文件排行",
+      "summary": "指定路径下超过阈值的大文件排行（按体积降序，条数可调）",
+      "param_count": 3,
+      "required": [
+        "path"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "disk.topdir",
+      "model_name": "disk__topdir",
+      "domain": "C",
+      "risk": "green",
+      "title": "目录体积排行",
+      "summary": "指定路径的子目录体积排行（已按大小降序，可设深度与体积下限）",
+      "param_count": 4,
+      "required": [
+        "path"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "disk.usage",
+      "model_name": "disk__usage",
+      "domain": "C",
+      "risk": "green",
+      "title": "磁盘用量总览",
+      "summary": "根分区用量与 inode 一眼确认，附全部挂载点（含高水位判读）",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "file.cat",
+      "model_name": "file__cat",
+      "domain": "C",
+      "risk": "green",
+      "title": "读文件原文",
+      "summary": "读一个配置文件/脚本的原文（只允许白名单目录；密钥类永不读）",
+      "param_count": 1,
+      "required": [
+        "path"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "file.grep",
+      "model_name": "file__grep",
+      "domain": "C",
+      "risk": "green",
+      "title": "文件内容检索",
+      "summary": "在指定目录/文件里按关键字检索（带上下文行），返回命中行而不是让你自己敲 grep 参数",
+      "param_count": 3,
+      "required": [
+        "path",
+        "keyword"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "file.manifest",
+      "model_name": "file__manifest",
+      "domain": "C",
+      "risk": "green",
+      "title": "目录清单与小文件摘要",
+      "summary": "一个目录的条目清单（类型/字节/时间/权限/属主/路径）+ 小文件的 sha256（留证用，只读）",
+      "param_count": 3,
+      "required": [
+        "path",
+        "depth"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "file.pull",
+      "model_name": "file__pull",
+      "domain": "C",
+      "risk": "green",
+      "title": "从目标机取回文件",
+      "summary": "把目标机上的文件下载到管理机 var/downloads/（取证、对比、留档）",
+      "param_count": 1,
+      "required": [
+        "remote_path"
+      ],
+      "cost_note": "★ 代价：会在【管理机】落盘（repo/var/downloads/，文件名与远端一致）",
+      "require_note": ""
+    },
+    {
+      "id": "file.stat",
+      "model_name": "file__stat",
+      "domain": "C",
+      "risk": "green",
+      "title": "路径状态",
+      "summary": "一个文件或目录在不在（ls -ld；退出码 2 = 不存在，那是结论不是错误）",
+      "param_count": 1,
+      "required": [
+        "path"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "host.cgroup",
+      "model_name": "host__cgroup",
+      "domain": "A",
+      "risk": "green",
+      "title": "cgroup 版本与控制器",
+      "summary": "cgroup v1 还是 v2、挂载点、可用控制器与子树委派开关（容器主机的必查项）",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "host.checkup",
+      "model_name": "host__checkup",
+      "domain": "A",
+      "risk": "green",
+      "title": "一键体检",
+      "summary": "12 项体检一次跑完，给「总判 + 每项判定 + 下一步」的结论式报告（只读）",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "★ 代价：聚合十余项检查、耗时较长；★ 不要与它内部的子动作重复调用（同一件事查两遍）",
+      "require_note": "★ 依赖：无（缺工具会降级，不拖垮报告）"
+    },
+    {
+      "id": "host.datetime",
+      "model_name": "host__datetime",
+      "domain": "A",
+      "risk": "green",
+      "title": "时间与时区",
+      "summary": "时区、系统时间、RTC 与 NTP 同步状态（不同步直接给排查方向）",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "host.identity-show",
+      "model_name": "host__identity_show",
+      "domain": "A",
+      "risk": "green",
+      "title": "读出这台机器的身份现状（只读）",
+      "summary": "machine-id / SSH host key 指纹 / 主机名 / 静态 IP —— 身份四项一次读全",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "host.kernelparams",
+      "model_name": "host__kernelparams",
+      "domain": "A",
+      "risk": "green",
+      "title": "内核参数与模块",
+      "summary": "关键内核参数（转发 / 内存 / 并发三件套 / 安全开关）+ 参数总量 + 已加载模块数与前几条（只读）",
+      "param_count": 1,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "host.logins",
+      "model_name": "host__logins",
+      "domain": "B",
+      "risk": "green",
+      "title": "登录审计",
+      "summary": "当前在线、最近登录、失败登录与各账号最后登录时间（含异常登录判读）",
+      "param_count": 2,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "host.overview",
+      "model_name": "host__overview",
+      "domain": "A",
+      "risk": "green",
+      "title": "主机概览",
+      "summary": "一次给全：发行版、内核、CPU、内存、负载、运行时长",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "k8s.certs",
+      "model_name": "k8s__certs",
+      "domain": "J",
+      "risk": "green",
+      "title": "集群证书到期体检",
+      "summary": "kubeadm 的证书到期表（剩余天数 / 到期日 / CA）一次取全 —— ★ 只读，不做续期",
+      "param_count": 1,
+      "required": [
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.config",
+      "model_name": "k8s__config",
+      "domain": "J",
+      "risk": "green",
+      "title": "配置与存储",
+      "summary": "ConfigMap / Secret / PVC / PV / StorageClass 一次取全 —— ★ Secret 只给键名与条数，值一个字节都不读",
+      "param_count": 3,
+      "required": [
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.describe",
+      "model_name": "k8s__describe",
+      "domain": "J",
+      "risk": "green",
+      "title": "对象详情（describe）",
+      "summary": "按名字取一个对象的详情：kind 白名单 + 名字 + 命名空间 —— ★ \"去哪一行复核\"的那只手",
+      "param_count": 4,
+      "required": [
+        "kind",
+        "name",
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.diagnose",
+      "model_name": "k8s__diagnose",
+      "domain": "J",
+      "risk": "green",
+      "title": "排障结论化（成因清单）",
+      "summary": "扫全集群的 Pod，直接给**成因清单**（Pending / CrashLoopBackOff / ImagePullBackOff / OOMKilled 各自点名）—— 不用自己读 describe",
+      "param_count": 1,
+      "required": [
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.events",
+      "model_name": "k8s__events",
+      "domain": "J",
+      "risk": "green",
+      "title": "事件时间线",
+      "summary": "全命名空间事件按时间排（★ Warning 单独一段 ＋ 条数）—— \"刚刚发生了什么\"最直接的证据",
+      "param_count": 1,
+      "required": [
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.logs",
+      "model_name": "k8s__logs",
+      "domain": "J",
+      "risk": "green",
+      "title": "Pod 日志快照",
+      "summary": "一次取一段（最近 N 行 / 上一个已退出的容器）★ 快照式，不是流式",
+      "param_count": 6,
+      "required": [
+        "pod",
+        "namespace",
+        "mode",
+        "tail",
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.nodes",
+      "model_name": "k8s__nodes",
+      "domain": "J",
+      "risk": "green",
+      "title": "集群节点树与就绪状态",
+      "summary": "kubectl 原文（节点表 / kube-system Pod / 存储对象）+ 等所有节点 Ready —— \"集群真的可用了吗\"的判据家",
+      "param_count": 2,
+      "required": [
+        "wait_seconds",
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.pods",
+      "model_name": "k8s__pods",
+      "domain": "J",
+      "risk": "green",
+      "title": "Pod 总览",
+      "summary": "全部 Pod 一屏取全 ＋ ★ 重启次数排行 ＋ 非 Running 的单独一段；判读用\"状态白名单\"而不是\"坏状态黑名单\"",
+      "param_count": 1,
+      "required": [
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.wait",
+      "model_name": "k8s__wait",
+      "domain": "J",
+      "risk": "green",
+      "title": "等一个对象到达指定状态",
+      "summary": "用 `kubectl wait` 的**退出码**回答\"它到底成了没有\" —— 对象名与条件都由参数给，命令写死在 YAML 里",
+      "param_count": 6,
+      "required": [
+        "kind",
+        "name",
+        "namespace",
+        "condition",
+        "timeout_seconds",
+        "kubeconfig"
+      ],
+      "cost_note": "★ 代价：会轮询等待（可能长时间占用），必须给 wait_seconds",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "k8s.workloads",
+      "model_name": "k8s__workloads",
+      "domain": "J",
+      "risk": "green",
+      "title": "工作负载总览",
+      "summary": "Deployment / StatefulSet / DaemonSet / Job / CronJob 一次取全 —— ★ 期望与就绪逐行对照，差在哪一眼看出",
+      "param_count": 1,
+      "required": [
+        "kubeconfig"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "kernel.log",
+      "model_name": "kernel__log",
+      "domain": "I",
+      "risk": "green",
+      "title": "内核日志与 OOM",
+      "summary": "内核错误/告警、本轮错误级日志与 OOM（内存被杀进程）检索",
+      "param_count": 1,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "log.view",
+      "model_name": "log__view",
+      "domain": "E",
+      "risk": "green",
+      "title": "日志查看器",
+      "summary": "按服务、时间范围、级别、关键字检索日志（结论只给重点，完整内容在步骤留证里）",
+      "param_count": 6,
+      "required": [
+        "unit"
+      ],
+      "cost_note": "★ 代价：大日志会被截断（截断处在结论里标明）",
+      "require_note": ""
+    },
+    {
+      "id": "mon.alerts",
+      "model_name": "mon__alerts",
+      "domain": "J",
+      "risk": "green",
+      "title": "监控 · 当前告警（在响什么）",
+      "summary": "读 /api/v1/alerts：firing / pending 各有几条；可按\"必须出现某条\"与\"必须不出现某条\"当场判定",
+      "param_count": 3,
+      "required": [
+        "prom_base"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：要在装了监控栈的那台机器上跑（本环境是 node-03）"
+    },
+    {
+      "id": "mon.alerts-received",
+      "model_name": "mon__alerts_received",
+      "domain": "J",
+      "risk": "green",
+      "title": "监控 · 收端已收到的告警（送出去了没有）",
+      "summary": "读 Webhook 收端的 append-only JSONL：一共收到几次投递、每次带哪些告警，并可当场判\"某条必须到过\"",
+      "param_count": 2,
+      "required": [
+        "sink"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：要在装了监控栈的那台机器上跑（本环境是 node-03）"
+    },
+    {
+      "id": "mon.am-alerts",
+      "model_name": "mon__am_alerts",
+      "domain": "J",
+      "risk": "green",
+      "title": "监控 · Alertmanager 告警面（含抑制状态）",
+      "summary": "读 Alertmanager 的 /api/v2/alerts：有几条 active、几条被 suppressed（抑制），并可当场判定上下界",
+      "param_count": 3,
+      "required": [
+        "am_base",
+        "expect_active_max",
+        "expect_suppressed_min"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：要在装了监控栈的那台机器上跑（本环境是 node-03）"
+    },
+    {
+      "id": "mon.overview",
+      "model_name": "mon__overview",
+      "domain": "J",
+      "risk": "green",
+      "title": "监控栈总览（版本 / 单元 / 监听面 / 存储）",
+      "summary": "一次给全：四个组件的版本号、systemd 单元状态、有没有哪一处监听了 0.0.0.0、时序数据占多大",
+      "param_count": 1,
+      "required": [
+        "root"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：要在装了监控栈的那台机器上跑（本环境是 node-03）"
+    },
+    {
+      "id": "mon.rules",
+      "model_name": "mon__rules",
+      "domain": "J",
+      "risk": "green",
+      "title": "监控 · 告警规则生效面（写了 vs 在跑）",
+      "summary": "读 /api/v1/rules：几条规则在跑、有没有\"没带 for 的\"、以及文件与生效面是否逐条对得上",
+      "param_count": 3,
+      "required": [
+        "prom_base",
+        "rules_file",
+        "min_rules"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：要在装了监控栈的那台机器上跑（本环境是 node-03）"
+    },
+    {
+      "id": "mon.targets",
+      "model_name": "mon__targets",
+      "domain": "J",
+      "risk": "green",
+      "title": "监控 · 抓取目标健康度（在采没在采）",
+      "summary": "读 Prometheus 的 /api/v1/targets：几条目标、几条 up、几条 down，并当场判\"有没有 down\"",
+      "param_count": 2,
+      "required": [
+        "prom_base",
+        "min_up"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：要在装了监控栈的那台机器上跑（本环境是 node-03）"
+    },
+    {
+      "id": "net.addr",
+      "model_name": "net__addr",
+      "domain": "F",
+      "risk": "green",
+      "title": "网卡与地址",
+      "summary": "每张网卡的地址、状态、MTU、MAC，附默认网关与 NetworkManager 连接名",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "net.dns",
+      "model_name": "net__dns",
+      "domain": "F",
+      "risk": "green",
+      "title": "DNS 解析链路",
+      "summary": "DNS 服务器、本地 hosts 与一次完整解析验证（用的就是应用真实走的链路）",
+      "param_count": 1,
+      "required": [
+        "name"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "net.firewall",
+      "model_name": "net__firewall",
+      "domain": "F",
+      "risk": "green",
+      "title": "防火墙规则",
+      "summary": "firewalld 状态、当前放行的服务与端口，以及\"改了没持久化\"的差异",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "net.http",
+      "model_name": "net__http",
+      "domain": "F",
+      "risk": "green",
+      "title": "HTTP 探测",
+      "summary": "探测一个 URL：响应码、建连与总耗时、TLS 校验结果，附响应头",
+      "param_count": 2,
+      "required": [
+        "url"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "net.ping",
+      "model_name": "net__ping",
+      "domain": "F",
+      "risk": "green",
+      "title": "连通性与路径",
+      "summary": "ping 目标并追踪路径，直接给出丢包/延迟判读",
+      "param_count": 2,
+      "required": [
+        "target"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "net.port",
+      "model_name": "net__port",
+      "domain": "F",
+      "risk": "green",
+      "title": "端口占用",
+      "summary": "谁占了端口：端口 → 进程/PID → 归属 systemd 服务（可只查某一个端口）",
+      "param_count": 1,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "net.route",
+      "model_name": "net__route",
+      "domain": "F",
+      "risk": "green",
+      "title": "路由与邻居",
+      "summary": "默认网关、完整路由表与邻居（ARP）表，含二层异常判读",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "nfs.export-check",
+      "model_name": "nfs__export_check",
+      "domain": "F",
+      "risk": "green",
+      "title": "NFS 导出清单",
+      "summary": "问本机的 mountd：现在到底导出了哪些目录（导出是否真的生效），只读",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": "★ 依赖：目标机要有 NFS 导出（没有导出 = 结论本身，不是故障）"
+    },
+    {
+      "id": "perf.overview",
+      "model_name": "perf__overview",
+      "domain": "I",
+      "risk": "green",
+      "title": "负载与资源概览",
+      "summary": "负载 / CPU / 内存 / 换页 / IO 与中断，一屏判断\"这台机器累不累\"",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "pkg.installed",
+      "model_name": "pkg__installed",
+      "domain": "H",
+      "risk": "green",
+      "title": "已装软件与文件归属",
+      "summary": "已装包总数、某个包的详情，或某个文件属于哪个包（rpm 查询，全部离线）",
+      "param_count": 2,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "pkg.outdated",
+      "model_name": "pkg__outdated",
+      "domain": "H",
+      "risk": "green",
+      "title": "可升级清单",
+      "summary": "这台机器上装了哪些\"仓库里有更新\"的包（升级预检，只读），等价于 dnf check-update",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "★ 代价：会刷新目标机的包缓存（dnf 取元数据，写 /var/cache/dnf）",
+      "require_note": ""
+    },
+    {
+      "id": "pkg.search",
+      "model_name": "pkg__search",
+      "domain": "H",
+      "risk": "green",
+      "title": "包搜索",
+      "summary": "按关键字搜可用包，或查出\"哪个包提供某个命令\"（要装工具时必备）",
+      "param_count": 2,
+      "required": [
+        "keyword"
+      ],
+      "cost_note": "★ 代价：会刷新目标机的包缓存（含 makecache）",
+      "require_note": ""
+    },
+    {
+      "id": "proc.overview",
+      "model_name": "proc__overview",
+      "domain": "E",
+      "risk": "green",
+      "title": "进程总览",
+      "summary": "负载与进程数、按 CPU/内存排序的 TOP 进程、按用户或名称过滤、进程树",
+      "param_count": 4,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "registry.probe",
+      "model_name": "registry__probe",
+      "domain": "J",
+      "risk": "green",
+      "title": "镜像仓库可达性",
+      "summary": "一次探测一组容器镜像仓库（401 = 仓库活着 / 000 = 不可达），并给一张对照表",
+      "param_count": 2,
+      "required": [],
+      "cost_note": "",
+      "require_note": "★ 依赖角色：需要能读集群的入口（控制面；★ 工作节点上没有 kubeconfig 是正常现象，不是集群故障）"
+    },
+    {
+      "id": "sec.avc",
+      "model_name": "sec__avc",
+      "domain": "G",
+      "risk": "green",
+      "title": "SELinux 拒绝记录",
+      "summary": "指定时间范围内的 AVC 拒绝记录（含 auditd 是否可信的说明）",
+      "param_count": 1,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "sec.cert",
+      "model_name": "sec__cert",
+      "domain": "G",
+      "risk": "green",
+      "title": "证书到期检查",
+      "summary": "检查一个 PEM 证书的主体、签发者与到期时间（含 30 天 / 7 天预警）",
+      "param_count": 1,
+      "required": [
+        "path"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：目标机要有 openssl（本环境只有 docker-01 有）"
+    },
+    {
+      "id": "sec.selinux",
+      "model_name": "sec__selinux",
+      "domain": "G",
+      "risk": "green",
+      "title": "SELinux 状态",
+      "summary": "当前模式与配置文件模式是否一致、策略名、是否 Enforcing",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "sec.ssh-harden",
+      "model_name": "sec__ssh_harden",
+      "domain": "G",
+      "risk": "green",
+      "title": "SSH 加固与密钥查看",
+      "summary": "sshd 最终生效的加固项（sshd -T）+ root 授权公钥数量与指纹（只读）",
+      "param_count": 1,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "svc.configtest",
+      "model_name": "svc__configtest",
+      "domain": "E",
+      "risk": "green",
+      "title": "配置语法校验",
+      "summary": "校验服务配置的语法（内置静态表：nginx -t / sshd -t / mariadbd --verbose --help），不重启、不改动任何文件",
+      "param_count": 1,
+      "required": [
+        "binary"
+      ],
+      "cost_note": "",
+      "require_note": "★ 依赖：目标机要装了对应程序（nginx / sshd / mariadbd）"
+    },
+    {
+      "id": "svc.list",
+      "model_name": "svc__list",
+      "domain": "E",
+      "risk": "green",
+      "title": "服务总览",
+      "summary": "谁在跑、谁失败了、失败原因是什么",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "svc.status",
+      "model_name": "svc__status",
+      "domain": "E",
+      "risk": "green",
+      "title": "单元状态（单个）",
+      "summary": "一个 systemd 单元的加载/运行/自启状态、单元文件与 drop-in 路径，一次给全",
+      "param_count": 1,
+      "required": [
+        "unit"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "timer.list",
+      "model_name": "timer__list",
+      "domain": "E",
+      "risk": "green",
+      "title": "定时任务",
+      "summary": "systemd 定时器与用户 crontab 一览（含下次执行时间与失败项）",
+      "param_count": 1,
+      "required": [],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "vm.ip",
+      "model_name": "vm__ip",
+      "domain": "M",
+      "risk": "green",
+      "title": "虚拟机 IP（问 guest 自己）",
+      "summary": "通过 VMware Tools 问 guest 要 IP —— 用于确认\"它起来之后地址是哪一个\"",
+      "param_count": 1,
+      "required": [
+        "vm"
+      ],
+      "cost_note": "★ 代价：本机执行（经 VMware Tools 问 guest 要地址）；★ 关机的 VM 上这条**会失败**（那是结论，不是故障），且它不证明 ssh 通",
+      "require_note": "★ 依赖：本机 `vmrun` ＋ guest 里装了 VMware Tools；★ 没有 Tools ⇒ 读不到地址（不是「VM 不在」）"
+    },
+    {
+      "id": "vm.list",
+      "model_name": "vm__list",
+      "domain": "M",
+      "risk": "green",
+      "title": "虚拟机清单（含归属）",
+      "summary": "一眼看清宿主机上所有虚拟机：哪些在跑、哪些归本项目管、哪些只读可见不可操作",
+      "param_count": 0,
+      "required": [],
+      "cost_note": "★ 代价：本机执行（`vmrun list` ＋ 扫 allow_vmx_dirs 下的 .vmx ＋ 只读 inventory.vmls）；★ 很便宜，但读的是**宿主机**不是目标机",
+      "require_note": "★ 依赖：**宿主机**上跑得动 `vmrun.exe`（本机实测 `C:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe`）；★ 不需要 ssh 到任何目标机"
+    },
+    {
+      "id": "vm.snapshot-list",
+      "model_name": "vm__snapshot_list",
+      "domain": "M",
+      "risk": "green",
+      "title": "虚拟机快照链",
+      "summary": "列出这台虚拟机的全部快照（★ 名字是逐字匹配的，含空格与中文）",
+      "param_count": 1,
+      "required": [
+        "vm"
+      ],
+      "cost_note": "★ 代价：本机执行（`vmrun listSnapshots`）；★ 对**已关机**的 VM 也能读——回滚某条快照**不必先开机**",
+      "require_note": "★ 依赖：本机 `vmrun`；★ 只读，关机也读得到"
+    },
+    {
+      "id": "vm.status",
+      "model_name": "vm__status",
+      "domain": "M",
+      "risk": "green",
+      "title": "虚拟机状态",
+      "summary": "这台虚拟机现在是跑是停（问 VMware 自己）、快照链上有哪些、归谁管",
+      "param_count": 1,
+      "required": [
+        "vm"
+      ],
+      "cost_note": "★ 代价：本机执行（问 VMware 两次：运行清单 ＋ 快照链）；★ 电源状态问的是 VMware 自己，不是看文件在不在",
+      "require_note": "★ 依赖：同 `vm.list` —— 本机 `vmrun`；★ 对象必须是**已登记**或**当次点名**的 VM（红线 12）"
+    },
+    {
+      "id": "vm.vmx-read",
+      "model_name": "vm__vmx_read",
+      "domain": "M",
+      "risk": "green",
+      "title": "读虚拟机的 .vmx 身份字段（只读）",
+      "summary": "VMware 的 UUID / MAC / 显示名 / guestOS / 内存 —— ★ 只读，一个字都不改",
+      "param_count": 1,
+      "required": [
+        "vm"
+      ],
+      "cost_note": "",
+      "require_note": ""
+    },
+    {
+      "id": "vm.wait-guest",
+      "model_name": "vm__wait_guest",
+      "domain": "M",
+      "risk": "green",
+      "title": "等虚拟机就绪（guest 起来）",
+      "summary": "等到 guest 真的起来了再往下走 —— ★ 它是\"起来了\"的判据，不是\"能 ssh 进去\"的判据",
+      "param_count": 2,
+      "required": [
+        "vm",
+        "timeout_sec"
+      ],
+      "cost_note": "★ 代价：**会轮询等待**（最多 timeout_sec 秒，默认 180）；★ 它回答「guest 起来了吗」，**不回答**「能不能 ssh 进去」",
+      "require_note": "★ 依赖：本机 `vmrun` ＋ guest 里的 VMware Tools；★ 等不到会**如实判红**"
+    }
+  ]
+}

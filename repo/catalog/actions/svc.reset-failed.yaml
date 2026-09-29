@@ -1,0 +1,150 @@
+# ============================================================
+# 动作：清除单元失败状态（reset-failed）
+# 来源：T8·S2 —— T6 让用户手敲过、T7 给了"一次性"授权却没做动作的那件（规范 §12.26）
+# 风险：yellow
+# ============================================================
+
+id: svc.reset-failed
+title: 清除单元失败状态
+summary: systemctl reset-failed —— 把 failed 状态清掉（★ 它不修根因、不启停服务、不清日志）
+domain: E
+risk: yellow
+priority: P1
+tags: [变更, 服务, systemd]
+
+note: |
+  ★ 为什么需要它：凡"故意失败"的演练（自检夹具、故障演练）都会在**体检里长期留痕** ——
+  T6 当时是让用户**手敲一条 ssh 命令**才清掉的，那不该是常态。
+
+  ★★ **口径（§12.26）：它只做一件事，边界要写死**
+
+  | 它做什么 | 它**不**做什么 |
+  |---|---|
+  | 把单元的 `failed` 状态**清掉** | ❌ **不改**单元定义（那是「重载单元定义」）❌ **不启不停**服务（那是启停动作）❌ **不清**日志（`journalctl` 是另一件事）❌ **不修**让它失败的原因（那是排障） |
+
+  ★★ **「复位」不是「修好了」**：本动作的结论里会明说「**状态已清，根因未处理**」。
+  它与「服务总览」的"失败服务检出"是一对：**一个负责发现，一个负责复位**。
+
+  ★ 「对照」怎么给的：清之前与清之后各读一次
+  （`systemctl is-system-running` 给系统总判；`systemctl list-units --state=failed --no-legend` 给失败清单），
+  所以"清掉了几个"是**看得见**的，不是一句"我清了"。
+
+confirm:
+  title: 确认清除失败状态
+  body: |
+    即将在「{host.name}」（{host.address}）上执行 `systemctl reset-failed {{ unit }}`
+    （留空 = 全部单元）。
+
+    会发生什么：这些单元的 `failed` 状态被清掉，体检报告里不再报红。
+    ★ **它不会让服务变好** —— 如果根因还在，下次它照样会失败；
+    本动作只是把"已经失败过"这个记录去掉。
+  confirm_text: 我已确认要清除失败状态
+
+params:
+  - name: unit
+    label: 只清这个单元
+    type: str
+    required: false
+    pattern: '^[A-Za-z0-9@._-]{1,64}\.(service|socket|timer|target|mount|path)$'
+    placeholder: aoc-fail.service
+    help: '留空 = 清掉**全部**单元的失败状态（等价于不带参数的 systemctl reset-failed）'
+
+steps:
+  - name: health_before
+    title: 清之前的系统总判
+    run: [systemctl, is-system-running, --no-pager]
+    parser: raw
+    ok_exit_codes: [0, 1, 2, 3, 4]
+    timeout: 30
+    note: >
+      输出 running / degraded / starting / maintenance / stopping。
+      ★ 有失败单元时它给 **degraded**（退出码 1）—— 那是**结论**不是错误（§9.6 同族），
+      所以 0~4 全部声明为"正常报告"。★ 它同时也是本动作的自证来源（结论永远落在 stdout）。
+
+  - name: fail_before
+    title: 清之前的失败清单（对照物）
+    run: [systemctl, list-units, --state=failed, --no-legend, --no-pager]
+    parser: raw
+    optional: true
+    timeout: 30
+    note: >
+      ★ `--no-legend` 去掉表头与页脚 ⇒ 剩下的"一行一个失败单元"可以直接拿来前后对照。
+      一个都没有时它是**空的** —— 那是"没有失败"这个**结论**，不是"问不出来"（§10.6.3）。
+
+  - name: fail_count_before
+    title: 清之前的失败单元**个数**（★ 本步是判据来源：一行一条）
+    run: [systemctl, list-units, --state=failed, --no-legend, --no-pager]
+    parser: line_count
+    timeout: 30
+    note: >
+      ★★ 与上一步是**同一条命令、两个解析器**（§12.23 / `file.stat` 的同一个做法）：
+      `raw` 在"一个失败单元都没有"时给出**空**，而 `raw` 的空是 `None`（"空结果 ≠ 空数据"），
+      拿它当对照 ⇒ `changed` 只能判 **unknown**；
+      而 `line_count` 对空输出给 **0** —— 那是**结论**（"没有失败单元"），
+      于是"清之前 0 个、清之后 0 个"能判成 **没变（幂等）** 而不是"不知道"。
+
+  - name: reset
+    title: 清除失败状态
+    run:
+      - systemctl
+      - reset-failed
+      - { when: unit, value: "{{ unit }}" }
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★ 成功时**什么都不输出** ⇒ 不能当自证来源（§9.6）；自证交给 `health_after`。
+      ★ `unit` 留空时最后那个元素渲染成空 ⇒ 引擎丢掉空元素 ⇒ 等价于全量 `reset-failed`。
+
+  - name: health_after
+    title: 清之后的系统总判
+    run: [systemctl, is-system-running, --no-pager]
+    parser: raw
+    ok_exit_codes: [0, 1, 2, 3, 4]
+    timeout: 30
+
+  - name: fail_after
+    title: 清之后的失败清单（与前一步对照）
+    run: [systemctl, list-units, --state=failed, --no-legend, --no-pager]
+    parser: raw
+    optional: true
+    timeout: 30
+
+  - name: fail_count_after
+    title: 清之后的失败单元**个数**（★ 前后对照算 `changed`）
+    run: [systemctl, list-units, --state=failed, --no-legend, --no-pager]
+    parser: line_count
+    timeout: 30
+    note: ★ 与 `fail_count_before` 配对：两个数字一减，就知道这次到底清掉了几个。
+
+verify:
+  - name: ★★ 必须能读到系统总判（这一步问不出来才算故障）
+    from: health_after
+    on_missing: >
+      `systemctl is-system-running` 没有输出 —— 目标机可能不是 systemd 系统（或权限不足）。
+      ★ 反过来：**degraded 不是故障**（它就是"有东西失败过"的结论），本动作照旧 ok。
+  - name: 必须能读到清之后的失败清单（拿不到就无法对照）
+    from: fail_after
+    severity: warn
+    on_missing: 读不到失败清单 —— "清掉了几个"这件事就没法对照了（看结论里的 systemctl 输出）
+
+conclusion: |
+  【{host.name}】清除单元失败状态（变更）
+  范围：{unit}（留空 = 全部单元）
+  · 清之前：系统总判 {health_before} ｜ 失败单元**个数** {fail_count_before} ｜ 清单（空 = 没有失败）：
+  {fail_before}
+  · 清之后：系统总判 {health_after} ｜ 失败单元**个数** {fail_count_after} ｜ 清单：
+  {fail_after}
+  · ★ 本次清掉的个数：{fail_count_before} → {fail_count_after}
+
+  判读：
+    · ★★ **状态已清，根因未处理** —— 「复位」不是「修好了」（§12.26）：
+      如果让它失败的原因还在（配置写错 / 依赖不在 / 端口被占），它**下次照样会失败**；
+      本动作只是把那笔"已经失败过"的记录去掉；
+    · ★ 前后清单**对照着看**：清之前有、清之后没有 ⇒ 真的清掉了（有变更）；
+      两边都空 ⇒ 本来就没有失败单元（本次是**幂等**，没改动目标机）；
+    · ★ `health_before` 是 `degraded` 而 `health_after` 变 `running` ⇒ 这次清除把系统的告警面收敛了；
+      若 `health_after` 仍是 `degraded` ⇒ **还有别的单元在失败**（用「服务总览」看失败明细）；
+    · ★ 边界：**不改**单元定义（那是「重载单元定义」）· **不启不停**服务 · **不清**日志 · **不修**根因；
+    · 回退：**没有可回退的东西** —— 失败状态是 systemd 的运行时记录，
+      要让它"回来"只能让那个单元真的再失败一次（这不该是回退手段，所以列为"回不去：无内容"）。

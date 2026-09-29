@@ -1,0 +1,86 @@
+id: file.grep
+title: 文件内容检索
+summary: 在指定目录/文件里按关键字检索（带上下文行），返回命中行而不是让你自己敲 grep 参数
+domain: C
+risk: green
+priority: P0
+tags: [文件, 检索]
+
+note: |
+  ★ 与「日志查看器」的分工：日志看 unit/时间/级别；这个看**任意文件内容**。
+  ★ 关键字走白名单字符集（不做正则），因为用户眼里的"关键字"通常就是字面量；
+  需要正则的场景属于高级用法，宁可让用户用终端，也不在这里开一个注入面。
+  ★ grep 无匹配时返回 **1**（探针同类命令的语义）—— 那是**结论**（"没找到"），不是故障。
+
+params:
+  - name: path
+    label: 检索位置（目录或文件）
+    type: str
+    required: true
+    default: /etc/systemd/system
+    pattern: '^/[A-Za-z0-9._@+/-]*$'
+    placeholder: /etc/systemd/system
+    help: '绝对路径；目录会递归检索'
+  - name: keyword
+    label: 关键字
+    type: str
+    required: true
+    default: aoc
+    pattern: '^[A-Za-z0-9._@+=:,/-]+$'
+    help: '只支持字面量（不做正则）；允许字母数字与 . _ @ + = : , / -'
+  - name: context
+    label: 上下文行数（可留空）
+    type: int
+    required: false
+    min: 0
+    max: 10
+    default: 1
+    help: '每个命中行的前后各显示几行；0 表示只显示命中行'
+
+steps:
+  - name: scope_ok
+    title: 确认检索位置存在且可读
+    run: [ls, -ld, "{{ path }}"]
+    parser: raw
+    note: 这一步同时给 verify 提供"确实有输出"的事实（避免 grep 无匹配时断言全空）
+
+  - name: hits
+    title: 检索命中行
+    run:
+      - grep
+      - -r
+      - -n
+      - -I
+      - { when: context, value: -C }
+      - { when: context, value: "{{ context }}" }
+      - --
+      - "{{ keyword }}"
+      - "{{ path }}"
+    parser: head_lines
+    timeout: 60
+    ok_exit_codes: [0, 1]
+    note: |
+      -r 递归、-n 行号、-I 跳过二进制文件；`--` 之后才是关键字，避免关键字以 - 开头被当成选项。
+      ★ 退出码 0=有命中、1=无命中，两者都是"有效报告"。
+      head_lines 取前 20 行（动作层禁用管道，截断由解析器做）。
+
+verify:
+  - name: 检索位置可读
+    from: scope_ok
+    on_missing: 读不到该路径的元数据 —— 路径可能不存在或权限不足
+  - name: 命中结果有返回（含"无命中"的空列表）
+    from: hits
+    severity: warn
+    on_missing: 检索没有返回结果（空结果也可能是"确实没命中"，看结论里的判读）
+
+conclusion: |
+  文件内容检索结果（{host.name}）
+  · 位置：{path}　关键字：{keyword}　上下文：{context} 行
+  · 命中（★ 最多显示 **20 行输出**：`--` 分隔行也占行数，所以命中条数可能更少）：
+  {hits}
+
+  判读：
+    · 显示「（无）」表示**这个位置里没有出现该关键字**（不是检索失败）；
+    · ★ 若末尾出现「〔输出已截断：仅显示前 N 行／共 M 行〕」，说明**还有更多命中没显示** ——
+      那是**上限**，不是总数（别读成"一共就这些"）；
+    · 若想看更多命中，请把范围收窄到具体子目录，再执行一次。

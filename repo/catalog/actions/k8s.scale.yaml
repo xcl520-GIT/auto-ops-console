@@ -1,0 +1,237 @@
+# ============================================================
+# 动作：扩缩容
+# 来源：T9·S4 —— 规范 §12.37.1 ①（判据必须**回问终态**）、§12.38（回得去 / 回不去）
+# 形态：**可恢复变更**（yellow）
+# ============================================================
+
+id: k8s.scale
+title: 扩缩容
+summary: 把 Deployment / StatefulSet 调到指定副本数，★ 等 `readyReplicas` 真的到位才算成；原副本数进报告（可回退）
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, K8s, 工作负载, 伸缩]
+
+note: |
+  ★★ **判据是"回问终态"，不是"命令返回 0"**（规范 §12.37.1 ①）：
+  `kubectl scale` 返回 0 只说明 **API server 收下了这个声明**；"容器真的起来了几个"要再问一次 ——
+  ⇒ 本动作的判据是 **`kubectl rollout status` 的退出码** ＋ `readyReplicas` 前后对照。
+
+  ★★ **回得去 / 回不去**（规范 §12.38）：
+  · ✅ **回得去**：把副本数改回去（★ **原副本数进报告**，这是"回得去"的兑现依据）；
+  · ❌ **回不去**：**缩容时被杀掉的那批容器** —— 再扩出来的是**新容器**，不是原来那些。
+
+  ★ **幂等**：调到**当前值** ⇒ `spec.replicas` 前后相同 ⇒ `changed = False`（`changed` 规则见 `app/changed.py`）。
+
+params:
+  - name: kind
+    label: 对象类型
+    type: enum
+    required: true
+    choices: [Deployment, StatefulSet]
+    values: [deployment, statefulset]
+    default: Deployment
+  - name: name
+    label: 对象名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: t9-web
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+  - name: replicas
+    label: 目标副本数
+    type: int
+    required: true
+    min: 0
+    max: 100
+    default: 2
+    help: '★ 0 是合法值（= 停掉全部实例，但对象还在）。'
+  - name: wait_seconds
+    label: 等到位超时（秒）
+    type: int
+    required: true
+    min: 10
+    max: 900
+    default: 180
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认调整副本数
+  body: |
+    即将把「{namespace}/{kind}/{name}」的副本数调到 **{replicas}** 个。
+    · 能不能撤：★ **改回原值即可**（原副本数会写进报告）——
+      但**缩容时被杀掉的那批容器回不来**（再扩出来的是新容器）。
+    · 影响面：副本数变 0 = 这个工作负载**没有任何实例在跑**（对象还在，随时能再扩）。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认要调整副本数
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: target_exists
+    title: ★ 对象必须存在（不存在就中止，而不是"scale 了一个空气"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: desired_before
+    title: 改之前的期望副本数（★ **回退值**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.spec.replicas}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: ready_before
+    title: 改之前的就绪数（对照用）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.status.readyReplicas}"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: act
+    title: 提交新的副本数（★ 这一步只说明"声明被收下了"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - scale
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "--replicas={{ replicas }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: wait
+    title: ★★ 判据：等它**真的到位**（`rollout status` 的退出码）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - rollout
+      - status
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "--timeout={{ wait_seconds }}s"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 920
+    note: >
+      ★★ 超时 ⇒ 非 0 ⇒ **整条动作红**。这正是我们要的：API 收下了、但容器没起来，
+      必须**在报告里红**（否则就是"跑完了 ≠ 事情成了"的老毛病）。
+      ★ 副本数调到 **0** 时 `rollout status` 会立刻返回 0（没有副本要等）—— 那是**正确结论**。
+
+  - name: desired_after
+    title: 改之后的期望副本数（判据之一）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.spec.replicas}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: ready_after
+    title: 改之后的就绪数（★ "真的起来了吗"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.status.readyReplicas}"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对），本次没有改任何东西。
+  - name: ★★ 副本数必须真的落到目标值（问的是"被管的那一方"）
+    from: desired_after
+    on_missing: >
+      改完之后读回来的 `spec.replicas` 是空的 —— 说明这次没读到对象状态。
+      ★ 不要把它当成"改成功了"：**拿不到对照数据 ≠ 已经改好**。
+
+conclusion: |
+  【{host.name}】扩缩容 · {namespace}/{kind}/{name}（变更）
+  目标副本数：**{replicas}**（等到位超时 {wait_seconds} 秒）
+
+  · 改之前：期望 {desired_before} ｜ 就绪 {ready_before}
+  · 改之后：期望 {desired_after} ｜ 就绪 {ready_after}
+  · `rollout status` 原文：{wait}
+
+  ★★ 回得去 / 回不去（规范 §12.38）：
+    · ✅ **回得去**：执行一次 `k8s.scale`，把副本数改回 **{desired_before}**（这是改之前的原值）；
+    · ❌ **回不去**：**缩容时被杀掉的那批容器** —— 再扩出来的是**新容器**（新 IP、新启动时间），
+      不是原来那些；有状态服务（StatefulSet）还要看它的存储是否被保留；
+    · ⚠️ 目标副本数为 0 时，这个工作负载**没有任何实例在跑**（对象还在，随时能再扩）。
+
+  判读：
+    · ★★ **判据是 `rollout status` 的退出码**与 `ready_after`，**不是** `scale` 那一步的返回；
+    · ★ `ready_after` 为空（（无））= `readyReplicas` **字段缺失** = **一个都没就绪**（结论，不是读不到）；
+    · ★ 本动作**只改副本数**，不动镜像、不动配置、不重启别的对象（`changed` 只看 `spec.replicas`）。

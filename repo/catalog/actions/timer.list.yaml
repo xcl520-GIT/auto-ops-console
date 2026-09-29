@@ -1,0 +1,83 @@
+# ============================================================
+# 动作：定时任务
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 E（P1 · 只读）
+# 形态：一次给全结论（systemd 定时器 + 用户 crontab + 失败项）
+# 风险：green —— T2 只做**查看**；增删改属变更动作，归 T3
+# ============================================================
+
+id: timer.list
+title: 定时任务
+summary: systemd 定时器与用户 crontab 一览（含下次执行时间与失败项）
+domain: E
+risk: green
+priority: P1
+tags: [只读, 定时任务, systemd]
+note: |
+  刻意与 T3 划界：本动作**只读**。crontab 的增删、定时器的启停都在 T3 做（那里会有备份与二次确认）。
+  「谁在半夜跑什么」经常是排障关键：备份/清理脚本会和业务抢磁盘 IO 与 CPU。
+  用 --no-legend 去掉 systemctl 的说明性尾注，让结论区只留数据。
+
+params:
+  - name: user
+    label: 查看哪个用户的 crontab
+    type: str
+    required: false
+    pattern: '^[a-z_][a-z0-9_-]{0,31}$'
+    default: root
+    help: 仅用于 `crontab -u <用户> -l`（只读列出），不涉及任何写操作。
+
+steps:
+  - name: cron
+    title: 用户 crontab
+    run: ["crontab", "-u", "{{ user }}", "-l"]
+    parser: lines
+    optional: true
+    ok_exit_codes: [0, 1]
+    note: >
+      该用户没有 crontab 时，crontab 会返回退出码 1 并把「no crontab for X」写到 stderr。
+      把 1 声明为"正常报告"（ok_exit_codes），否则"没有定时任务"会被显示成步骤失败 ——
+      这正是 T1 踩坑 #5 的同款陷阱。
+
+  - name: timers
+    title: systemd 定时器
+    run: ["systemctl", "list-timers", "--all", "--no-pager"]
+    parser: lines
+    note: 保留表头（NEXT / LEFT / LAST / PASSED / UNIT / ACTIVATES），这几列正是判读依据。
+
+  - name: timer_units
+    title: 定时器单元
+    run: ["systemctl", "list-units", "--type=timer", "--all", "--no-pager", "--no-legend"]
+    parser: lines
+    optional: true
+
+  - name: timer_failed
+    title: 失败的定时器
+    run: ["systemctl", "list-units", "--type=timer", "--state=failed", "--no-pager", "--no-legend"]
+    parser: lines
+    optional: true
+
+verify:
+  - name: 必须能列出 systemd 定时器
+    from: timers
+    on_missing: systemctl list-timers 无输出 —— 目标机可能不是 systemd 系统
+  - name: 用户 crontab 必须能读到结果
+    from: cron
+    severity: warn
+    on_missing: 没读到 crontab 内容（该用户没有定时任务时属正常）
+
+conclusion: |
+  【{host.name}】定时任务（crontab 用户：{user}）
+  systemd 定时器（NEXT 下次执行 / LAST 上次执行）：
+  {timers}
+  定时器单元状态：
+  {timer_units}
+  ⚠️ 失败的定时器：
+  {timer_failed}
+  用户 {user} 的 crontab：
+  {cron}
+
+  判读：
+  · 看「LAST」列：为 `-` 或很久以前 → 该定时器没在按预期跑（未触发或被禁用）；
+  · 失败的定时器若有列出 → 用 `systemctl status <单元名>` 看原因（本动作只读，不会去动它）；
+  · crontab 显示（无）= 该用户没有定时任务（正常）；
+  · 想改/删定时任务：属变更类动作，T3 提供（带改动前备份）。

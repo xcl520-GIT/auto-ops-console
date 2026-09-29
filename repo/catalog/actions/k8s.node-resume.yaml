@@ -1,0 +1,168 @@
+# ============================================================
+# 动作：恢复调度（uncordon）
+# 来源：T9·S4 —— 规范 §12.37.1 ①、§12.38（drain 的反向）
+# 形态：**可恢复变更**（yellow）
+# ============================================================
+
+id: k8s.node-resume
+title: 恢复调度
+summary: 把节点从"不可调度"改回来（`uncordon`）—— 它是 `k8s.node-drain` 的反向手
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, K8s, 节点, 维护]
+
+note: |
+  ★★ **判据**（规范 §12.37.1 ①）：`spec.unschedulable` **不再是 true**
+  （字段被移除或为 false）—— ★ 不是"`uncordon` 返回 0"。
+
+  ★★ **回得去 / 回不去**（规范 §12.38）：
+  · ✅ **回得去**：再 `drain` 一次即可（本动作与 drain 互为反向）；
+  · ❌ **回不去**的是**排空那一侧**造成的东西：被驱逐的 Pod 已经重建过、`emptyDir` 的数据（若当时选了那一档）
+  已经没了 —— ★ **恢复调度不会把它们带回来**（这一点必须说清，否则会让人以为"撤了 drain 就全回来了"）。
+
+params:
+  - name: node
+    label: 节点名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: node-02
+  - name: wait_seconds
+    label: 等确认超时（秒）
+    type: int
+    required: true
+    min: 10
+    max: 300
+    default: 60
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认恢复调度
+  body: |
+    即将把「{node}」从"不可调度"改回来（`uncordon`）。
+    · 能不能撤：✅ 能（再 `k8s.node-drain` 一次即可）；
+    · ★★ **但它不会把排空时"丢掉的东西"带回来**：被驱逐的 Pod 已经在别的节点上重建过；
+      若当时选了"带 emptyDir / 强制档"，那些数据已经没了。
+    · 影响面：这个节点**重新可以被调度**了（新的 Pod 可能落上来）。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认要恢复调度
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: node_exists
+    title: ★ 节点必须存在
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - node
+      - "{{ node }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: sched_before
+    title: 恢复之前的 `spec.unschedulable`（true = 现在正是"不可调度"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - node
+      - "{{ node }}"
+      - "-o"
+      - "jsonpath={.spec.unschedulable}"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: act
+    title: 恢复调度（`uncordon`）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - uncordon
+      - "{{ node }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: sched_after
+    title: ★★ 判据：`spec.unschedulable` 必须**不再是 true**
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - node
+      - "{{ node }}"
+      - "-o"
+      - "jsonpath={.spec.unschedulable}"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: node_state
+    title: 节点现在长什么样（`SchedulingDisabled` 应该**不在**了）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - nodes
+      - "-o"
+      - wide
+      - --no-headers
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对），本次没有改任何东西。
+  - name: ★★ 节点表必须读得出来（`SchedulingDisabled` 在不在，看这一屏）
+    from: node_state
+    on_missing: >
+      节点表读不出来 —— 这次**拿不到**"它是不是已经可调度"的判据。
+      ★ 不许把"读不到"当成"已经恢复"。
+
+conclusion: |
+  【{host.name}】恢复调度 · {node}（变更）
+  · `spec.unschedulable`：{sched_before} → **{sched_after}**（★ 空/false = 已可调度）
+  · `uncordon` 原文：{act}
+  ── 现在的节点表（`SchedulingDisabled` **不该**再出现）──
+  {node_state}
+
+  ★★ 回得去 / 回不去（规范 §12.38）：
+    · ✅ **回得去**：再 `k8s.node-drain` 一次即可（两者互为反向）；
+    · ❌ ★★ **它不会把排空时丢掉的东西带回来**：被驱逐的 Pod 已经在别的节点上**重建过**；
+      若当时选了"带 emptyDir / 强制档"，那些数据**已经没了**；
+    · ⚠️ 恢复调度**只**回答"新 Pod 能不能落上来"，不回答"原来那些 Pod 回来没有"。
+
+  判读：
+    · ★★ 判据是 **`spec.unschedulable` 不再是 true** ＋ 节点表里 **`SchedulingDisabled` 消失**；
+    · ★ 字段为空（（无））是**正常**的：`uncordon` 会把 `unschedulable` **整个字段移除**；
+    · ★ 这一步只写**一个字段**，不动别的节点、不动任何 Pod（`changed` 只看这个字段的前后对照）。

@@ -1,0 +1,106 @@
+# ============================================================
+# 动作：重置 SSH host key（身份五项之②）
+# 来源：规范 §12.128 / §12.129（★ 最阴的一项：连上去**不会报错**）
+# 形态：删旧钥匙 → ssh-keygen -A 重新生成 → restorecon → 重启 sshd → 比**指纹**
+# 风险：yellow（可恢复：旧钥匙本来就不该留）｜ 执行通道：ssh
+# ============================================================
+
+id: host.ssh-hostkey-reset
+title: 重置 SSH host key（身份五项之②）
+summary: 换掉这台机器的 SSH 主机密钥 —— ★ 克隆机与母机共用钥匙，是"最安静的串味"
+domain: A
+risk: yellow
+priority: P0
+channel: ssh
+tags: [变更, 身份, 造机]
+
+note: |
+  ★★ 五项身份里**最阴的一项**（规范 §12.129 第 5 条）：钥匙一样的时候，
+    SSH **不会报错** —— 只会让 `known_hosts`、跳板信任与审计**全部失真**，
+    而且**没有任何一处报警**（与 §12.122「问不到 ≠ 不存在」同族）。
+  ★★ 判据：**公钥指纹**（`ssh-keygen -lf`）与动手前**不同**，且新钥匙**真的生成了**；
+    同时 `sshd` 必须**真在跑**（重启失败 = 这一步没成立）。
+  ★ 为什么**不做文件级备份**：旧钥匙**正是要丢掉的那件东西** ——
+    把它拉回管理机既没用也不安全（红线 2：密钥不外发）。★ 这是刻意的，"回不去"落在钥匙链上。
+  ★ SELinux：重建 `/etc/ssh` 内容后要 `restorecon -R /etc/ssh`（否则 sshd 可能拒绝加载）。
+  ★ 演练开关 `dry_run=yes`：只跑判据、不动手 ⇒ 判据**必须红**。
+
+confirm:
+  title: 确认重置 SSH host key
+  body: |
+    即将把「{host.name}」（{host.address}）的 SSH 主机密钥**全部换新**：
+    删掉 `/etc/ssh/ssh_host_*_key(.pub)` → `ssh-keygen -A` 重新生成 → `restorecon` → 重启 `sshd`。
+
+    会发生什么：
+      · 任何**已经**把旧指纹记进 `known_hosts` 的客户端，下次连接会看到「主机指纹变了」的告警
+        （★ 这正是我们**想要**的效果：它就是"不再是母机"的证据）
+      · `sshd` 会重启一次 —— ★ **本次连接**用的是已有会话，但**重启期间新连接可能被拒**
+
+    能不能撤回：
+      · ★ **不能，也不需要**：旧钥匙就是"串味"本身（母机与新机共用一把钥匙）
+      · 回不去的：旧指纹（那是我们要消除的东西）
+
+    判据（做完怎么算成）：
+      · 新的**公钥指纹**与动手前**不同**，且 `sshd` 真的在跑
+  confirm_text: 我已确认要换掉这台机器的 SSH 主机密钥
+
+params:
+  - name: dry_run
+    label: 演练模式（只跑判据、不动手）
+    type: enum
+    required: true
+    choices: ["不演练：真的重置", "演练：只判定、不动手"]
+    values: ["no", "yes"]
+    default: "no"
+    help: ★ 演练是**反例工具**：判据会红（指纹没变）
+
+steps:
+  - name: push_script
+    title: 把身份脚本推到目标机
+    transfer: put
+    src: aoc-identity.sh
+    dst: /usr/local/sbin/aoc-identity.sh
+    parser: raw
+
+  - name: reset
+    title: 重置 + 自证（★ 比的是**公钥指纹**，退出码就是结论）
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, reset, ssh-hostkey, "{{ dry_run }}"]
+    parser: raw
+    timeout: 300
+    ok_exit_codes: [0]
+    note: |
+      ★ 0 = 指纹变了 · 3 = 指纹没变（**判红：还是母机那套钥匙**）· 2 = 读不到 / ssh-keygen 失败。
+      ★ 这一步**不许 optional**：它就是本动作的判据。
+
+  - name: sshd_alive
+    title: 旁证：sshd 重启之后**真的在跑**（"换了钥匙"不能以"服务挂了"为代价）
+    run: [systemctl, is-active, sshd]
+    parser: raw
+    timeout: 60
+    optional: true
+
+  - name: after
+    title: 判据的**旁证**：独立重读一次指纹
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, show, ssh-hostkey]
+    parser: raw
+    timeout: 60
+    optional: true
+
+verify:
+  - name: 指纹必须真的变了（否则任务已经是失败）
+    from: reset
+    on_missing: 重置那一步没有给出任何输出 —— 本结论不可用
+  - name: 必须能独立重读到新指纹（旁证）
+    from: after
+    on_missing: 独立重读没有输出 —— ★ 这不等于"没成功"，但不该继续往下走
+
+conclusion: |
+  【{host.name}】SSH host key 重置结果
+  · 脚本自证（含动手前后的指纹 sha256）：{reset}
+  · sshd 状态：{sshd_alive}
+  · 独立重读：{after}
+
+  ★ 为什么这一项最要紧（规范 §12.129）：钥匙一样时 **SSH 不报错**，
+    只会让 `known_hosts` 与审计静默失真 —— 属于"没有一处报警、而结论是错的"那一类。
+  ★ 回不去的（逐项说清）：**旧指纹**（那是要消除的东西）；★ 客户端上的旧指纹记录需要**人来清**
+    （`ssh-keygen -R <地址>`）—— 平台不代改别人的 `known_hosts`。

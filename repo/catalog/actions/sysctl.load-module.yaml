@@ -1,0 +1,136 @@
+# ============================================================
+# 动作：加载内核模块（T8·S2 · 与 sysctl.set 配对）
+# 来源：规范 §12.24.3 —— **模块必须先于 `bridge-nf-call-*` 写入**
+# 风险：yellow
+# ============================================================
+
+id: sysctl.load-module
+title: 加载内核模块
+summary: modprobe 加载一个内核模块并自证真的在（可选持久化到 /etc/modules-load.d/）
+domain: A
+risk: yellow
+priority: P0
+tags: [变更, 内核, 模块, 集群前置]
+
+note: |
+  ★★ **为什么它与「写内核参数」是**一对**（规范 §12.24.3）**：
+  `net.bridge.bridge-nf-call-iptables` / `-ip6tables` 这两个键**只有在 `br_netfilter` 加载之后才存在**。
+  顺序写反（先写参数、后加载模块）时的现象是：`sysctl -w` **看起来成功**（或静默不生效），
+  错误拖到 `sysctl --system` 那一步才爆 —— ★ **教科书式的"假成功"**。
+  正确顺序：**先跑本动作，再用「写内核参数」**。
+
+  ★★ **判据怎么做到"可证伪"**：本动作在加载**之后**用 `grep -c <模块> /proc/modules` 复读，
+  并且**只接受退出码 0**。而 `grep -c` 的退出码语义是"**匹配到几行**"：
+  匹配 0 行时它返回 **1** ⇒ 于是"modprobe 返回 0 但模块其实不在"这种情况
+  会**当场把这一步判红**（不是假绿）。计数走 `/proc/modules`（一行一条、**无表头**），
+  不用 `lsmod`（有表头 ⇒ 数出来差 1，规范 §12.23 的假数字）。
+
+  ★ 只读复读用 `grep` 直读 `/proc/modules`，**没有管道**（动作层禁用管道）。
+
+confirm:
+  title: 确认加载内核模块
+  body: |
+    即将在「{host.name}」（{host.address}）上加载内核模块：`{{ module }}`
+    并持久化到 `/etc/modules-load.d/99-aoc-{{ module }}.conf`（重启后仍会加载）。
+
+    会发生什么：该模块进入内核（例如 `br_netfilter` 打开网桥的 iptables 过滤，
+    `ipip` 提供 Calico IPIP 封装所需的隧道设备类型）。
+    可撤回：本次**不自动卸载** —— `rmmod` 在有人依赖它时会失败，
+    需要卸载请显式评估依赖后再动手（结论里会说明回不去的部分）。
+  confirm_text: 我已确认要加载这个模块
+
+backup:
+  - path: "/etc/modules-load.d/99-aoc-{{ module }}.conf"
+    label: "本工作台管理的持久化文件（首次创建时不存在，属正常）"
+    required: false
+
+params:
+  - name: module
+    label: 模块名
+    type: str
+    required: true
+    pattern: '^(overlay|br_netfilter|nf_conntrack|ip_tables|iptable_nat|nf_nat|xt_MASQUERADE|ipip|vxlan|nfsd)$'
+    default: overlay
+    placeholder: br_netfilter
+    help: '容器/集群常用的那几个（白名单）；这些名字同时是 /etc/modules-load.d/ 里的合法文件名'
+
+precheck:
+  - name: known
+    title: 确认内核**认识**这个模块（模块名拼错的话在这里就停）
+    run: [modinfo, -n, "{{ module }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: >
+      `modinfo -n` 成功说明这个模块在本机内核里**存在**（可能已加载、也可能还没加载）。
+      ★ 它顺带把"模块名拼错"这个最常见的输入错误挡在预检里（那时目标机零改动）。
+
+steps:
+  - name: count_before
+    title: 加载前：它在不在（`/proc/modules` 里的条数）
+    run: [grep, -c, "{{ module }}", /proc/modules]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+    note: >
+      ★ 退出码 0 = 有匹配，1 = 没有匹配 —— **两个都是"有效报告"**（§9.6 同族：
+      退出码是它的一句话结论，不是错误码）。所以这一步永远不阻断。
+      ★ 计数来源是 `/proc/modules`（一行一条、无表头），不是 `lsmod`（有表头）。
+
+  - name: load
+    title: 加载模块（modprobe）
+    run: [modprobe, "{{ module }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★ 成功时它**什么都不输出** —— 所以它**不能**当自证来源（§9.6：verify 判的是"有没有值"）。
+      自证交给下一行的 `count_after`。
+
+  - name: count_after
+    title: ★★ 加载后：它到底在不在（★ 本步是判据：只接受退出码 0）
+    run: [grep, -c, "{{ module }}", /proc/modules]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: >
+      ★★ 与上一步的**唯一差别**就是 `ok_exit_codes`：这里**只收 0** ⇒
+      "modprobe 返回 0、但模块其实没在（`grep -c` 给 1）"**会当场判红**。
+      这就是本动作"可被证伪"的那一行 —— 少了它，"加载成功"就只是一句口号。
+
+  - name: persist
+    title: 持久化（写到 /etc/modules-load.d/，一模块一文件）
+    write_file:
+      path: "/etc/modules-load.d/99-aoc-{{ module }}.conf"
+      content: |
+        # managed by auto-ops-console (T8) — 请勿手工编辑
+        {{ module }}
+      mode: "0644"
+    parser: raw
+    note: ★ `99-aoc-` 前缀 ⇒ 可枚举、可删净；一模块一文件 ⇒ 不会覆盖别人那份（§12.25.3 同一套理由）。
+
+verify:
+  - name: ★★ 加载后必须在 `/proc/modules` 里数得到（本步只有"数得到"才给 0）
+    from: count_after
+    on_missing: >
+      加载之后仍然数不到这个模块 —— 或者它压根没被加载（判红），
+      或者 /proc/modules 读不到。★ 无论哪种，都不许当成"加载成功"。
+
+conclusion: |
+  【{host.name}】加载内核模块（变更）
+  模块：{module}
+  · 加载前在不在（/proc/modules 条数）：{count_before}（0 = 不在 ｜ ≥1 = 在）
+  · 加载命令回显：{load}
+  · ★★ 加载后在不在：{count_after}（★ 本动作只接受 ≥1 —— 数不到就判红）
+  · 持久化文件：/etc/modules-load.d/99-aoc-{module}.conf
+
+  判读：
+    · `count_before` = 0、`count_after` ≥ 1 ⇒ **本次真的加载了**（有变更）；
+      两者都 ≥ 1 ⇒ **本来就加载着**（本次是**幂等**，没改动目标机）；
+    · ★ 数到的是**包含该名字的行数**（子串匹配），例如 `nf_conntrack` 也会数到
+      `nf_conntrack_netlink` 这类同族模块 —— 本动作用它判"≥1"，不做精确计数；
+    · ★★ **回不去的**：本动作**不自动卸载**。`rmmod` 在有人依赖它时会失败
+      （例如 `br_netfilter` 被 iptables 规则依赖、`nfsd` 正在导出），
+      要卸载必须另行评估依赖 —— 这一条**不在回退范围内**，空也要写清楚；
+    · 加载完 `br_netfilter` 之后，请用「写内核参数」把
+      `net.bridge.bridge-nf-call-iptables` / `-ip6tables` 写成 1（顺序不能反）。

@@ -1,0 +1,62 @@
+# ============================================================
+# 动作：磁盘用量总览
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 C（P0 · 只读）
+# 形态：一次给全结论（根分区确定值 + 全部挂载点 + inode 用量 + 判读）
+# 风险：green
+# ============================================================
+
+id: disk.usage
+title: 磁盘用量总览
+summary: 根分区用量与 inode 一眼确认，附全部挂载点（含高水位判读）
+domain: C
+risk: green
+priority: P0
+tags: [只读, 磁盘, 容量, inode]
+note: |
+  用 `df -P`（POSIX 可移植格式，固定 6 列、不为长设备名折行），而不是默认格式（会折行）。
+  根分区**单独再查一次**（`df -P /`）：这样结论里的根分区数字是确定的，不依赖 df 的行序 ——
+  只靠 `{mounts.0}` 取第一行是脆的（前几个挂载点可能是 tmpfs/devtmpfs）。
+  inode 用 `df -P -i`：容量没满但 inode 满了是"海量小文件"的经典故障。
+
+params: []
+
+steps:
+  - name: mounts
+    title: 全部挂载点用量
+    run: ["df", "-P"]
+    parser: df_rows
+
+  - name: root
+    title: 根分区用量
+    run: ["df", "-P", "/"]
+    parser: df_rows
+
+  - name: root_inode
+    title: 根分区 inode
+    run: ["df", "-P", "-i", "/"]
+    parser: df_rows
+
+verify:
+  - name: 必须解析出挂载点
+    from: mounts
+    on_missing: df -P 没有给出任何文件系统（或输出格式已变，需检查脚本）
+  - name: 必须拿到根分区用量
+    from: root
+    on_missing: 无法确定根分区用量 —— 本结论不可用
+  - name: 必须拿到根分区 inode
+    from: root_inode
+    on_missing: df -P -i 未返回 inode 信息（老内核或特殊文件系统可能没有）
+
+conclusion: |
+  【{host.name}】磁盘用量
+  根分区 {root.0.fs}
+    容量 已用 {root.0.pcent} ｜ {root.0.used_mb} MB / {root.0.size_mb} MB（可用 {root.0.avail_mb} MB）
+    inode 已用 {root_inode.0.ipcent} ｜ {root_inode.0.iused} / {root_inode.0.inodes}
+  全部挂载点（共 {mounts.count} 个，单位 MB）：
+  {mounts}
+
+  判读：
+  · 容量或 inode **任一超过 80%** 就该处理：先用「目录体积排行」找出大目录，再决定清什么；
+  · inode 满而容量余量很大的典型成因：海量小文件（日志碎片、缓存、会话文件、邮件队列）；
+  · tmpfs / devtmpfs / efivarfs 随内存或硬件走，百分比没有运维意义，可忽略；
+  · 本动作**只读**：不会删除或移动任何文件。

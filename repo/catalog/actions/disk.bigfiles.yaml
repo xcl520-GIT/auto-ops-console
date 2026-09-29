@@ -1,0 +1,82 @@
+# ============================================================
+# 动作：大文件排行
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 C（P0 · 只读）
+# 形态：一次给全结论（超过阈值的大文件，按体积降序）
+# 风险：green
+# ============================================================
+
+id: disk.bigfiles
+title: 大文件排行
+summary: 指定路径下超过阈值的大文件排行（按体积降序，条数可调）
+domain: C
+risk: green
+priority: P0
+tags: [只读, 磁盘, 大文件]
+note: |
+  `find <路径> -xdev -type f -size +N -printf '%s\t%p\n'`：
+  -xdev 不跨文件系统（顺带排除 /proc、/sys 这类虚拟文件系统）；
+  `-size +N` 由 find 自己过滤（不用管道 grep）；
+  `-printf '%s\t%p\n'` 输出**字节数 + 路径**，是结构化程度最高的选择。
+  字节 → MB 换算与排序都在 find_rows 解析器里做（动作层禁止管道，`| sort -rn` 写不了）。
+
+params:
+  - name: path
+    label: 扫描路径
+    type: str
+    required: true
+    default: /
+    pattern: '^/[A-Za-z0-9._/-]{0,200}$'
+    placeholder: /var
+    help: 绝对路径。不跨文件系统，所以扫描 / 时不会跟到其他挂载点里。
+  - name: min_size
+    label: 体积阈值
+    type: enum
+    choices: ["≥ 50MB", "≥ 100MB", "≥ 500MB", "≥ 1GB"]
+    values: ["50M", "100M", "500M", "1G"]
+    default: "≥ 50MB"
+    help: 只列出不小于该体积的文件。默认 50MB —— 定太高在实验机上常常一个都命中不了。
+  - name: top_n
+    label: 排行显示条数
+    type: int
+    min: 1
+    max: 200
+    default: 20
+    help: 最多显示前 N 条（T4 起可调）。以前固定 20 条，会遇到"看不见第 21 个"的情况。
+
+steps:
+  - name: path_check
+    title: 路径存在性
+    run: ["ls", "-d", "{{ path }}"]
+    parser: raw
+
+  - name: big
+    title: 大文件
+    run: ["find", "{{ path }}", "-xdev", "-type", "f", "-size", "+{{ min_size }}", "-printf", '%s\t%p\n']
+    parser: find_rows
+    parser_arg: "{{ top_n }}"
+    timeout: 90
+    note: >
+      '%s\t%p\n' 里的 \t 与 \n 由 find 自己解释（YAML 里用单引号写，避免被当成真换行）。
+      超时 90 秒：扫 / 时若磁盘很满，find 本身也要时间。
+      parser_arg 决定显示前几条（T4 起可调，见规范 §10.5）。
+
+verify:
+  - name: 扫描路径必须存在
+    from: path_check
+    on_missing: 指定路径在目标机上不存在 —— 检查拼写后再试
+  - name: 大文件清单必须可读
+    from: big
+    severity: warn
+    on_missing: 该路径下没有超过阈值的文件（把阈值调小再试，例如 ≥ 50MB）
+
+conclusion: |
+  【{host.name}】大文件排行
+  扫描 {path} ｜ 阈值 {min_size} ｜ 不跨文件系统 ｜ 命中 {big.count} 个（按体积降序，最多 {top_n} 个）
+  {big}
+
+  判读：
+  · 单位 MB，是真实字节换算值（例如 100663296 字节 → 96.0 MB）；
+  · 常见大户：数据库单文件（ibdata1 / ib_logfile0）、没轮转的日志、容器镜像层、导出的压缩包；
+  · 命中 0 个（显示（无））说明没有超过 {min_size} 的文件 —— 想更细就把阈值调到 50MB；
+  · 只想看某个目录就把「扫描路径」改成 /var/lib/mysql 之类；
+  · 本动作只读，不会删除任何文件。

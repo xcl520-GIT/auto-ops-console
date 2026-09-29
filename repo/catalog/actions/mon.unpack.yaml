@@ -1,0 +1,173 @@
+# ============================================================
+# 动作：监控组件解包（T10）
+# 来源：阶段开题单\T10-监控告警接入.md §6（代码）+ §10.2.1（装法定稿）
+# 形态：一次点击 = 建用户/目录骨架 → 解 tarball（剥顶层）→ 建版本软链 → 归属到位
+# 风险：yellow（写 /opt/aoc-monitoring 白名单目录；不改任何系统自带文件）
+# ============================================================
+
+id: mon.unpack
+title: 监控组件解包（tarball → /opt/aoc-monitoring）
+summary: 建目录骨架与专用用户、解开官方静态 tarball（剥顶层）、建版本软链、归属到位
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, 监控, 装机, tarball]
+
+confirm:
+  title: 确认解包并建立组件软链
+  body: |
+    即将在「{host.name}」（{host.address}）上：
+      · 建 / 复用系统用户 aocmon
+      · 把 /tmp/{artifact} 解开到 /opt/aoc-monitoring/pkg/{dest}/
+        （★ 该目录**已存在**时，其中内容会被 tarball 覆盖）
+      · 把软链 /opt/aoc-monitoring/{component} 指向它
+      · 把 /opt/aoc-monitoring 整个 chown 给 aocmon
+
+    ★ 不写 etc/（配置）与 data/（时序数据），不碰任何系统自带文件。
+    ★ **回不去的东西**：被覆盖的同名版本目录里的内容（不是数据，但事后只能靠文件时间分辨）。
+  confirm_text: 我已确认要解包
+
+note: |
+  ★ **为什么走官方静态 tarball**：S0 实测本环境**没有 EPEL** —— 启用仓库只有
+    `appstream` / `baseos` / `extras` / `docker-ce-stable` / `kubernetes`，
+    `dnf search` 里 prometheus / alertmanager / node_exporter **一个都搜不到**（只有 grafana 可得）。
+    理由与"为什么不用包管理装 grafana"见 开题单 §10.2.1 #1。
+  ★ **为什么 tarball 由管理机下载再 `file.push` 上来**：S0 实测靶机到外网只有 **~0.10 MB/s**
+    （20 秒 2.02MB），而管理机有 **2.59~3.16 MB/s** —— 差 10~30 倍。见 开题单 §10.2.1 #2。
+  ★ **幂等**：`useradd` 的 rc=9（用户已存在）算成功；`tar` 重复解包覆盖同目录；
+    `ln -sfn` 是原子替换。★ "变了没有"看**软链指向**（before/after 两次 `readlink` 的**退出码 + 取值**）。
+  ★★ **本动作不声明 `backup:`，这不是漏了**：它只往**自己的白名单目录**里**新增/覆盖版本目录**，
+    并把软链重新指过去 —— **不覆盖任何既有配置（`etc/`）与数据（`data/`）**，
+    所以**没有"改之前的样子"需要留底**。★ 这条"回不去"的说明见下面 conclusion 末尾。
+
+params:
+  - name: artifact
+    label: 已上传到 /tmp 的 tarball 文件名
+    type: str
+    required: true
+    default: node_exporter-1.12.1.linux-amd64.tar.gz
+    pattern: '^[A-Za-z0-9._-]{6,96}$'
+    help: 只写文件名；文件要先经 `file.push` 传到目标机的 /tmp。
+  - name: dest
+    label: 版本目录名（落在 /opt/aoc-monitoring/pkg/ 下）
+    type: str
+    required: true
+    default: node_exporter-1.12.1
+    pattern: '^[A-Za-z][A-Za-z0-9._-]{2,63}$'
+    help: 建议 `<组件>-<版本>`，例如 prometheus-3.15.0。★ 带版本号的目录是"可枚举、可回退"的前提。
+  - name: component
+    label: 组件软链名
+    type: enum
+    required: true
+    choices: [prometheus, alertmanager, grafana, node_exporter, webhook]
+    values: [prometheus, alertmanager, grafana, node_exporter, webhook]
+    default: node_exporter
+    help: ★ 用**受控枚举**而不是自由文本 —— 软链名会拼进 argv，枚举让它结构上不可能指向别处。
+
+steps:
+  - name: user
+    title: 建专用系统用户 aocmon
+    run: [useradd, --system, --home-dir, /opt/aoc-monitoring, --shell, /sbin/nologin, --comment, "AOC monitoring stack", aocmon]
+    parser: raw
+    ok_exit_codes: [0, 9]
+    timeout: 30
+    note: rc=9 = 用户已存在 ⇒ 幂等（"再点一次"能成立的一部分）。
+
+  - name: dirs
+    title: 建目录骨架
+    run:
+      - mkdir
+      - -p
+      - /opt/aoc-monitoring/etc
+      - /opt/aoc-monitoring/etc/targets
+      - /opt/aoc-monitoring/etc/grafana-provisioning/datasources
+      - /opt/aoc-monitoring/data
+      - /opt/aoc-monitoring/log
+      - /opt/aoc-monitoring/_out
+      - /opt/aoc-monitoring/_target
+      - /opt/aoc-monitoring/webhook
+      - /opt/aoc-monitoring/_pkg
+      - "/opt/aoc-monitoring/pkg/{{ dest }}"
+    parser: raw
+    timeout: 30
+    note: ★ `_target` 是 node_exporter 的 **textfile collector** 目录（造条件的地方，见 §10.2.1 #5）。
+
+  - name: link_before
+    title: 记下组件软链现在指哪儿
+    run: [readlink, "/opt/aoc-monitoring/{{ component }}"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+    note: rc=1 = 还没有这个软链（首次装机）；★ 两种都算"跑过了"，正是 `_diff` 要的对照。
+
+  - name: stage
+    title: 把 tarball 送上去（受控目录 → /tmp）
+    transfer: put
+    src: "{{ artifact }}"
+    dst: "/tmp/{{ artifact }}"
+    parser: raw
+    note: >
+      ★★ 这一步**为什么不用 `file.push`**（T10·S2 复跑抓到的真缺陷）：`file.push` 在覆盖既有文件前
+      **会自动备份**，而护栏 `backup.max_file_mb = 50` —— 三件套的 tarball 是 106MB / 190MB，
+      ⇒ 备份被拒 ⇒ 整条动作中止 ⇒ **同一个包装第二遍根本进不来**（幂等复跑直接死在第一步）。
+      ★ 引擎的 `transfer` 步是"上传 + sha256 双向比对"，**不做覆盖前备份**（它本来就不是"改配置"，
+      只是往暂存区放东西），正好是这条路要的语义。
+      ★ 完整性由**下一步的 `tar` 承担**：gzip/包残缺时 `tar -xzf` 必然非零退出（§12.49：判据交给退出码）。
+    timeout: 900
+
+  - name: unpack
+    title: 解开 tarball（剥掉顶层目录）
+    run: [tar, -xzf, "/tmp/{{ artifact }}", -C, "/opt/aoc-monitoring/pkg/{{ dest }}", --strip-components=1]
+    parser: raw
+    timeout: 600
+    note: >
+      ★ `--strip-components=1` 剥掉官方 tarball 的顶层目录（`prometheus-3.15.0.linux-amd64/` 之类），
+      于是 `/opt/aoc-monitoring/pkg/<dest>/` 直接就是"组件根"。
+      ★ 这一步**成功时 stdout 是空的** —— 所以下面**不许**对它做非空自证（规范 §12.49 假红）。
+
+  - name: link
+    title: 建 / 更新版本软链
+    run: [ln, -sfn, "/opt/aoc-monitoring/pkg/{{ dest }}", "/opt/aoc-monitoring/{{ component }}"]
+    parser: raw
+    timeout: 20
+
+  - name: link_after
+    title: 复读软链（这才是"变了没有"的对照值）
+    run: [readlink, "/opt/aoc-monitoring/{{ component }}"]
+    parser: raw
+    timeout: 20
+
+  - name: proof
+    title: 自证：软链下真的有东西
+    run: [ls, -1, "/opt/aoc-monitoring/{{ component }}"]
+    parser: lines
+    timeout: 20
+    note: ★ 承担结论的步骤**不许 optional**（规范 §12.45.3）；它的输出就是"解出来了"的证据。
+
+  - name: chown
+    title: 归属到位
+    run: [chown, -R, aocmon:aocmon, /opt/aoc-monitoring]
+    parser: raw
+    timeout: 180
+
+verify:
+  - name: 软链下必须真的解出内容
+    from: proof
+    on_missing: 解出来的目录是空的 —— tarball 可能没传完整，或 --strip-components 的层数不对
+
+conclusion: |
+  【{host.name}】监控组件解包
+  组件：{component} ｜ 版本目录：/opt/aoc-monitoring/pkg/{dest} ｜ 来源：/tmp/{artifact}
+  软链指向：装前 {link_before} → 装后 {link_after}
+  用户 aocmon：{user}
+  解出来的内容（前若干行）：{proof}
+
+  判读：
+  · 软链**装前是（无）** = 首次装这个组件；**装前等于装后** = 幂等（再点一次没换版本）；
+  · `{proof}` 为空 ⇒ tarball 没传完整或层数不对（本动作会因此判红）；
+  · ★★ **回不去 / 回得去**（规范 §12.38）：
+    - **回得去**：软链指向 —— 把 `<component>` 软链指回旧版本目录即可（旧目录若还在，一条 `ln -sfn` 就回去了）；
+    - **回不去**：**被覆盖的同名版本目录** —— 若 `pkg/{dest}` 已存在，本动作会用 tarball 里的内容**覆盖**它；
+      这不是"删了数据"，但**目录里原有的东西是否被替换过，事后再查只能靠文件时间**。
+      ★ 本动作**不写** `etc/`（配置）与 `data/`（时序数据），那两处一个字节都不动。
+  · 本动作**只往自己的白名单目录**（`/opt/aoc-monitoring/`）写东西，不碰任何系统自带文件。

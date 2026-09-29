@@ -1,0 +1,78 @@
+# ============================================================
+# 动作：二次确认闸门样例（risk: yellow）
+#
+# ★ 本文件存在的原因（请先读这段）：
+#   开题单验收标准 #3 要求「风险分级机制存在，且有一个 yellow 样例可用」，
+#   但同时 §3「不做什么」第 1 条明确 T1 不做变更类动作。
+#   两条要求一起看，结论是：T1 需要的是「yellow 闸门机制 + 一个可运行的样例」，
+#   而不是一个真的会改系统动作。
+#
+#   因此本样例的内容是**只读的**（读时间、时区、NTP 同步状态 ——
+#   正好是覆盖地图域 A 的 P0 条目 host.datetime 能力），
+#   但风险等级刻意标为 yellow，用来驱动「执行前二次确认 + 命令预览」这条闸门。
+#
+#   T3 的真实变更动作（服务启停、防火墙放行）将复用同一套闸门，不会另写一套。
+#   本动作不登记进 map.yaml 的覆盖率分母（它是 demos 段）。
+# ============================================================
+
+id: demo.confirm-gate
+title: 时间与时区（二次确认闸门样例）
+summary: 演示 risk:yellow 的执行前二次确认；内容为只读，无破坏性
+domain: A
+risk: yellow
+priority: P0
+tags: [样例, 二次确认, 时间与时区]
+
+confirm:
+  title: 确认执行此动作
+  body: |
+    即将在「{host.name}」（{host.address}，账号 {host.user}）上执行本动作。
+
+    风险等级：yellow（可恢复的变更级）→ 执行前需要你二次确认。
+    涉及命令：timedatectl status / timedatectl show / chronyc tracking
+    说明：本样例实际为只读动作，不会改动目标机上的任何配置。
+  confirm_text: 我已确认要执行
+
+params: []
+
+steps:
+  - name: datetime
+    title: 时间与时区
+    run: ["timedatectl", "status"]
+    parser: colon_kv
+    pick:
+      "Local time": local_time
+      "Universal time": utc_time
+      "Time zone": timezone
+      "System clock synchronized": synced
+      "NTP service": ntp_service
+      "RTC in local TZ": rtc_in_local_tz
+
+  - name: datetime_props
+    title: 时间属性（结构化）
+    run: ["timedatectl", "show", "--no-pager",
+          "-p", "Timezone", "-p", "NTP", "-p", "NTPSynchronized",
+          "-p", "LocalRTC", "-p", "CanNTP"]
+    parser: shell_kv
+    optional: true
+
+  - name: chrony
+    title: chrony 同步详情
+    run: ["chronyc", "tracking"]
+    parser: colon_kv
+    optional: true
+    note: 未安装 chrony 时本步骤自动跳过（optional），不影响动作结论。
+
+verify:
+  - name: 必须读到本地时间
+    from: datetime
+    field: local_time
+    on_missing: timedatectl 未返回本地时间（目标机可能不是 systemd 系统）
+
+conclusion: |
+  本地时间 {datetime.local_time}（时区 {datetime.timezone}）
+  UTC 时间 {datetime.utc_time}
+  NTP 服务 {datetime.ntp_service} ｜ 时钟已同步 {datetime.synced} ｜ RTC 用本地时区 {datetime.rtc_in_local_tz}
+
+  —— chrony 同步详情 ——
+  {chrony}

@@ -1,0 +1,153 @@
+# ============================================================
+# 动作：等一个对象到达指定状态
+# 来源：T8·S7 —— 规范 §12.32.2（判据 = 退出码）在"工作负载"上的那一面
+# 形态：**只读**（green）—— `kubectl wait` 不创建、不修改、不删除任何对象
+# ============================================================
+
+id: k8s.wait
+title: 等一个对象到达指定状态
+summary: 用 `kubectl wait` 的**退出码**回答"它到底成了没有" —— 对象名与条件都由参数给，命令写死在 YAML 里
+domain: J
+risk: green
+priority: P1
+tags: [只读, K8s, 等待, 判据]
+
+note: |
+  ★★ **为什么它是一个独立的手、而不是塞进 `k8s.apply`**：
+  `kubectl apply` 是**异步**的 —— 它返回 0 只说明"清单交给了 API server"，
+  对象**跑起来没有**是另一件事。★ 而"等它成"这件事与"把它交出去"是**两个不同的判据**：
+  · `k8s.apply` 的 `get -f` 回答"**对象在不在**"；
+  · 本动作回答"**对象成没成**"。
+  合成一步就会出现 T6 那个老毛病：**"跑完了" ≠ "事情成了"**（§12.6.5）。
+
+  ★★ **判据是 `kubectl wait` 的退出码**（规范 §12.32.2）：
+  超时 ⇒ 非 0 ⇒ 判红。★ 这才是"**由被等的那一方回答**"的那种判据。
+
+  ★★ **它存在的直接理由（T8·S7）**：`存储类可用` 这条验收要求
+  "**PVC 真绑定 + Pod 真读写**"（不是"对象建出来了"）。
+  ⇒ 那份读写验证是一个 **Job**：只有等它 **complete**，
+  宿主机上才会出现"由 Pod 写出来的那份文件"；平台随后在宿主机上读它 —— **两个方向都留了证**。
+  没有本动作，配方就只能"交出去就宣布成功"（那是**假绿**）。
+
+  ★ 本动作**只读**：`kubectl wait` 只观察，不改对象（`changed` 恒 `false`，§12.3）。
+
+params:
+  - name: kind
+    label: 对象类型
+    type: enum
+    required: true
+    choices: [Pod, Job, Deployment, DaemonSet, StatefulSet, Node]
+    values: [pod, job, deployment, daemonset, statefulset, node]
+    default: Job
+    help: '★ 闭枚举 ⇒ 它**选不出任意命令**（§12.10）。'
+  - name: name
+    label: 对象名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]{0,62}$'
+    default: aoc-storage-rw
+    help: 'Kubernetes 对象名的合法形状（小写字母/数字/点/短横）。'
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+    default: default
+  - name: condition
+    label: 等待的条件
+    type: enum
+    required: true
+    choices: [Ready, 完成（complete）, 可用（available）, 成功（succeed）]
+    values: [Ready, complete, available, succeed]
+    default: 完成（complete）
+    help: '★ 闭枚举 —— `kubectl wait --for=condition=<这个值>` 的那一半。'
+  - name: timeout_seconds
+    label: 超时（秒）
+    type: int
+    required: true
+    min: 1
+    max: 900
+    default: 180
+    help: '★ 超时**不是**失败的同义词：挂载不上、镜像拉不动，给再长也等不到。'
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+    note: ★ 不声明 `means_done`：缺工具是**真故障**（规范 §12.33 规矩 3）。
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在（★ 不在 = 这台机器读取不了集群，**真故障**）
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+    note: ★ 同样不声明守卫 —— "等不到"的终态判据是**超时**，不是"工具/入口不在"。
+
+steps:
+  - name: wait
+    title: ★★ 等它到达指定状态（**本步的退出码就是判据**：超时 ⇒ 非 0 ⇒ 判红）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - -n
+      - "{{ namespace }}"
+      - wait
+      - --for=condition={{ condition }}
+      - "{{ kind }}/{{ name }}"
+      - --timeout={{ timeout_seconds }}s
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 920
+    note: >
+      ★★ 它的输出形如 `job.batch/aoc-storage-rw condition met`（**一行**）。
+      ★ 判据是**退出码**：超时 ⇒ 非 0 ⇒ 步骤失败 ⇒ 动作失败。
+      ★ 失败时它会把"到目前为止对象的状态"写出来 —— 那正是归因要看的（Pending / 没有卷 / 镜像拉不动）。
+
+  - name: show
+    title: 对象现状（★ 给人看的原文，同时是**归因**材料）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - -n
+      - "{{ namespace }}"
+      - get
+      - "{{ kind }}/{{ name }}"
+      - -o
+      - wide
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+    note: '★ 可选：连它都读不出来时，上面那条的失败原因已经足够定位了。'
+
+verify:
+  - name: ★★ 必须真的等到了（判据是退出码，不是"命令返回了"）
+    from: wait
+    on_missing: >
+      `kubectl wait` 没能等到 `{{ kind }}/{{ name }}` 到达 `{{ condition }}` ——
+      ★ 超时**不等于**"再等等就好"：先看 `show` 那一段里对象停在哪个阶段
+      （`Pending` = 调度或卷没就绪；`ImagePullBackOff` = 镜像拿不到；
+      `ContainerCreating` 卡住 = 卷挂不上）。
+
+conclusion: |
+  【{host.name}】等一个对象到达指定状态（只读）
+  · 对象：{kind}/{name}（命名空间 {namespace}）｜ 条件：{condition} ｜ 超时：{timeout_seconds} 秒
+  · ★★ 等待结果（`kubectl wait` 的退出码为 0 才算等到）：
+  {wait}
+  · 对象现状：
+  {show}
+
+  判读：
+    · ★★ **判据是退出码**：超时 ⇒ 非 0 ⇒ 判红（规范 §12.32.2）。
+      ★ 它回答的是"**成了没有**"，与 `k8s.apply` 的 `get -f`（"**在不在**"）**互补**——
+      "对象建出来了"与"它跑起来了"是两件事（§12.6.5 同源）；
+    · ★ 超时**不是**失败的同义词：**没挂上的卷、拉不动的镜像**，给再长也等不到。
+      先看"对象现状"那一段停在哪个阶段，再决定要不要加大超时；
+    · ★ 本动作**只读**：不创建、不修改、不删除对象（`changed` 恒 false）。

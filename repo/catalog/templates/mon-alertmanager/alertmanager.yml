@@ -1,0 +1,44 @@
+# ============================================================
+# managed by auto-ops-console (T10) —— 请勿手工编辑
+# 落点：/opt/aoc-monitoring/etc/alertmanager.yml
+#
+# ★★ 本文件里真正的"判据"只有一处：**收端**（规范 v1.13 §12.57）。
+#   配置里写了 webhook 地址**不算**——`AocWebhookSink` 那个端点里
+#   真的出现了这条告警（带时间戳与标签），才算"送出去了"。
+# ★ 抑制（§12.56）：同一实例、同一 `aoc_group` 内，severity=critical 抑制 severity=warning。
+#   于是"写 1 ⇒ 只有 Warning 响 / 写 2 ⇒ Critical 响且 Warning 消失"这一对**可证伪**。
+# ★ 渲染参数：receiver_url
+# ============================================================
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: aoc-webhook
+  group_by: ["alertname", "instance", "aoc_group"]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity="critical"
+      receiver: aoc-webhook
+      continue: false
+
+receivers:
+  - name: aoc-webhook
+    webhook_configs:
+      - url: "{{ receiver_url }}"
+        send_resolved: true
+        max_alerts: 0
+
+inhibit_rules:
+  # ★ 抑制对：同实例 + 同 aoc_group 内，critical 压住 warning。
+  #   · 自检对：AocMonSelfTestCritical 抑制 AocMonSelfTestWarning
+  #   · 容量对：AocFilesystemSpaceCritical 抑制 AocFilesystemSpaceLow / AocHostDiskInodesLow
+  #   · 可用性：AocExporterDown 抑制同实例的 AocScrapeSamplesDrop（exporter 都掉线了，别再报样本数）
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: ["instance", "aoc_group"]

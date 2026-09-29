@@ -1,0 +1,39 @@
+# ============================================================
+# 反例配方 1：把命令写进了配方里（宪法①：配方只声明"要什么"）
+# ★ 期望：装载期被拒，且**点名** `run` 这个键
+# ============================================================
+
+id: bad-command
+name: 反例·配方里写命令
+version: "1"
+summary: 故意写错：配方里出现 run
+risk: green
+params:
+  - name: port
+    label: 端口
+    type: int
+    required: true
+    default: 9100
+
+steps:
+  - name: s1
+    title: 直接跑一条命令（★ 不许）
+    run: [systemctl, restart, nginx]
+    parser: raw
+
+health:
+  - expect:
+      state: { unit: nginx, equals: active }
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: nginx }
+  disable: []
+  remove_config: []
+  purge_paths: []
+  keep_data: []
+  remove_packages: []
+  stop_confirm_text: 我已确认要停止服务
+  purge_confirm_text: 我已确认全删
+  health: []

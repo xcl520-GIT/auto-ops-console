@@ -1,0 +1,14 @@
+id: bad.pipe
+title: 坏动作-管道
+summary: 故意违规
+domain: A
+risk: green
+priority: P0
+steps:
+  - name: s1
+    title: 用管道
+    run: ["dmesg | grep -i oom"]
+    parser: lines
+verify:
+  - name: a
+    from: s1

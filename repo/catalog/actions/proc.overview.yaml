@@ -1,0 +1,152 @@
+# ============================================================
+# 动作：进程总览
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 E（P0 · 只读）
+# 形态：一次给全结论（负载/核数/总数 + 排序后的进程 + 按用户/名称过滤 + 进程树）
+# 风险：green
+# ============================================================
+
+id: proc.overview
+title: 进程总览
+summary: 负载与进程数、按 CPU/内存排序的 TOP 进程、按用户或名称过滤、进程树
+domain: E
+risk: green
+priority: P0
+tags: [只读, 进程, 排行]
+note: |
+  ★ 两个实测出来的坑：
+    ① `ps -e ... -u <用户>` **不会**按用户过滤（-e 的选择范围会压过 -u），
+       所以"按用户"那一步**不带 -e**，并且整条命令用 when 整体挂起（没填用户就整步跳过）。
+    ② `ps --no-headers` 去掉表头，否则表头会被当成第一条进程。
+  截断（每条列表最多取前 N 条，N = top_n，默认 20）由 head_lines 解析器做 ——
+  动作层禁止管道，`| head` 写不了。
+
+params:
+  - name: sort
+    label: 排序依据
+    type: enum
+    choices: ["CPU 占用", "内存占用", "启动时间"]
+    values: ["-pcpu", "-pmem", "start_time"]
+    default: "CPU 占用"
+
+  - name: user
+    label: 只看某个用户
+    type: str
+    required: false
+    pattern: '^[a-z_][a-z0-9_-]{0,31}$'
+    placeholder: root
+    help: 留空 = 跳过该步骤（对应下面「按用户过滤」一栏显示（无））。
+
+  - name: name
+    label: 按进程名看详情
+    type: str
+    required: false
+    pattern: '^[A-Za-z0-9._-]{1,32}$'
+    placeholder: sshd
+    help: 用 pgrep -a 展示完整命令行（会连 sshd-session 这类同前缀进程一起列出）；留空 = 跳过。
+
+  - name: top_n
+    label: 列表显示条数
+    type: int
+    min: 1
+    max: 200
+    default: 20
+    help: 每个列表最多显示前 N 条（T4 起可调）。以前固定 20 条，会遇到"看不见第 21 个"的情况。
+
+steps:
+  - name: loadavg
+    title: 负载
+    run: ["cat", "/proc/loadavg"]
+    parser: space_list
+    note: 取 /proc/loadavg 而不是 uptime 的人读文本 —— 结构化优先。
+
+  - name: cpus
+    title: 逻辑核数
+    run: ["nproc"]
+    parser: raw
+
+  - name: boot
+    title: 开机时间
+    run: ["uptime", "-s"]
+    parser: raw
+    optional: true
+
+  - name: total
+    title: 进程总数
+    run: ["ps", "-e", "--no-headers"]
+    parser: line_count
+    note: line_count 只数行数，不把 253 行都塞进结论。
+
+  - name: procs
+    title: 进程列表（排序）
+    run:
+      - ps
+      - -eo
+      - pid,ppid,user,pcpu,pmem,stat,etime,comm
+      - --sort
+      - "{{ sort }}"
+      - --no-headers
+    parser: head_lines
+    parser_arg: "{{ top_n }}"
+    note: 排序由 ps 自己做；只保留前 {top_n} 条（T4 起可调，见规范 §10.5），避免一屏几百行。
+
+  - name: by_user
+    title: 按用户过滤
+    run:
+      - { when: user, value: ps }
+      - { when: user, value: -o }
+      - { when: user, value: pid,ppid,user,pcpu,pmem,stat,etime,comm }
+      - { when: user, value: -u }
+      - { when: user, value: "{{ user }}" }
+      - { when: user, value: --no-headers }
+    parser: head_lines
+    parser_arg: "{{ top_n }}"
+    optional: true
+    note: >
+      每个元素都挂 when: user → 没填用户时渲染成空 argv，引擎按"未提供参数 → 本步未执行"处理。
+      **注意不带 -e**：实测 -e 会让 -u 失效（列出的仍是全部进程）。
+
+  - name: by_name
+    title: 按名称看详情
+    run:
+      - { when: name, value: pgrep }
+      - { when: name, value: -a }
+      - { when: name, value: "{{ name }}" }
+    parser: lines
+    optional: true
+    note: pgrep -a 输出"PID + 完整命令行"，比 ps 的 comm 更能看出进程在干什么。
+
+  - name: tree
+    title: 进程树
+    run: ["pstree", "-p"]
+    parser: head_lines
+    parser_arg: "{{ top_n }}"
+    timeout: 20
+    optional: true
+    note: 括号内是 PID。进程多时会很长，故截断到前 {top_n} 行。
+
+verify:
+  - name: 必须能列出进程
+    from: procs
+    on_missing: ps 没有返回进程列表 —— 本结论不可用
+  - name: CPU 核数必须可读
+    from: cpus
+    on_missing: nproc 无输出（coreutils 缺失？）—— 无法判断负载是否偏高
+
+conclusion: |
+  【{host.name}】进程总览
+  逻辑核 {cpus} ｜ 进程总数 {total} ｜ 开机于 {boot}
+  负载（1 / 5 / 15 分钟）：{loadavg.0} / {loadavg.1} / {loadavg.2}
+  按 [{sort}] 降序，最多 {top_n} 条 —— PID / PPID / USER / %CPU / %MEM / STAT / 已运行 / COMMAND：
+  {procs}
+  按用户 [{user}] 过滤：
+  {by_user}
+  按名称 [{name}] 的完整命令行（pgrep -a）：
+  {by_name}
+  进程树（前 {top_n} 行，括号内为 PID）：
+  {tree}
+
+  判读：
+  · 负载 1 分钟值 > 逻辑核数（{cpus}）→ 已经在排队，先确认上面 %CPU 前几名是不是预期内的进程；
+  · 内存吃紧时把「排序依据」改成「内存占用」，看 %MEM 前列；
+  · STAT 速查：R 运行 ｜ S 睡眠 ｜ D 不可中断（多在等 IO，是 IO 瓶颈的典型信号）｜ Z 僵尸 ｜ T 停止；
+  · 「按用户」或「按名称」栏显示（无）= 没填那个过滤条件，或该条件没有命中进程。

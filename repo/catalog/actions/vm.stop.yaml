@@ -1,0 +1,115 @@
+# ============================================================
+# 动作：关闭虚拟机（优雅）
+# 来源：设计\05-虚拟化层-架构设计.md §4 · 总纲 §4.2 T16
+# 形态：走 guest 的**优雅关机**（soft）→ 判据：VMware 的运行清单里没有它了
+# 风险：yellow（可逆：再开一次即可）｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.stop
+title: 关闭虚拟机（优雅关机）
+summary: 请 guest 自己关机（soft）—— 会等服务停完再断电，不是拔电源
+domain: M
+risk: yellow
+priority: P0
+channel: local
+tags: [变更, 虚拟化, 电源]
+
+note: |
+  ★★ `soft` 与 `hard` 是**两件事**（规范 §12.118 / 红线 15）：
+    · `soft`（本动作）= 请 guest 自己关机：它会停服务、刷盘再断电 ⇒ **yellow**；
+    · `hard` = **拔电源**（`vm.stop-hard`）⇒ **永远 red**，可能丢数据。
+  ★★ 与 `vm.start` 同一条纪律（规范 §12.119）：命令那一步是**收条**（可 optional），
+    判据是"再问一次 VMware：它还在这份运行清单里吗"。
+
+confirm:
+  title: 确认关闭虚拟机（优雅关机）
+  body: |
+    即将在**宿主机**上关闭虚拟机「{vm_name}」（{vm_vmx}），方式：**soft（优雅关机）**。
+
+    会发生什么：
+      · guest 开始走正常关机流程（停服务、卸文件系统、刷盘）
+      · 它的服务会随之下线（例如 target 机上的 kubelet / 监控三件套）
+      · ★ 若它本来就已关机，本动作**什么都不会改**（幂等）
+
+    能不能撤回：
+      · 能：`vm.start` 再开一次
+      · ★ **回不去的部分**：关机期间它对外提供的服务是**真的中断了**（不是"看起来断了"），
+        中断期间的请求与连接**恢复不了**。
+  confirm_text: 我已确认要关机
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名；★ 只有"已登记"或"当次点名"的才允许操作
+
+  - name: timeout_sec
+    label: 最多等多少秒（等它真的从运行清单里消失）
+    type: int
+    required: true
+    default: 180
+    min: 10
+    max: 900
+    help: 超过这个时间仍在运行 ⇒ **判红**（如实说"它还没关掉"）
+
+precheck:
+  - name: vmx_ok
+    title: 确认这台虚拟机的 vmx 打得开
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "listSnapshots", "{{ vm_vmx }}"]
+    parser: raw
+    ok_exit_codes: [0]
+
+steps:
+  - name: probe_before
+    title: 动手前先问一次：它现在在跑吗（★ 幂等的判据来源）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "state", "--vmx", "{{ vm_vmx }}"]
+    parser: json
+    timeout: 60
+
+  - name: stop
+    title: 请求优雅关机（★ 这一步只是**收条**）
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "stop", "{{ vm_vmx }}", "soft"]
+    parser: raw
+    timeout: 300
+    optional: true
+    note: |
+      ★ `soft` = 请 guest **自己**关机（会等服务停完、文件系统刷盘）。
+      ★ 为什么 optional：对**已经关机**的 VM 报错是**幂等路径**，不是失败。
+      ★ 但它只是**收条** —— "它到底关掉了吗"由下一步回答。
+
+  - name: wait_stopped
+    title: 判据：再问一次 VMware，它真的不在运行清单里了吗（★ 退出码就是结论）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_vmx }}", "--expect", "stopped", "--wait", "{{ timeout_sec }}"]
+    parser: json
+    timeout: 960
+    ok_exit_codes: [0]
+    note: |
+      ★ 0 = 真的不在运行了 · 3 = 等超时它还在跑（**判红**）· 2 = 读不到。
+      ★ `soft` 是**请求**：guest 可以选择"我还有服务没停完" ⇒ 那就该等到超时并**如实判红**，
+        而不是"命令返回 0 就算关掉了"。（要强关，请用 `vm.stop-hard` —— 那是 red。）
+
+verify:
+  - name: 必须读到"动手前"的状态（否则幂等无法判定）
+    from: probe_before
+    field: was_running
+    on_missing: 没读到动手前的状态 ⇒ 这次到底改没改，**无法判定**（不许猜）
+  - name: 必须读到"动手后"的状态
+    from: wait_stopped
+    field: state
+    on_missing: 判据那一步没有给出状态 —— 本结论不可用
+
+conclusion: |
+  【{vm_name}】关机结果
+  · 动手前：{probe_before.state}（was_running={probe_before.was_running}）
+  · 动手后：{wait_stopped.state}（等了几秒 {wait_stopped.waited_sec}）
+  · 判据来源：{wait_stopped.checked}
+
+  判读：
+  · 若 `was_running=no` ⇒ 本次**没有改动任何东西**（幂等：它本来就关着）；
+  · 优雅关机会等 guest 把服务停完 —— 如果这里等超时了，说明 guest **没能在时限内关完**
+    （可能是服务卡住 / 有未完成的写盘）⇒ ★ 请先看它在 guest 里的状态，
+    **不要**顺手改成 `vm.stop-hard`（那是拔电源，red）。

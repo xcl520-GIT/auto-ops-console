@@ -1,0 +1,59 @@
+# ============================================================
+# 动作：MariaDB 探活（真问一句"它活着吗"）
+# 来源：T6 服务铺量 —— `expect` 第 6 类 `responds` 的采集来源（规范 §12.11）
+# 形态：**只读**（green）—— 不重启、不写任何文件
+# ============================================================
+
+id: db.mariadb-ping
+title: MariaDB 探活
+summary: 真问一句 MariaDB 活着吗（mariadb-admin ping），只读、不改任何状态
+domain: E
+risk: green
+priority: P1
+tags: [只读, 服务, 数据库]
+
+note: |
+  ★ 存在的理由：`state: active`（单元在跑）和"端口在听"都只是**旁证**。
+  "部署完了到底能不能用"需要**真问一句** —— 就像 Nginx 的 `http_status`。
+  本动作就是 MariaDB / Valkey / NFS 三兄弟的那一句（规范 §12.11）。
+
+  ★ 为什么是 `mariadb-admin ping`（**不加** `-h 127.0.0.1 -P 3306`）：
+  不加 `-h` 时客户端走**本机 socket**，而 RHEL/Rocky 上 MariaDB 的 root 默认是
+  **unix_socket 认证** —— 工作台正是以 root 连接，所以**不需要密码**。
+  走 TCP 反而会因"root 不允许无密码远程登录"而报 Access denied：
+  那是**认证问题**，不是**服务问题**，拿它当健康判据会误判。
+  ⇒ ★ **已真机确认（T6·S2）**：本机 socket 形态返回 `mysqld is alive`（免密码、root unix_socket 认证）。
+
+  ★ **它证明不了什么**：`responds` 走的是本机 socket，**完全不看 TCP 端口** ——
+  所以"参数里填的 port 生效了没有"必须由**另一条判据**钉住：配方的 `health` 里同时给
+  `port_open: "{{ port }}"`（规范 §12.11 / 检查清单 45）。两条一起才算"部署完了能用"。
+
+  ★ **故意不做 precheck**：不预检 `mariadb-admin` 在不在，让命令自己失败 ——
+  引擎会把 rc=127 翻译成 `TOOL_MISSING`（规范 §8.2），于是期望判定降级成「**无法判定**」，
+  而不是把它误报成「服务没应答」。用 `ls` 预检反而会把"缺工具"变成一次 abort。
+
+  ★ 本动作**只读**（green）：`changed` 恒 `false`（规范 §12.3，按 risk 自动判定）。
+
+params: []
+
+steps:
+  - name: probe
+    title: 问一句 MariaDB（本机 socket）
+    run: [/usr/bin/mariadb-admin, ping]
+    parser: raw
+    timeout: 30
+    note: >
+      成功时输出 `mysqld is alive`（★ MariaDB 客户端的原文，配方里 `equals` 就写它）。
+      服务没起来 → 命令非 0 → 动作失败 → 期望判 **fail**（那就该判红）；
+      客户端没装 → rc=127 → `TOOL_MISSING` → 期望判 **unknown**（无法判定，**不是**通过）。
+
+verify:
+  - name: 探活必须有输出（没输出 = 这次根本没问到）
+    from: probe
+    on_missing: 拿不到探活输出 —— 这次"问一句"没有结果
+
+conclusion: |
+  【{host.name}】MariaDB 探活
+  应答：{probe}
+  判定：上面是**服务自己的应答原文** —— 不是"端口在听"、也不是"单元在跑"那种旁证。
+  说明：本动作**只读** —— 不重启服务、不写任何文件。

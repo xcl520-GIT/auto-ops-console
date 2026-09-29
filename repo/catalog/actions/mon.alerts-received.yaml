@@ -1,0 +1,97 @@
+# ============================================================
+# 动作：监控 · 收端里收到了什么（T10）
+# 来源：开题单 §7 验收 #6（"真的送出去了"）
+# 形态：**收端留证** —— 这是"送达"的唯一判据
+# 风险：green
+# ============================================================
+
+id: mon.alerts-received
+title: 监控 · 收端已收到的告警（送出去了没有）
+summary: 读 Webhook 收端的 append-only JSONL：一共收到几次投递、每次带哪些告警，并可当场判"某条必须到过"
+domain: J
+risk: green
+priority: P0
+tags: [只读, 监控, 通知, 收端, 判据, T10]
+
+note: |
+  ★★ 规范 v1.13 §12.57「**"送出去了"是通知面的唯一判据**」：
+    配置里写了 webhook 地址**不算**；Alertmanager 日志里说 "Notify success" 也**只是旁证**；
+    只有**收端里真的出现了这条告警（带接收时间戳与标签）**才算送达。
+  ★★ 收端**只绑 127.0.0.1**（见模板 `mon-webhook/receiver.service`）—— 
+    Alertmanager 与它在同一台机器上，所以**监听面一处都没有扩大**；
+    控制台通过**本动作**把它读回来。★ 这与开题单 §10.2.4 的**目标**一致（差异已记入 §10.2.1）。
+  ★★ `expect_received` 四个 run 元素统一挂同一个 `when`（规范 §12.51.1）：留空 ⇒ 整步跳过。
+
+params:
+  - name: sink
+    label: 收端的落盘文件
+    type: str
+    required: true
+    default: /opt/aoc-monitoring/data/webhook/alerts-received.jsonl
+    pattern: '^/opt/aoc-monitoring/[A-Za-z0-9._/-]{1,80}$'
+  - name: expect_received
+    label: 必须收到过这条告警（留空则不判）
+    type: str
+    required: false
+    default: ""
+    pattern: '^[A-Za-z][A-Za-z0-9_]{0,63}$'
+    help: 告警名，例如 AocMonSelfTestCritical。留空 = 跳过这个判据。
+
+steps:
+  - name: unit
+    title: 收端单元在不在
+    run: [systemctl, is-active, aoc-mon-webhook.service]
+    parser: raw
+    ok_exit_codes: [0, 3]
+    timeout: 20
+    note: rc=3 = inactive（"还没收到过东西"时它可能没起）—— 这也是结论，不是故障。
+
+  - name: deliveries
+    title: 一共收到几次投递
+    run: [grep, -c, ".", "{{ sink }}"]
+    parser: raw
+    ok_exit_codes: [0, 1, 2]
+    timeout: 20
+    note: rc=2 = 文件还不存在 = "一次都没收到过"（**是结论**，所以 2 也算成功）。
+
+  - name: assert_received
+    title: ★★ 判据：这条告警必须到过收端
+    optional: true
+    run:
+      - { when: expect_received, value: grep }
+      - { when: expect_received, value: -q }
+      - { when: expect_received, value: "\"alertname\": \"{{ expect_received }}\"" }
+      - { when: expect_received, value: "{{ sink }}" }
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+
+  - name: last
+    title: 最近几次投递的原文（人读）
+    run: [tail, -n, "3", "{{ sink }}"]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    optional: true
+    note: ★★ rc=1 也算成功：**"收端还一次都没收到过"是结论，不是出错** —— 那正是这条动作最该报出来的东西（陈列型步骤必须接受 rc=1，§12.51 同族）。
+    timeout: 20
+
+verify:
+  - name: 收端落盘的读取必须成立
+    from: deliveries
+    on_missing: 收端的落盘文件读不到（rc 既不是 0/1 也不是 2）—— 看单元与目录权限
+
+conclusion: |
+  【{host.name}】监控 · 收端已收到的告警
+  收端单元：{unit} ｜ 落盘：{sink}
+  **投递次数 {deliveries}** ｜ 判据：必须收到过「{expect_received}」
+
+  最近 3 次投递原文（JSONL，一行一次投递）：
+  {last}
+
+  判读：
+  · **投递次数 = （无）** ⇒ 一次都没送达过：① 看 `aoc-alertmanager.service` 在不在；
+    ② 看 `alertmanager.yml` 里的 `url` 对不对；③ 看 `aoc-mon-webhook.service` 在不在（它没起，投递会被拒）；
+  · 一行里 `status` 是 **firing** 或 **resolved** —— `resolved` 是"这条已经恢复"（`send_resolved: true`），
+    它同样算"送达过"，不要把 resolved 当成失败；
+  · ★★ **本动作的结论才是"送出去了"** —— 收端里没有，就是没有。别拿"配置里写了地址"糊过去；
+  · 本动作只读：不删收端记录、不改 Alertmanager 配置。

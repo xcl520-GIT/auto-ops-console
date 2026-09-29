@@ -1,0 +1,122 @@
+# ============================================================
+# 动作：监控 · Alertmanager 告警面（含抑制状态）（T10）
+# 来源：开题单 §7 验收 #7（"抑制真的生效"）
+# 形态：**抑制是 Alertmanager 的职责** —— 判据只能问它，问 Prometheus 是问错了人
+# 风险：green
+# ============================================================
+
+id: mon.am-alerts
+title: 监控 · Alertmanager 告警面（含抑制状态）
+summary: 读 Alertmanager 的 /api/v2/alerts：有几条 active、几条被 suppressed（抑制），并可当场判定上下界
+domain: J
+risk: green
+priority: P0
+tags: [只读, 监控, 抑制, 判据, T10]
+
+note: |
+  ★★★ **为什么抑制必须问 Alertmanager，不能问 Prometheus**（规范 v1.13 §12.56）：
+    `/api/v1/alerts`（Prometheus 的）回答的是"**规则判没判**"；
+    而**抑制是 Alertmanager 在投递前做的决定**，Prometheus 根本不知道。
+    真跑现场：写 value=2 之后，Prometheus 那边 `AocMonSelfTestWarning` **照样是 firing**，
+    而 Alertmanager 这边它变成 `"state": "suppressed"`、并给出 `inhibitedBy` 的指纹。
+    ⇒ 拿 Prometheus 的 API 去验抑制，**永远验不出来**（会得出"抑制没生效"的错误结论）。
+  ★★ **机器判据**（两个可选的上下界，默认 0 = 不判）：
+    · `expect_active_max`   —— active **不许超过** N 条；
+    · `expect_suppressed_min` —— suppressed **至少**有 N 条。
+    抑制成立时：写 1 ⇒ active=1 / suppressed=0；写 2 ⇒ **active=1 / suppressed=1**
+    （★ 若抑制没生效，写 2 时 active 会是 **2** ⇒ 第一条判红，抓得到）。
+  ★ 计数一律走 `awk` 数**出现次数**（不是 `grep -c` 数行）—— 紧凑 JSON 只有一行，`grep -c` 只会给出 1。
+
+params:
+  - name: am_base
+    label: Alertmanager 地址
+    type: str
+    required: true
+    default: http://127.0.0.1:9093
+    pattern: '^http://127\.0\.0\.1:[0-9]{2,5}$'
+  - name: expect_active_max
+    label: active 不许超过几条（0 = 不判）
+    type: int
+    required: true
+    min: 0
+    max: 99
+    default: 0
+  - name: expect_suppressed_min
+    label: suppressed 至少几条（0 = 不判）
+    type: int
+    required: true
+    min: 0
+    max: 99
+    default: 0
+
+steps:
+  - name: fetch
+    title: 取 Alertmanager 的 /api/v2/alerts（★ 抑制状态的唯一出处）
+    run: [curl, -sS, --max-time, "15", -o, /opt/aoc-monitoring/_out/am-alerts.json, "{{ am_base }}/api/v2/alerts"]
+    parser: raw
+    timeout: 40
+
+  - name: pretty
+    title: 整理成稳定文本
+    run: [python3, -m, json.tool, /opt/aoc-monitoring/_out/am-alerts.json, /opt/aoc-monitoring/_out/am-alerts.pretty.json]
+    parser: raw
+    timeout: 40
+
+  - name: count_active
+    title: active 几条
+    run: [awk, "{n+=gsub(/\"state\": \"active\"/,\"\")} END{print n+0}", /opt/aoc-monitoring/_out/am-alerts.pretty.json]
+    parser: raw
+    timeout: 20
+
+  - name: count_suppressed
+    title: suppressed（被抑制）几条
+    run: [awk, "{n+=gsub(/\"state\": \"suppressed\"/,\"\")} END{print n+0}", /opt/aoc-monitoring/_out/am-alerts.pretty.json]
+    parser: raw
+    timeout: 20
+
+  - name: detail
+    title: 每条告警的原件（告警名 / 状态 / 严重度 / 被谁抑制）
+    run: [grep, -e, '"alertname": ', -e, '"state": ', -e, '"severity": ', -e, '"inhibitedBy": ', /opt/aoc-monitoring/_out/am-alerts.pretty.json]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    optional: true
+    note: ★★ rc=1 也算成功：**"Alertmanager 这边一条都没有"是结论，不是出错**（陈列型步骤必须接受 rc=1，§12.51 同族）。
+    timeout: 20
+
+  - name: assert_active_max
+    title: ★★ 判据：active 不许超过 {expect_active_max} 条
+    run: [awk, "{n+=gsub(/\"state\": \"active\"/,\"\")} END{exit (n<={{ expect_active_max }}?0:1)}", /opt/aoc-monitoring/_out/am-alerts.pretty.json]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    note: ★ `expect_active_max=0` 时这条恒真（不判）—— 于是它不会成为"永远红的假闸门"。
+  - name: assert_suppressed_min
+    title: ★★ 判据：suppressed 至少 {expect_suppressed_min} 条
+    run: [awk, "{n+=gsub(/\"state\": \"suppressed\"/,\"\")} END{exit (n>={{ expect_suppressed_min }}?0:1)}", /opt/aoc-monitoring/_out/am-alerts.pretty.json]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+
+verify:
+  - name: 必须读到 Alertmanager 的告警面
+    from: count_active
+    on_missing: /api/v2/alerts 没有返回内容 —— Alertmanager 在不在？端口对不对？
+
+conclusion: |
+  【{host.name}】监控 · Alertmanager 告警面（含抑制状态）
+  Alertmanager：{am_base}
+  **active {count_active}** ｜ **suppressed {count_suppressed}**
+  判据：active ≤ {expect_active_max} ｜ suppressed ≥ {expect_suppressed_min}
+
+  逐条（告警名 / 状态 / 严重度 / 被谁抑制）：
+  {detail}
+
+  判读：
+  · ★★★ **`suppressed` 是抑制的唯一可信证据**，而且它**只在 Alertmanager 这一侧存在** ——
+    Prometheus 的 `/api/v1/alerts` 里那条被抑制的告警**照样是 firing**（抑制是投递前的决定）。
+    ⇒ 用错 API 会得出"抑制没生效"的**错误结论**；
+  · `inhibitedBy` 给出的是**抑制它的那些告警的指纹** —— 有它就是"被压住了"的结构性证据；
+  · ★★ **抑制对在这里的形态**：`AocMonSelfTestWarning`（warning）与 `AocMonSelfTestCritical`（critical）
+    是同一个指标上的两个阈值；`inhibit_rules` 里 critical 压住同实例同组 warning。
+    于是 写 1 ⇒ active=1 / suppressed=0；写 2 ⇒ **active=1 / suppressed=1**；
+  · 本动作只读：不 silencing、不 expire、不改配置。

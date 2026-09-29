@@ -1,0 +1,82 @@
+# ============================================================
+# 动作：SELinux 拒绝记录（AVC）
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 G（P0 · 只读）
+# 形态：一次给全结论（模式 + auditd 状态 + 指定范围的 AVC 记录）
+# 风险：green
+# ============================================================
+
+id: sec.avc
+title: SELinux 拒绝记录
+summary: 指定时间范围内的 AVC 拒绝记录（含 auditd 是否可信的说明）
+domain: G
+risk: green
+priority: P0
+tags: [只读, 安全, SELinux, 排障]
+note: |
+  AVC 是"服务能启动但访问被拒"这类疑难杂症的常见根因（改端口、迁移数据目录、自建服务）。
+  本动作同时给出 SELinux 模式与 auditd 状态 —— 因为**没有 auditd 时"查不到记录"并不等于"没有拒绝"**，
+  这一点必须让人看到，而不是让人误以为"干净"。
+  ausearch 查不到匹配时退出码为 1 且输出 "<no matches>"，故声明 ok_exit_codes: [0, 1]。
+
+params:
+  - name: span
+    label: 查询时间范围
+    type: enum
+    choices: ["最近 10 分钟", "今天", "本周", "本次开机以来"]
+    values: ["recent", "today", "this-week", "boot"]
+    default: "最近 10 分钟"
+    help: 对应 ausearch 的 -ts 取值。★ 范围越大越慢（实测 -ts today 在全量审计日志上要 70 秒以上），默认用最快且最常用的「最近 10 分钟」。
+
+steps:
+  - name: enforce
+    title: SELinux 当前模式
+    run: ["getenforce"]
+    parser: raw
+    optional: true
+
+  - name: auditd
+    title: auditd 状态
+    run: ["systemctl", "is-active", "auditd"]
+    parser: raw
+    ok_exit_codes: [0, 3]
+    note: >
+      is-active 在未运行时返回 3 并把 "inactive" 写到 stdout —— 这就是我们要的结论，
+      声明为正常报告，否则"审计服务没跑"会被显示成步骤失败。
+
+  - name: denials
+    title: AVC 拒绝记录
+    run: ["ausearch", "-m", "avc", "-ts", "{{ span }}", "--input", "/var/log/audit/audit.log"]
+    parser: lines
+    optional: true
+    ok_exit_codes: [0, 1]
+    timeout: 150
+    note: >
+      ★ 必须显式给 --input：ausearch 在 stdin 不是终端时会**把 stdin 也当成输入来源**并一直等 EOF，
+      经 SSH 执行就会挂死（T2 实测：同一条命令手工直跑 20ms，经引擎跑挂满 160 秒）。
+      传输层已统一加 `< /dev/null` 兜住这一整类问题，这里再显式指定审计日志，
+      让"读哪个文件"不依赖任何隐含约定，双重保险。
+      无匹配时退出码 1、输出 `<no matches>` —— 这是"没有拒绝"的结论，不是失败。
+      超时给到 150 秒：范围选「今天/本周」时 ausearch 要扫很大的审计日志（实测 70 秒以上）。
+
+verify:
+  - name: 必须确认 auditd 状态
+    from: auditd
+    on_missing: 读不到 auditd 状态 —— 无法判断"查不到 AVC"是否可信
+
+conclusion: |
+  【{host.name}】SELinux 拒绝记录（AVC）
+  SELinux 当前模式：{enforce} ｜ auditd：{auditd} ｜ 查询范围：{span}
+  拒绝记录：
+  {denials}
+
+  判读：
+  · 记录结构：`avc: denied { 权限 } for pid=... comm="..." scontext=... tcontext=... tclass=...`
+    —— scontext 是"谁"，tcontext 是"被访问的目标"，tclass 是目标类型；
+  · 常见成因：改了服务监听端口、把数据目录挪到 /opt 或 /home（非标准上下文）、
+    自建服务没打标签、拷贝文件时丢了上下文（用 cp 而非 cp -Z）；
+  · 处理原则：**不要 setenforce 0 关掉整机 SELinux**（那会同时掩盖其它问题）。
+    正确做法是用 `restorecon -Rv <目录>` 修上下文，或用 semanage 放行端口/路径；
+  · 显示 `<no matches>` → 该范围内没有拒绝记录（好事）；
+  · ⚠️ 若 auditd 显示 inactive → 立即查到的结果**不可信**（内核拒绝事件没有落盘/转 journal），
+    先 `dnf install -y audit` 并 `systemctl enable --now auditd`；
+  · 还要看更宽的错误面（不止 AVC）请看「内核日志与 OOM」。

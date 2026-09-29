@@ -1,0 +1,15 @@
+id: undefparam.run
+title: 坏动作-未定义参数
+summary: 故意违规
+domain: A
+risk: green
+priority: P0
+params: []
+steps:
+  - name: s1
+    title: x
+    run: ["echo", "{{ not_defined }}"]
+    parser: raw
+verify:
+  - name: a
+    from: s1

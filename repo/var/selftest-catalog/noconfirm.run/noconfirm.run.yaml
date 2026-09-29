@@ -1,0 +1,14 @@
+id: noconfirm.run
+title: 坏动作-yellow无确认文案
+summary: 故意违规
+domain: E
+risk: yellow
+priority: P0
+steps:
+  - name: s1
+    title: x
+    run: ["true"]
+    parser: raw
+verify:
+  - name: a
+    from: s1

@@ -1,0 +1,97 @@
+# ============================================================
+# 动作：服务总览
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 E（P0 · 只读）
+# 形态：谁在跑、谁失败了、失败原因是什么（一次给全结论）
+# 风险：green
+#
+# 解析策略（开题单技术要求 #3「不要解析人类可读输出」）：
+#   systemctl 一律加 --output=json 取结构化数据；
+#   systemctl show 用 -p 取属性（KEY=VALUE）；
+#   journalctl 用 -o short-iso 只是为了让时间可读，失败原因靠退出码 + Result 属性。
+# ============================================================
+
+id: svc.list
+title: 服务总览
+summary: 谁在跑、谁失败了、失败原因是什么
+domain: E
+risk: green
+priority: P0
+tags: [只读, 服务, 一屏结论]
+
+params: []
+
+steps:
+  - name: health
+    title: 系统整体状态
+    run: ["systemctl", "is-system-running", "--no-pager"]
+    parser: raw
+    optional: true
+    # 这个命令的退出码本身就是"报告"，不是"成败"：
+    #   0 = running，1 = degraded（有单元失败），其它值 = 更差的状态。
+    # 所以把 1 也声明为可接受，避免界面上把 degraded 显示成"步骤失败"。
+    ok_exit_codes: [0, 1]
+    note: 取值 running / degraded / maintenance / starting / stopping / offline。
+
+  - name: running
+    title: 运行中的服务
+    run: ["systemctl", "list-units", "--type=service", "--state=running",
+          "--output=json", "--no-pager"]
+    parser: json
+
+  - name: failed
+    title: 失败的服务
+    run: ["systemctl", "list-units", "--type=service", "--state=failed",
+          "--output=json", "--no-pager"]
+    parser: json
+
+  - name: loaded
+    title: 已加载服务总数
+    run: ["systemctl", "list-units", "--type=service", "--all",
+          "--output=json", "--no-pager"]
+    parser: json
+
+  - name: failed_state
+    title: 失败服务的状态属性
+    foreach: "failed.unit"          # 遍历上一步解析出的 unit 列表
+    as: unit
+    item_pattern: '^[A-Za-z0-9@._-]+$'
+    run: ["systemctl", "show", "{{ unit }}", "--no-pager",
+          "-p", "Id", "-p", "Description",
+          "-p", "ActiveState", "-p", "SubState", "-p", "LoadState",
+          "-p", "Result", "-p", "ExecMainStatus", "-p", "ExecMainCode",
+          "-p", "NRestarts", "-p", "FragmentPath"]
+    parser: shell_kv
+    optional: true
+
+  - name: failed_log
+    title: 失败服务的近期日志
+    foreach: "failed.unit"
+    as: unit
+    item_pattern: '^[A-Za-z0-9@._-]+$'
+    run: ["journalctl", "-u", "{{ unit }}", "-n", "8",
+          "--no-pager", "-o", "short-iso"]
+    parser: lines
+    optional: true
+    note: >
+      这里**故意不加 -p err 级别过滤**。
+      2026-09-23 用"故意失败的服务"实测发现：加了 -p err 之后只剩一行
+      「Failed to start t1-fixture.service - ...」，
+      而真正说明原因的两行 ——
+      「Main process exited, code=exited, status=1/FAILURE」
+      和「Failed with result 'exit-code'」—— 并不在 err 级别，会被一并过滤掉。
+      也就是说 -p err 刚好把"为什么失败"过滤没了。故改为不过滤级别、取最近 8 行。
+
+verify:
+  - name: 必须读到服务清单
+    from: loaded
+    on_missing: systemctl 未返回服务清单（目标机可能不是 systemd 系统，或权限不足）
+
+conclusion: |
+  系统整体状态：{health}
+  运行中 {running.count} 个 ｜ 失败 {failed.count} 个 ｜ 已加载合计 {loaded.count} 个
+
+  —— 失败明细（Result / 退出码 / 状态）——
+  {failed_state}
+
+  —— 失败服务的近期错误日志 ——
+  {failed_log}

@@ -1,0 +1,67 @@
+# ============================================================
+# 动作：读虚拟机的 .vmx 身份字段（只读）—— 身份五项之⑤
+# 来源：规范 §12.128（第 5 项）· §12.133（「改不动」要如实说）· 红线 13
+# 形态：只读解析 .vmx 的 uuid.bios / ethernet0.generatedAddress → 出一个指纹
+# 风险：green（**只读**；红线 13：读得到，改不动）｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.vmx-read
+title: 读虚拟机的 .vmx 身份字段（只读）
+summary: VMware 的 UUID / MAC / 显示名 / guestOS / 内存 —— ★ 只读，一个字都不改
+domain: M
+risk: green
+priority: P0
+channel: local
+tags: [只读, 虚拟化, 身份]
+
+note: |
+  ★★ 它是**第 5 项身份的唯一判据来源**（规范 §12.128 第 5 行 / §12.133）：
+    VMware 的 UUID 与 MAC 是**明文写在 `.vmx` 里的**，而红线 13 **禁止改 `.vmx`** ——
+    所以"克隆到底换没换它们"这件事，只能**读出来看**，不能改。
+  ★★ 「**读得到**」与「**改得动**」是两件事：本动作的能力边界就到这里；
+    若实测发现 `vmrun clone` 会自行换 UUID/MAC，**判据就是两台机这个指纹不一样**；
+    若换不掉，就按 §12.133 **如实写成"本平台的边界"**，不许硬改、也不许拿"让人去 GUI 手工改"冒充自动化。
+  ★ 指纹 = `sha256(uuid.bios + MAC)`：一句话就能回答"这两台机是不是同一个人"。
+  ★ 本动作**只读**：不读磁盘、不读快照内容、不写任何文件。
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx 或母机名
+    help: 可填 hosts.yaml 里的主机 id（推荐）、vmx 文件名，或 vm.extra_allow 里当次点名的名字
+
+steps:
+  - name: read
+    title: 只读解析 .vmx（★ 交代读的是哪个文件的哪几个键）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "vmx", "--vmx", "{{ vm_vmx }}"]
+    parser: json
+    timeout: 60
+    ok_exit_codes: [0]
+
+verify:
+  - name: 必须读到 uuid 与 MAC（否则"换没换"这件事无论可依）
+    from: read
+    field: identity_fingerprint
+    on_missing: 没读到 .vmx 的身份字段 —— 本结论不可用（★ 不等于"它是新的"）
+
+conclusion: |
+  【{vm_name}】`.vmx` 身份字段（只读，红线 13）
+  · 文件：{vm_vmx}
+  · 显示名 displayName：{read.display_name}
+  · guestOS：{read.guest_os}
+  · **uuid.bios**：{read.uuid_bios}
+  · uuid.location：{read.uuid_location}（与 uuid.bios 相同：{read.uuid_mac_equal_location}）
+  · **MAC**：{read.mac}
+  · 规格：{read.numvcpus} vCPU / {read.memsize_mb} MB
+  · ★ **身份指纹**（sha256(uuid + MAC)）：{read.identity_fingerprint}
+  · 文件大小 {read.size_bytes} 字节 · 最后写入 {read.mtime}
+  · 判据来源：{read.checked}
+
+  判读：
+  · 把**母机**与**新机**各读一次，比较那个**身份指纹**：
+    · 两个不同 ⇒ 克隆**自己换了** UUID/MAC（好消息，如实记进规范）；
+    · 两个相同 ⇒ 串味还在，而**平台改不动它**（红线 13）⇒ 按 §12.133 写成"平台边界"，
+      ★ 不许硬改 `.vmx`，也不许把"让人去 GUI 手工改"当成自动化。

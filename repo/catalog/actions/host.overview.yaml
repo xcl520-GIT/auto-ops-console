@@ -1,0 +1,98 @@
+# ============================================================
+# 动作：主机概览
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 A（P0 · 只读）
+# 形态：一次给全结论（发行版 / 内核 / CPU / 内存 / 负载 / 运行时长）
+# 风险：green —— 全部只读命令，不改动目标机
+# ============================================================
+
+id: host.overview
+title: 主机概览
+summary: 一次给全：发行版、内核、CPU、内存、负载、运行时长
+domain: A
+risk: green
+priority: P0
+tags: [只读, 主机, 一屏结论]
+note: 界面结果应与手工执行同组命令的结果一致（验收标准 #1 的对照对象）。
+
+params: []          # 无参数
+
+steps:
+  - name: os_release
+    title: 发行版
+    run: ["cat", "/etc/os-release"]
+    parser: shell_kv
+    note: /etc/os-release 是结构化契约文件（KEY=VALUE），不是"人类可读输出"，可安全解析。
+
+  - name: kernel
+    title: 内核
+    run: ["uname", "-r"]
+    parser: raw
+
+  - name: arch
+    title: 架构
+    run: ["uname", "-m"]
+    parser: raw
+
+  - name: hostname
+    title: 主机名
+    run: ["hostnamectl", "--static"]
+    parser: raw
+    optional: true            # 极简系统可能没有 hostnamectl（systemd 231+ 才有）
+
+  - name: cpu
+    title: CPU
+    run: ["lscpu"]
+    parser: colon_kv
+    pick:                     # 只挑结论需要的字段并改名，避免模板里出现带空格/括号的键
+      "Model name": model
+      "CPU(s)": cpus
+      "Socket(s)": sockets
+      "Core(s) per socket": cores_per_socket
+      "Thread(s) per core": threads_per_core
+      "CPU max MHz": mhz_max
+      "Virtualization": virtualization
+
+  - name: mem
+    title: 内存
+    run: ["free", "-m"]
+    parser: free_m
+
+  - name: loadavg
+    title: 负载
+    run: ["cat", "/proc/loadavg"]
+    parser: space_list
+
+  - name: uptime
+    title: 运行时长
+    run: ["uptime", "-p"]
+    parser: raw
+    optional: true
+
+  - name: uptime_sec
+    title: 运行时长（秒）
+    run: ["cat", "/proc/uptime"]
+    parser: space_list
+    note: >
+      /proc/uptime 输出**两个**数：第一个是系统已运行秒数，第二个是累计空闲秒数。
+      结论里取 {uptime_sec.0} —— 取整块会把空闲秒数一起渲染出来（T1 期间踩过）。
+
+verify:
+  - name: 必须读到发行版
+    from: os_release
+    field: PRETTY_NAME
+    on_missing: 无法从 /etc/os-release 读取发行版名称
+  - name: 必须读到内核
+    from: kernel
+    on_missing: uname -r 无输出
+  - name: 必须读到内存
+    from: mem
+    field: Mem
+    on_missing: free -m 未返回内存信息
+
+conclusion: |
+  【{hostname}】{os_release.PRETTY_NAME}（{os_release.VERSION_ID}）· {arch}
+  内核 {kernel} ｜ 已运行 {uptime}（{uptime_sec.0} 秒）
+  CPU {cpu.model} ｜ {cpu.sockets} 路 × {cpu.cores_per_socket} 核 × {cpu.threads_per_core} 线程 = {cpu.cpus} 逻辑核
+  内存 共 {mem.Mem.total}MB ｜ 已用 {mem.Mem.used}MB ｜ 可用 {mem.Mem.available}MB ｜ 缓存 {mem.Mem.buff_cache}MB
+  交换 共 {mem.Swap.total}MB ｜ 已用 {mem.Swap.used}MB
+  负载 1分钟 {loadavg.0} ｜ 5分钟 {loadavg.1} ｜ 15分钟 {loadavg.2}

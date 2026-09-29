@@ -1,0 +1,62 @@
+# ============================================================
+# 动作：读出这台机器的身份现状（只读）
+# 来源：规范 §12.128（五项身份与各自判据）· §12.129（拷贝件 ≠ 新机器）
+# 形态：把身份脚本推上去 → 跑 `show` → 四项身份与各自指纹逐行打印
+# 风险：green（**只读**）｜ 执行通道：ssh
+# ============================================================
+
+id: host.identity-show
+title: 读出这台机器的身份现状（只读）
+summary: machine-id / SSH host key 指纹 / 主机名 / 静态 IP —— 身份四项一次读全
+domain: A
+risk: green
+priority: P0
+channel: ssh
+tags: [只读, 身份, 造机]
+
+note: |
+  ★★ 它是"克隆后对照"的**前半段证据**（规范 §12.128 / §12.129）：
+    克隆出来的机器，**这一刻读到的就是母机的身份** ——
+    所以"重置之后再读一次、两次的指纹不一样"这件事，**本身就证明了它不再与母机相同**，
+    不需要把母机开机、也不需要把母机的值抄下来。
+  ★ **判据问被管的那一方**：machine-id 读 `/etc/machine-id` 本体、hostkey 比**公钥指纹**、
+    hostname **回读**、IP 问**网卡**（`ip -4 -o addr`）—— 全都不看"我写没写过"。
+  ★ 第 **5 项**身份（VMware UUID / MAC）在 `.vmx` 里，属**宿主机侧** ⇒ 用动作 `vm.vmx-read` 只读读出。
+  ★ 这台机器上**什么都不改**（脚本的 `show` 分支一个写操作都没有）。
+
+params: []
+
+steps:
+  - name: push_script
+    title: 把身份脚本推到目标机（只是脚本；★ 它自己改不了身份）
+    transfer: put
+    src: aoc-identity.sh
+    dst: /usr/local/sbin/aoc-identity.sh
+    parser: raw
+    note: |
+      ★ 脚本来自受控目录 `repo/var/uploads/`（进 Git、可复核、可单独看）。
+      ★ 为什么身份这件事要一个脚本：动作 YAML 的 `run` 元素**禁止 shell 元字符**
+        （`app/catalog.py::_FORBIDDEN_IN_ARGV`），而"删除 + 重新生成 + 前后对比 + 退出码"
+        天生需要复合语句 ⇒ 收进脚本，动作层只留朴素 argv（规范 §12.115.3 的同源纪律）。
+
+  - name: show
+    title: 读四项身份（★ 判据问被管的那一方）
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, show]
+    parser: raw
+    timeout: 60
+
+verify:
+  - name: 必须真的读到身份（否则这份对照没有证据）
+    from: show
+    on_missing: 身份那一步没有输出 —— 本结论不可用
+
+conclusion: |
+  【{host.name}】身份现状（只读）
+
+  {show}
+
+  ★ 交代查了什么（规范 §12.122：问不到 ≠ 不存在）：
+  · machine-id 读 `/etc/machine-id` **本体** · ssh host key 比**公钥指纹** ·
+    hostname **回读** · static-ip 问**网卡**（`ip -4 -o addr show scope global`）
+  ★ 第 5 项（VMware UUID / MAC）**不在这里** —— 它在 `.vmx` 里，用 `vm.vmx-read` 读。
+  ★ 本动作**不改任何东西**：它只是把"现在是谁"如实念出来。

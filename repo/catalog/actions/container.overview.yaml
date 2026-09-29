@@ -1,0 +1,148 @@
+# ============================================================
+# 动作：容器总览（docker / podman）
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 J（P1 · 只读）· T6 交付
+# 形态：一次给全：引擎版本 + 容器（含已停止）+ 镜像 + 卷 + 网络
+# 风险：green
+# ============================================================
+
+id: container.overview
+title: 容器总览
+summary: 容器引擎版本、容器（含已停止）、镜像、卷与网络一屏看清（docker / podman，全部只读）
+domain: J
+risk: green
+priority: P1
+tags: [只读, 容器, docker, podman]
+note: |
+  ★ 为什么这个动作**必须存在**（T6 开题单 §10.2 #3 的拍板）：
+  T6 要谈"双引擎（包管理 / 容器）的取舍"，而容器路线的结论是"本环境当前不可行"
+  （公网 Docker Hub 三台全不可达 + Harbor 里没有 mysql/redis 业务镜像）。
+  ★ 但结论要立在**事实**上，不能只立在一句话上 —— 拍板里写的是
+  "**只做查看现状，不加配方**，用 docker-01 做只读观察对象"。
+  本动作就是那个"查看现状"：它让"容器引擎这一层现在长什么样"变成**可复现的一屏**。
+
+  ★ 两个引擎**同一个动作**（`run_by` 选段，规范 §12.10）：
+  参数 `engine` 只用来**选段**，命令本身写死在 YAML 里 ——
+  `docker ps -a` 与 `podman ps -a` 子命令形状一致，所以一份动作能同时覆盖两者。
+  ★ 没有 `docker`/`podman` 时**明确中止并说清**（预检不通过），
+  **不硬造一个"看起来 ok"的结论**：这台机器上没有容器引擎，本身就是一条明确的事实，
+  但它不该被包装成"总览成功、内容为空"（那是 §10.6.3「空结果 ≠ 空数据」的坑）。
+
+  ★ 本动作**只读**（green）：不启停任何容器、不拉镜像、不删任何东西 ——
+  `changed` 恒 `false`（规范 §12.3）。
+
+params:
+  - name: engine
+    label: 容器引擎
+    type: enum
+    required: true
+    choices: [Docker, Podman]
+    values: [docker, podman]
+    default: Docker
+    help: '★ 只用来选段：两条命令都是平台内置的静态表（规范 §12.10），不接受任何来自界面的命令片段。'
+
+precheck:
+  - name: engine_present
+    title: 确认这台机器上装了对应引擎
+    run: [ls, -l, "/usr/bin/{{ engine }}"]
+    parser: raw
+    timeout: 20
+    note: >
+      不存在时 rc=2 → 预检不通过 → 整条动作 aborted（目标机零改动），
+      并给出"先确认这台机器上有没有跑容器"的建议。
+      ★ 这比输出一屏空白要好得多：空白会被误读成"没有容器"，而事实是"没有引擎"。
+
+steps:
+  - name: version
+    title: 引擎版本
+    run_by:
+      param: engine
+      cases:
+        docker: [docker, version]
+        podman: [podman, version]
+    parser: raw
+    timeout: 60
+    optional: true
+    note: 拿得到版本 = 引擎**装上了而且 daemon/socket 是通的**（只有客户端没服务端时会报错）。
+
+  - name: containers
+    title: 容器（含已停止）
+    run_by:
+      param: engine
+      cases:
+        docker: [docker, ps, -a]
+        podman: [podman, ps, -a]
+    parser: lines
+    timeout: 60
+
+  - name: images
+    title: 镜像
+    run_by:
+      param: engine
+      cases:
+        docker: [docker, images]
+        podman: [podman, images]
+    parser: lines
+    timeout: 60
+
+  - name: volumes
+    title: 卷
+    run_by:
+      param: engine
+      cases:
+        docker: [docker, volume, ls]
+        podman: [podman, volume, ls]
+    parser: lines
+    timeout: 60
+    optional: true
+    note: 卷列表为空是常见且正常的情况（没人建过具名卷）。
+
+  - name: networks
+    title: 网络
+    run_by:
+      param: engine
+      cases:
+        docker: [docker, network, ls]
+        podman: [podman, network, ls]
+    parser: lines
+    timeout: 60
+    optional: true
+
+verify:
+  - name: 引擎必须真的能应答（装上了不等于跑得起来）
+    from: version
+    severity: warn
+    on_missing: 拿不到引擎版本 —— 客户端在，但 daemon/socket 没通（服务可能没起，或当前用户无权限）
+  - name: 容器清单必须可读（这一条是"总览"的主干）
+    from: containers
+    on_missing: 拿不到容器清单 —— 引擎没有正常应答，本页结论不可信
+
+conclusion: |
+  【{host.name}】容器总览 · 引擎 {engine}
+  ── 引擎版本 ──
+  {version}
+
+  ── 容器（含已停止）──
+  {containers}
+
+  ── 镜像 ──
+  {images}
+
+  ── 卷 ──
+  {volumes}
+
+  ── 网络 ──
+  {networks}
+
+  判读：
+  · 上面四段都是**引擎自己的输出原文**（平台不改写、不摘要）——
+    所以"有多少个在跑、哪些是 Harbor 自己的组件"一眼可数；
+  · ★ 容器里出现的 `goharbor/*` 是**仓库自身的组件**，不是业务镜像 —— 别拿它做业务实验；
+  · 「卷」段**可能很长**：Docker 会给容器建**匿名卷**（那一串十六进制名就是），
+    所以"卷很多"不等于"有人建了很多具名卷"—— 要按名字区分（具名卷有可读名字）；
+  · 「镜像」段里同一镜像可能出现多行（`goharbor/x`、`192.0.2.60/library/x`、`x` 同名不同 tag/来源）；
+    判断"仓库里到底有什么"要看**哪个 registry 前缀**，别只看名字；
+  · 本动作只读：不启停容器、不拉镜像、不删任何东西；
+  · ★ 若这次**失败**且错误详情里是 `failed to connect to the docker API at unix:///var/run/docker.sock`
+    → 那是"**装了客户端、但 daemon 没跑**"（K8s 节点上很常见：docker 是 disabled、
+    `cri-docker.socket` 才是 active）—— **不是**"这台机器没有 docker"。
+    别顺手去启它：那可能影响 k8s 容器运行时（开题单 §10.2 #3 拍板：不启 node02 的 docker.service）。

@@ -1,0 +1,84 @@
+id: pkg.install
+title: 安装软件包
+summary: dnf 安装指定包，装完用 rpm -q 自证版本，并给出可回退的事务号
+domain: H
+risk: yellow
+priority: P1
+tags: [变更, 包管理]
+
+note: |
+  ★ 装包是"可恢复"而不是"可撤销"：`dnf history undo <事务号>` 能回退。
+  所以本动作把**事务号**写进结论 —— 没有它，"回退"就无从下手。
+  ★ 探针实测：dnf 是本项目里最慢的一类动作（拉元数据 + 依赖解析），
+  所以这一步的 timeout 单独放宽到 300 秒。
+  ★ 所有 dnf 调用都必须带 `-y`：控制台以 BatchMode 连接，任何交互式提问都会挂到超时。
+
+confirm:
+  title: 确认安装软件包
+  body: |
+    即将在「{host.name}」（{host.address}）上安装包「{package}」。
+
+    会发生什么：dnf 解析依赖 → 下载 → 安装（需要可达的软件源）。
+    可撤回：`dnf history undo <事务号>` 可回退本次安装；事务号会在结论里给出。
+  confirm_text: 我已确认要安装
+
+params:
+  - name: package
+    label: 包名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9._+-]+$'
+    default: bc
+    placeholder: bc
+    help: '只填包名（不含路径、空格、通配符）；允许字母数字与 . _ + -'
+
+steps:
+  - name: before
+    title: 查看当前是否已安装
+    run: [rpm, -q, "{{ package }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1]
+    note: |
+      探针实测：rpm -q 已安装 → 0；未安装 → 1。两者都是"有效报告"，
+      所以这一步标 optional 且同时接受 0 和 1，只用于结论里说明"装之前是什么状态"。
+
+  - name: install
+    title: 安装（这一步可能较慢）
+    run: [dnf, install, -y, "{{ package }}"]
+    parser: lines
+    timeout: 300
+    note: 单步 timeout 放宽到 300 秒（dnf 要拉元数据、解析依赖）
+
+  - name: after
+    title: 自证：用 rpm -q 确认包真的装上了（★ 退出码就是结论）
+    run: [rpm, -q, "{{ package }}"]
+    parser: raw
+    ok_exit_codes: [0]
+    note: 只接受 0（已安装）。若仍返回 1，说明安装没成功 → 整步失败，动作判失败
+
+  - name: history
+    title: 取最近的事务记录（回退依据）
+    run: [dnf, history]
+    parser: head_lines
+    optional: true
+    note: head_lines 取前 20 行；最新事务在最上面
+
+verify:
+  - name: 包确实已安装（rpm -q 有输出）
+    from: after
+    on_missing: rpm -q 查不到该包 —— 安装没有生效
+  - name: 安装步骤有输出（否则无法判断 dnf 做了什么）
+    from: install
+    on_missing: dnf 没有任何输出，安装过程不可信
+
+conclusion: |
+  「{package}」安装结果（{host.name}）
+  · 安装前：{before}
+  · 安装后：{after}
+  · 最近事务（回退依据）：
+  {history}
+
+  判读：
+    · 回退本次安装：`dnf history undo <上面第一条的 ID>`；
+    · 若安装失败，请看原始输出里的依赖冲突或源不可达提示。

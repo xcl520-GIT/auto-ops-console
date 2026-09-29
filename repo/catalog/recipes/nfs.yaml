@@ -1,0 +1,174 @@
+# ============================================================
+# 配方：NFS 服务端（T6 · 第三个服务 · ★ 唯一一个"非 systemd 生效"的真用例）
+# ------------------------------------------------------------
+# 一次点击 = 从"机器上没导出任何东西"到"导出真的生效、客户端真能挂"：
+#   装包 → 建导出目录 → 渲染导出配置 → 启动 + 自启 → （配置变了才）重启 → 健康检查
+# 反向操作：停止 / 卸载（保留数据）/ 卸载（全删）
+#
+# ★ 设计宪法（规范 §12.0）：
+#   ① 本文件只声明"要什么"，**判定与分支一律走平台侧**（没有一处命令、没有一处表达式）
+#   ② 「没变」可断言：平台采集 changed → **第二次跑该清单为空**就是幂等证明
+#   ③ 每个正向步骤都有反向操作（见 uninstall）
+# ============================================================
+
+id: nfs
+name: NFS 服务端
+version: "1"
+summary: 一键部署 NFS 导出（独立导出文件 + 真导出检查 + 幂等重跑 + 可卸载）
+risk: yellow
+
+note: |
+  ★ **"让导出生效"那一下，靠的是单元的 ExecStartPre**（规范 §12.12，T6 真机确认）：
+  `nfs-server.service` 的 `ExecStartPre=-/usr/sbin/exportfs -r` —— 也就是说
+  **`svc.restart nfs-server` 本身就等价于"让导出生效"**，本话题**不新增动作**。
+  ★ 备选（留档否掉）：新增一个 `nfs.export` 动作去跑 `exportfs -ra` ——
+  那是把"单元自己已经在做的事"再包一层；多一个动作就多一处要维护的 changed 规则。
+
+  ★ **为什么导出配置写成一份独立文件** `/etc/exports.d/aoc-<名字>.exports`：
+  ① 系统自带的 `/etc/exports` 里可能有**别人**的规则（这台机没有，但生产上常有）——
+     往它里面追加就得"读出原文再重写"，格式一漂就可能是在改别人的东西；
+  ② RHEL 系的 nfs-server 把 `/etc/exports` 与 `/etc/exports.d/*.exports` **一起**读，
+     所以独立文件能"只加自己的规则"；
+  ③ 它落在 `file.remove` 的白名单内（`/etc/<名>/...`）⇒ **「全删」删得掉**。
+     ★ 这也是导出点选 `/opt/aoc-nfs/<名字>` 而不是 `/srv/...` 的原因（§12.13.2）。
+
+  ★ **导出目录是怎么建出来的**：平台**没有**「建目录」动作，而模板写入会
+  `mkdir -p` 目标路径的父目录 —— 于是"往导出点里写一个 README"就顺手把目录建出来了
+  （与 Nginx 用 `{{ root_dir }}/index.html` 建站点目录同一姿势）。
+  ★ 顺序不能反：**目录必须先存在**，否则 `exportfs -r` 会因为"目录不存在"而让 nfs-server 起不来。
+
+  ★ **健康检查是"问链路最末端"**：`responds: {action: nfs.export-check, first_field: ...}`
+  走 `showmount -e 127.0.0.1` —— 问本机 mountd "你现在导出什么"。
+  ★ 为什么不能用"配置文件写对了"当判据：**写了配置文件 ≠ 导出生效**
+  （配置要经过 `exportfs` 才能进内核导出表）；而 `showmount` 答什么，客户端就能挂什么。
+  `first_field` 是**按字段全等**（不是子串）—— 正好卡住"导出点必须是我们那一个"。
+
+  ★ **端口按整组写**：NFS 不只 2049（还有 mountd 的 20048 与 rpcbind 的 111）——
+  只钉 2049 会漏掉"导出配置生效了但 mountd 没起来"这种半死状态。
+
+  ★ **关于 `nfs-utils` 包**：这台靶机上它是**系统既有**的（2026-08-09 装的，不是本工作台装的，
+  所以 `install` 步骤实测是"未变更"）。本配方的「全删」仍然会**卸掉它** ——
+  理由：三个服务的按钮语义必须一致（"全删"就是真的全删）。
+  ★ 但因为它是既有包，**T6 收尾还原靶机时要把 nfs-utils 装回去**（详见 S7 的还原清单）。
+
+params:
+  - name: share
+    label: 导出名
+    type: str
+    required: true
+    pattern: '^[a-z][a-z0-9-]{0,20}$'
+    default: share
+    help: '只用小写字母/数字/短横。导出点 = /opt/aoc-nfs/<导出名>；导出配置 = /etc/exports.d/aoc-<导出名>.exports。'
+  - name: client
+    label: 允许挂载的来源
+    type: enum
+    required: true
+    choices: [本网段, 仅本机]
+    values: ["192.0.2.0/24", "192.0.2.13"]
+    default: 本网段
+    help: '默认只允许本网段挂载；「仅本机」只允许靶机自己。★ NFS 没有认证，来源限制就是第一道门。'
+  - name: access
+    label: 访问权限
+    type: enum
+    required: true
+    choices: [只读, 读写]
+    values: [ro, rw]
+    default: 只读
+    help: '默认只读。★ 「读写」等于允许客户端改你这里的文件，请想清楚再选。'
+
+steps:
+  - name: install
+    title: 安装 nfs-utils
+    action: pkg.install
+    args: { package: nfs-utils }
+    note: >
+      ★ 这台机器上它通常**已经装着**（系统自带）—— 那这一步会显示"未变更"，
+      这正是幂等该有的样子。装包不是为了"从零"，而是为了"保证前置条件成立"。
+
+  # ★ 顺序：先建目录（往目录里写 README），再写导出配置。
+  #   反过来的话 `exportfs -r` 会因"目录不存在"让 nfs-server 起不来。
+  - name: render_dir
+    title: 准备导出目录（/opt/aoc-nfs/<导出名>）
+    template: nfs/README.txt
+    dest: "/opt/aoc-nfs/{{ share }}/README.txt"
+    mode: "0644"
+    note: >
+      ★ 这个文件不是装饰：平台没有「建目录」动作，而模板写入会 `mkdir -p` 父目录
+      —— 于是它就是"把导出目录造出来"的那一下（与 Nginx 建站点目录同一姿势）。
+      ★ 它不 notify：目录本身不需要重启服务才生效。
+
+  - name: render_exports
+    title: 渲染导出配置（/etc/exports.d/aoc-<导出名>.exports）
+    template: nfs/aoc.exports
+    dest: "/etc/exports.d/aoc-{{ share }}.exports"
+    mode: "0644"
+    notify: [restart_nfs]
+
+  - name: start
+    title: 启动服务
+    action: svc.start
+    args: { unit: nfs-server }
+    note: >
+      ★ 这一步同时验证三件事：导出目录存在、导出配置语法没写坏、rpcbind 可用。
+      单元起不来（比如 `exportfs -r` 报错）→ 这一步**真实失败**，远端原文在错误详情里。
+
+  - name: enable
+    title: 设为开机自启
+    action: svc.enable
+    args: { unit: nfs-server }
+
+  - name: restart_nfs
+    title: 重启 NFS 服务（仅当导出配置真的变了）
+    action: svc.restart
+    args: { unit: nfs-server }
+    trigger_only: true
+    note: >
+      由 render_exports 的 notify 唤起 —— ★ 这**就是**"让导出生效"那一下
+      （单元的 ExecStartPre 就是 `exportfs -r`，规范 §12.12）。
+      第二次跑（内容没变）**根本不会执行** —— 幂等靠这个成立。
+
+health:
+  - expect:
+      state: { unit: nfs-server, equals: active }
+  # ★ 真问一句：本机 mountd 现在到底导出什么（按字段全等，不是子串）
+  - expect:
+      responds: { action: nfs.export-check, first_field: "/opt/aoc-nfs/{{ share }}" }
+  # ★ 端口按整组钉（只钉 2049 抓不到"mountd 没起来"这种半死状态）
+  - expect:
+      port_open: "2049"
+  - expect:
+      port_open: "20048"
+  - expect:
+      port_open: "111"
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: nfs-server }
+  disable:
+    - action: svc.disable
+      args: { unit: nfs-server }
+  # ★ 只删**配方自己写出来的**那一份导出配置（系统自带的 /etc/exports 一个字不动）
+  remove_config:
+    - action: file.remove
+      args: { path: "/etc/exports.d/aoc-{{ share }}.exports" }
+  # ★ 导出目录（里面的文件就是"数据"）：只在「全删」时删
+  purge_paths:
+    - "/opt/aoc-nfs/{{ share }}"
+  # ★ 「保留数据」是一条**承诺**，报告里必须念出来，而且要被真验（规范 §12.13.1）
+  keep_data:
+    - "/opt/aoc-nfs/{{ share }}"
+  remove_packages:
+    - nfs-utils
+  stop_confirm_text: 我已确认要停止服务
+  purge_confirm_text: 我已确认全删
+  # ★ 停止 / 「保留数据」卸载**之后**应当成立的事实（规范 §12.6.3）：
+  #   ★★ 用"导出清单里没有我们那一条"（外部可观测），**不用** `state: {equals: inactive}` ——
+  #     后者依赖"单元还驻留在 systemd 内存里"，`svc.disable` 之后它会从内存卸载（T5 真跑踩过）。
+  #   ★ 这里**不能**用 `free_port`：NFS 的端口不是我们独占的（rpcbind 的 111 是共享基础设施），
+  #     而且 nfs-server 停了不代表 2049 立刻释放。
+  #   ★ 也不能用"responds 判 fail"——`expect` 层没有"判失败"这种期望；正解是换一个
+  #     **在"已停止"状态下应当成立**的判据。这里用 free_port 钉 2049（nfs 独占的那一个）。
+  health:
+    - expect:
+        free_port: "2049"

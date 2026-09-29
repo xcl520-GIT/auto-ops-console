@@ -1,0 +1,348 @@
+# ============================================================
+# 动作：容器内只读体检（exec）
+# 来源：T9·S4 —— ★★ 规范 §12.41（**非交互 · 不经 shell · 只读白名单**）
+# 形态：**只读探针**（yellow：它不写目标机，但"进别人的容器"这件事要有闸门）
+# ============================================================
+
+id: k8s.exec
+title: 容器内只读体检
+summary: 在容器**里面**问一句话（非交互 · 不经 shell · 命令是**写死的白名单**）—— ★ 不做交互式 shell
+domain: J
+risk: yellow
+priority: P1
+tags: [只读, K8s, Pod, 排障]
+
+note: |
+  ★★ **三条边界，一条都不许越**（规范 §12.41）：
+  ① **非交互**：**不做** `-it`（不开 TTY、不接 stdin）—— 本平台的执行形态是"一次性命令"，没有交互通道；
+  ② **不经 shell**：argv 数组直传（`kubectl exec <pod> -c <容器> -- <命令> <参数>`），
+  ★ **不许** `sh -c "…"`；
+  ③ **命令白名单**：★ 本动作**没有"自由命令"参数** —— 探针是**写死的静态 argv 表**（`run_by`），
+  参数只用来**选段**（规范 §12.10 的老规矩）。想跑别的？**先把探针登记进这张表**。
+
+  ★★ **为什么不给自由命令**（说清边界，不是没想到）：
+  给一个"在别人容器里跑任意命令"的输入框，等于把 §4 三层契约里的**第三层**（命令拼装）打开；
+  ★ 更实际的是：`exec` 能跑 `rm` / `kill` / `apk add`，那与"只读逃生口"的定位直接冲突。
+  ⇒ 本动作是**容器里的只读体检**（看它自己怎么想），**不是**容器版的终端。
+
+  ★★ **`--previous` 那种"上一份"的用法在日志里**（`k8s.logs`），不在本动作：
+  本动作问的是**活着**的这个容器。
+
+params:
+  - name: pod
+    label: Pod 名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: t9-web-xxxxx
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+  - name: container
+    label: 容器名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    default: web
+    help: '★★ **单容器也要写**：不带 `-c` 时 `kubectl` 会用"第一个容器"——那是个**隐含约定**，我们不做隐含。'
+  - name: probe
+    label: ★ 问什么（只读探针白名单）
+    type: enum
+    required: true
+    choices:
+      - 主进程命令行（/proc/1/cmdline）
+      - 系统版本（/etc/os-release）
+      - 进程表
+      - 环境变量
+      - 主机名
+      - 我是谁（id）
+      - 内核与架构（uname -a）
+      - 容器内的时间
+      - 文件系统用量（df -h）
+      - 网卡地址（ip addr）
+      - 路由表（ip route）
+      - 监听端口（ss -tln）
+      - DNS 配置（/etc/resolv.conf）
+      - 挂载表（/proc/mounts）
+      - 内存限额（cgroup v2 memory.max）
+    values: [cmdline, os_release, procs, env, hostname, id, uname, date, df, ip_addr, ip_route, ss_listen, resolv, mounts, mem_max]
+    default: 主进程命令行（/proc/1/cmdline）
+    help: '★★ 只能选这些 —— 它们是**写死在 YAML 里的静态命令**，不接受自由输入（规范 §12.41）。
+      ★★ **默认值是"在本环境真跑过的那一个"**（规范 §12.50）：靶子镜像 `docker.io/library/busybox:1.36`
+      **没有 `/etc/os-release`**，所以「系统版本」在它上面**必然红**；「监听端口（`ss -tln`）」同理
+      （镜像里没有那个工具）。⇒ 默认换成 **`/proc/1/cmdline`**：读的是**内核文件**，
+      **任何 Linux 镜像都有**，不依赖镜像自带工具集。'
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认在容器里跑一条只读探针
+  body: |
+    即将在「{namespace}/{pod}」的容器 **{container}** 里执行一条**只读**探针：{probe}
+    · 能不能撤：**无需撤** —— 白名单里的命令**都不写任何东西**（`cat` / `ps` / `env` / `df` / `ip` / `ss` 这类）；
+    · 影响面：会在容器里**多起一个进程**（毫秒级就退出）；★ 不会重启容器、不改文件、不改配置。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认要执行这条只读探针
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: pod_exists
+    title: ★ 这个 Pod 必须存在
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pod
+      - "{{ pod }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: probe_out
+    title: ★ 探针输出（**命令写死在下面的静态表里**）
+    run_by:
+      param: probe
+      cases:
+        os_release:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "cat"
+          - "/etc/os-release"
+        cmdline:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "cat"
+          - "/proc/1/cmdline"
+        procs:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "ps"
+        env:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "env"
+        hostname:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "hostname"
+        id:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "id"
+        uname:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "uname"
+          - "-a"
+        date:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "date"
+        df:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "df"
+          - "-h"
+        ip_addr:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "ip"
+          - "addr"
+        ip_route:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "ip"
+          - "route"
+        ss_listen:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "ss"
+          - "-tln"
+        resolv:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "cat"
+          - "/etc/resolv.conf"
+        mounts:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "cat"
+          - "/proc/mounts"
+        mem_max:
+          - kubectl
+          - --kubeconfig={{ kubeconfig }}
+          - exec
+          - "{{ pod }}"
+          - -n
+          - "{{ namespace }}"
+          - -c
+          - "{{ container }}"
+          - --
+          - "cat"
+          - "/sys/fs/cgroup/memory.max"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 90
+    note: >
+      ★★ **每一条 case 都是完整 argv**（含 `kubectl exec <pod> -n <ns> -c <容器> --` 前缀）——
+      `run_by` 选出来的是**整条命令**，不是"接在某段前缀后面的片段"。
+      ★ 这是"静态 argv 表"的代价，也是它的价值：**命令里没有一处来自输入**。
+      ★★ 本文件那 15 条 case 由 `_tools/t9s4-gen-exec-cases.py` **生成**（避免手抄 15 遍时漏掉前缀 ——
+      而那正是第一版犯过的错：漏了前缀就会在**宿主机**上跑 `cat`）。
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对）。
+  - name: ★★ 探针必须真的跑过（**退出码是判据**；输出为空是另一件事）
+    from: pod_exists
+    on_missing: >
+      在 <命名空间> 里没找到这个 Pod —— 先跑 `k8s.pods` 拿准确的名字与命名空间。
+      ★ 注意：本动作**不对探针输出做非空断言**（`ss` 在没有监听时本来就什么都打印不出来 ——
+      那是**结论**，不是失败；规范 §12.37.2 的真跑补记 / 清单 115）。
+
+conclusion: |
+  【{host.name}】容器内只读体检 · {namespace}/{pod} · 容器 {container}
+  探针：{probe}（★ 只读白名单；**非交互**、**不经 shell**）
+
+  ── 探针输出 ──
+  {probe_out}
+  ── 原文结束 ──
+
+  判读：
+    · ★★ 这是**容器自己的视角** —— 与宿主机上的同名命令**可能不一样**（命名空间、镜像自带工具集、
+      `/proc` 挂载都是容器私有）。要看**宿主机**的，用 `k8s@media`… ★ 用 `host.*` 系列动作；
+    · ★ **`ps` / `ip` / `ss` 这些工具在容器里不一定有**（`distroless` 镜像什么都没有）——
+      那时这一步会红并给出 `executable file not found`；★ 这本身是**结论**（"这个镜像没有工具"），
+      不是平台故障；
+    · ★★ **本环境的实测**（规范 §12.50）：靶子镜像 `busybox:1.36` 上 15 个探针里
+      **`os_release` 与 `ss_listen` 会失败**（镜像没有那个文件 / 没有那个工具），其余 13 个可跑；
+      ⇒ **默认值因此换成了 `/proc/1/cmdline`**（读内核文件，不依赖镜像工具集）——
+    · ★ **`-it` 交互式 shell 本动作不提供**（规范 §12.41）：它要的是**一个活着的连接**，
+      属于平台的架构事件，**单独立题**；
+    · ★ 本动作**只读**：白名单里的命令都不写目标机（也不改容器）；
+      `changed` 按"不改目标机"登记（`app/changed.py` 的豁免清单）。

@@ -1,0 +1,142 @@
+# ============================================================
+# 配方：K8s 容器运行时（T8 · S5 · 第三阶段）
+# ------------------------------------------------------------
+# 一次点击 = 从"运行时装了但没跑"到"运行时就绪，**并且按 CRI 路把沙箱镜像拿到手**"：
+#   装包 → 装 cri-tools → 自启 + 启动 → ★★ 链路最末端：按 CRI 路确认沙箱镜像在本地
+# 反向操作：停止 / 卸载（保留数据）/ 卸载（全删）
+#
+# ★ 设计宪法（规范 §12.0）：
+#   ① 本文件只声明"要什么"，**判定与分支一律走平台侧**（没有一处命令、没有一处表达式）
+#   ② 「没变」可断言：平台采集 changed → **第二次跑该清单为空**就是幂等证明
+#   ③ 每个正向步骤都有反向操作（见 uninstall）
+# ============================================================
+
+id: k8s-containerd
+name: K8s 容器运行时（containerd）
+version: "1"
+summary: 一键把 containerd 起好、真探活，并按 CRI 路确认沙箱镜像在本地（幂等 + 可卸载）
+risk: yellow
+
+note: |
+  ★★ **本配方一个配置文件都不改 —— 这是实测出来的结论，不是省事**（规范 §12.31.2）：
+  开工前只想改一处（`certs.d/registry.k8s.io/hosts.toml` 里那条 403 的加速），改完真跑一测才发现：
+
+  | 路 | 实测 | 结论 |
+  |---|---|---|
+  | 原配的加速 `m.daocloud.io/registry.k8s.io` | **403**（★ 有 **containerd 自己**的证词，不只是 curl） | 不通 |
+  | 直连 `registry.k8s.io` | **307 跳到 `*.pkg.dev` → 走 IPv6 → `network is unreachable`** | 不通 |
+
+  ⇒ ★★ **两条路都不通 ⇒ 改这个文件不会让任何事变好**。按本项目的规矩（改动必须让**链路末端**变好、
+  且"写坏了会红"），**正确地选择是"不改它"**（那处已按平台护栏从检查点逐字节还原成进场原文）。
+
+  ★★ **而开题单里记的那处"硬伤"（沙箱镜像来源会抖），在链路上量了一次才发现：当前不存在** ——
+  · `pinned_images.sandbox` = `registry.aliyuncs.com/google_containers/pause:3.10.1`；
+  · 该镜像**已经在本地镜像库里**（旧集群留下的），所以 `crictl pull` **根本不需要联网**；
+  · ★ 而且这个源**实测真拉得动**（本会话用它真拉了一个未缓存的 tag，rc=0 走完了网络）。
+
+  ⇒ 本配方因此只做三件**真的会改变末端**的事：**装包（含 cri-tools）· 起服务 · 按 CRI 路确认镜像到手**。
+
+  ★ **`cri-tools` 必须装上**：`crictl` 是走 CRI 路的那只手（A6 白名单内）。
+  缺它时 `container.pull` 的预检会**明确中止**（缺工具 ≠ 拉了个空）。
+
+  ★★ **为什么不走 `imports = ['/etc/containerd/conf.d/*.toml']` 那个 drop-in 钩子**：
+  那个目录**根本不存在**，而且**即使建出来也过不了"写坏了会红"这一关** ——
+  drop-in 语法对、表名写错时 containerd 照样起、镜像照样拉（走的是主配置里的值）⇒ **假绿**：
+  我们那份配置一个字都没被读。★ 落不到末端的改动，本话题**不动它**。
+
+  ★ **健康检查是"真问一句"，不是看单元在跑**：
+  `responds: {action: container.runtime, first_field: "Server:"}` 走 `ctr version` ——
+  ★ 参照值选 `Server:` 而不是版本号：那是"**API 真的通了**"这个**结构性事实**，
+  **不随版本漂**（写死 `v2.2.6` 就是"包一升级就假红"——本会话真的把包从 2.2.6 装成了 2.3.6）。
+  `state: active` 只是旁证：`systemctl is-active` 说什么都**代替不了**探活。
+
+params:
+  - name: sandbox_image
+    label: 沙箱镜像（Pod 的 pause 容器）
+    type: str
+    required: true
+    pattern: '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,180}(:[A-Za-z0-9._-]{1,128})?$'
+    default: registry.aliyuncs.com/google_containers/pause:3.10.1
+    help: '★ 默认值是从**实物**抄下来的：S3 留证的 /etc/containerd/config.toml 原文里 pinned_images.sandbox 那一行。本配方**不改主配置**，只在末端确认这个 ref 拿得到。'
+
+steps:
+  - name: install_containerd
+    title: 安装 containerd.io（已装则不动它）
+    action: pkg.install
+    args: { package: containerd.io }
+    note: >
+      ★★ **"已装则不动它"是做不到的** —— 实测：源里有更新版本时 `dnf install` 会**升级**
+      （本机 2.2.6 → 2.3.6，`pkg.install` 的 `changed` 规则**如实报了 True**）。
+      ★ 这符合规范 §12.1.1（**不锁包版本**：装当前源里可用的那个，并把实际装到的版本写进报告）；
+      但它是一次**真实变更**，回退路径是结论里给的那个事务号（`dnf history undo`）。
+
+  - name: install_cri_tools
+    title: 安装 cri-tools（提供 crictl —— 走 CRI 路的那只手）
+    action: pkg.install
+    args: { package: cri-tools }
+    note: >
+      ★ 为什么必须在**前面**装：`container.pull` 的预检查 `/usr/bin/crictl`，
+      没有它就会"缺工具 ⇒ 明确中止"，而不是"拉了个空"（规范 §12.31.4）。
+
+  - name: enable
+    title: 设为开机自启
+    action: svc.enable
+    args: { unit: containerd }
+
+  - name: start
+    title: 启动 containerd
+    action: svc.start
+    args: { unit: containerd }
+    note: >
+      ★ 起来之后 **kubelet 会跟着自愈**（它现在是 `activating / auto-restart`，只等运行时）——
+      那时它会去找旧集群那个已经不在的 apiserver，于是**继续重启**。
+      ★ 这是**预期现象**（S6 的 `kubeadm reset` + `init` 会收拾它），不是本配方的失败。
+
+  - name: pull_sandbox
+    title: ★★ 链路最末端：按 CRI 路把沙箱镜像拿到手
+    action: container.pull
+    args: { ref: "{{ sandbox_image }}" }
+    note: >
+      ★★ 这一步是"**能不能拿到**"的**唯一**末端判据（规范 §12.31.3）：
+      `401` 只说明"仓库活着"、`307` 只说明"manifest 存在"——**都不等于**"运行时这条路拉得下来"。
+      ★ 本环境**当场撞到了反例**：`registry.k8s.io` 的 307 会跳到 `*.pkg.dev`，
+      然后 containerd 走 **IPv6** 连过去 ⇒ `network is unreachable`（其实 DNS 也给了 IPv4，
+      是**解析顺序**的坑 —— 与"`getent hosts` 第一条给 IPv6"是同一类）。
+      ★ 它走 **CRI 路**（与 kubelet 同一条），拉/确认的是**实际会被用到的那一个** ref
+      （不是"挑个好拉的来证明链路"）。
+      ★ **幂等**：第二次跑时镜像已在本地 ⇒ `changed=false`（`changed.py` 只认"新增一个 ref"）。
+
+health:
+  - expect:
+      state: { unit: containerd, equals: active }
+  - expect:
+      responds: { action: container.runtime, first_field: "Server:" }
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: containerd }
+  disable:
+    - action: svc.disable
+      args: { unit: containerd }
+  # ★ 本配方**没有任何"自己写出来的配置文件"** ⇒ 没有 `remove_config`（选了就必须真删得掉，
+  #   而这里确实没有）。`certs.d/*/hosts.toml` 是旧集群留下的站点文件，**我们一个字都没改**。
+  # ★ 包自带的目录：只在「全删」时删（那时包也会被卸掉，目录随之由 rpm 清理/重装还原）—— 规范 §12.6 ★2
+  purge_paths:
+    - /etc/containerd
+  # ★★ 「保留数据」是一条**承诺**，报告里必须念出来：这里保留的是**镜像缓存**——
+  #   它是**资产不是数据**（删了要重拉，而这里的镜像源一个走得通一个走不通（见 note）；
+  #   旧集群的 k8s 镜像与沙箱镜像都在里面）。
+  keep_data:
+    - /var/lib/containerd
+  remove_packages:
+    - containerd.io
+  stop_confirm_text: 我已确认要停止服务
+  purge_confirm_text: 我已确认全删
+  # ★ 停止 / 「保留数据」卸载**之后**应当成立的事实（规范 §12.6.3）：
+  #   ★★ 判据选"**socket 不在了**"这种**外部可观测**的东西 ——
+  #     不用 `state: {equals: inactive}`：后者依赖"单元还驻留在 systemd 内存里"，
+  #     而 `svc.disable` 会让 systemd 把单元**从内存卸载**（T5 真跑踩过：明明停干净却报失败）。
+  health:
+    - expect:
+        absent: { action: file.stat, args: { path: /run/containerd/containerd.sock } }

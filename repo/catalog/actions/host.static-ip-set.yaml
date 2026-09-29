@@ -1,0 +1,124 @@
+# ============================================================
+# 动作：设置静态 IP（身份五项之④）
+# 来源：规范 §12.128（顺序：先本机身份、后网络）· §12.132（地址分配纪律）
+# 形态：nmcli 改**已有**活动连接 → up → 判据问**网卡**（ip -4 addr）
+# 风险：yellow（可恢复：地址改得回去）｜ 执行通道：ssh
+# ============================================================
+
+id: host.static-ip-set
+title: 设置静态 IP（身份五项之④）
+summary: 把网卡改成指定静态地址 —— ★ 克隆机带着母机的 IP，会和母机在网里"撞名"
+domain: A
+risk: yellow
+priority: P0
+channel: ssh
+tags: [变更, 身份, 造机, 网络]
+
+note: |
+  ★★ 身份五项之④（规范 §12.128）。克隆出来的机器**带着母机的 IP** ⇒
+    两台机器在网里"撞名"，纳管与巡检会连到**母机**上（而报告看起来一切正常）。
+  ★★ **顺序有依赖**（§12.128 第 2 条）：**先本机身份（machine-id / host key / 主机名）、后网络** ——
+    地址一改，管理机到这台机的那条 ssh 就断了；本动作的判据因此落在**网卡回读**上，
+    而"ssh 还连得上吗"由**配方**里紧随其后的 `wait` 步骤回答（§12.117：起来了 ≠ 连得上）。
+  ★ 只改**活动连接**（`nmcli connection show --active` 找出来的那一条），
+    **不新建**连接、**不动**别的网卡、**不碰** NAT 与虚拟网络编辑器（红线 17）。
+  ★ **回不去的东西要说清**：本动作**没有文件级备份** ——
+    连接档案的名字是 NetworkManager 自己起的（`<ifname>.nmconnection`），
+    我们不猜路径；"改回去"= **再跑一次本动作、把地址填回原值**（记录里会留下原值）。
+  ★ 演练开关 `dry_run=yes`：只跑判据、不动手 ⇒ 判据**必须红**。
+
+confirm:
+  title: 确认设置静态 IP（★ 会断掉当前这条 ssh）
+  body: |
+    即将把「{host.name}」（{host.address}）改成静态地址：**{ip}**（网关 {gateway}）
+    改的是**当前那条活动连接**（NM 连接档案里的 `ipv4.method=manual`）。
+
+    会发生什么：
+      · 网卡地址立刻变成 {ip} ⇒ ★ **当前这条 ssh 会断**（本动作的判据靠网卡回读，不靠这条连接）
+      · 若地址填错 ⇒ 这台机器会**连不上**（要到 VMware 控制台去救）
+
+    能不能撤回：
+      · 能：把地址改回去（要跑第二次本动作；★ 平台上**没有**"文件级备份"这一层，
+        因为连接档案的文件名是 NetworkManager 自己定的，我们不猜路径）
+      · 回不去的：断连那一瞬间正在传的东西
+
+    判据（做完怎么算成）：
+      · ★ 问**网卡**：`ip -4 -o addr` 里出现 {ip}（不是"nmcli 返回 0"）
+  confirm_text: 我知道会断掉当前连接，设置静态地址
+
+params:
+  - name: ip
+    label: 新地址（含掩码）
+    type: str
+    required: true
+    default: 192.0.2.14/24
+    pattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    placeholder: 192.0.2.14/24
+    help: ★ 必须写**含掩码**的地址；本环境在 192.0.2.0/24（VMnet8 NAT）
+
+  - name: gateway
+    label: 网关
+    type: str
+    required: true
+    default: 198.51.100.2
+    pattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    placeholder: 198.51.100.2
+    help: 本环境 NAT 网关是 198.51.100.2；★ 不确定就**别乱填**（填错会失去出网能力）
+
+  - name: dry_run
+    label: 演练模式（只跑判据、不动手）
+    type: enum
+    required: true
+    choices: ["不演练：真的改地址", "演练：只判定、不动手"]
+    values: ["no", "yes"]
+    default: "no"
+
+steps:
+  - name: push_script
+    title: 把身份脚本推到目标机（★ 趁连接还在，先推）
+    transfer: put
+    src: aoc-identity.sh
+    dst: /usr/local/sbin/aoc-identity.sh
+    parser: raw
+
+  - name: reset
+    title: 改地址 + 自证（★ 判据问**网卡**，退出码就是结论）
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, reset, static-ip, "{{ ip }}", "{{ gateway }}",
+          "{{ dry_run }}"]
+    parser: raw
+    timeout: 180
+    ok_exit_codes: [0]
+    note: |
+      ★ 0 = 网卡上出现了这个地址 · 3 = 没出现（**判红**）· 2 = 读不到 / nmcli 不在。
+      ★ 这一步**不许 optional**：它就是本动作的判据。
+      ★ 它跑完之后，**管理机到这台机的连接可能已经换了地址** —— 所以配方里紧跟 `wait`（等 ssh 通）。
+
+  - name: after
+    title: 判据的**旁证**：独立重读一次网卡地址
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, show, static-ip]
+    parser: raw
+    timeout: 60
+    optional: true
+
+verify:
+  - name: 网卡上必须真的出现新地址（否则任务已经是失败）
+    from: reset
+    on_missing: 改地址那一步没有给出任何输出 —— 本结论不可用
+  - name: 必须能独立重读到网卡地址（旁证）
+    from: after
+    on_missing: 独立重读没有输出 —— ★ 这不等于"没成功"，但不该继续往下走
+
+conclusion: |
+  【{host.name}】静态地址设置结果
+  · 目标地址：{ip}（网关 {gateway}）
+  · 脚本自证：{reset}
+  · 独立重读：{after}
+
+  ★ 判据（问**网卡**）：`ip -4 -o addr show scope global` 里出现 {ip}。
+  ★★ 顺序纪律（§12.128）：这一步是**四项身份里的最后一步** ——
+    因为地址一改，管理机到这台机的连接就换了；
+    "**还能 ssh 进去吗**"由配方里紧随其后的等待步骤回答（"起来了" ≠ "连得上"，§12.117）。
+  ★ 回不去的（逐项说清）：
+    · 断连瞬间未传完的东西 —— 回不来；
+    · ★ 这一项**没有文件级备份**（连接档案名字由 NM 自己定，我们不猜路径）——
+      "改回去"= 再跑一次本动作，把地址填回原值。

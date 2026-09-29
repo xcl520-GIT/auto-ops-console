@@ -1,0 +1,132 @@
+# ============================================================
+# 动作：拍摄快照（护栏四件套的第 4 件）
+# 来源：设计\05-虚拟化层-架构设计.md §3/§4 · 规范 §12.118
+# 形态：给这台虚拟机建一条快照 → 再读一次链，确认它**真的在链上**
+# 风险：yellow（占磁盘空间，可删）｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.snapshot-create
+title: 拍摄快照（变更前护栏）
+summary: 给虚拟机打一条快照 —— 比文件级备份更强的一层：整机回滚
+domain: M
+risk: yellow
+priority: P0
+channel: local
+tags: [变更, 虚拟化, 快照, 护栏]
+
+note: |
+  ★★ 这是**护栏四件套**的第 4 件（规范 §12.118）：改动前文件备份 / 一键恢复 /
+    red 手输确认词 / **变更前打快照**。快照是**整机**粒度的，与文件级备份**并列，不替代**：
+    · 快照能回的是"整台机器当时的样子"；文件级备份能回的是"某一个文件"。
+  ★★ 触发方式是**显式**（2026-09-28 拍板）：界面点 / 配方步骤 / 人勾选 ——
+    **不做**"任何变更动作前自动全域快照"（快照占盘 + **会改变快照链**，影响后续回滚语义）。
+  ★ 判据是"**再做一次链的查询**，这个名字真的在链上" ——
+    不是"snapshot 命令返回 0"（规范 §12.117 的同一条纪律）。
+  ★ 名字**逐字**算数（链上可能有中文与空格），且**同名快照**的行为由 VMware 决定 ——
+    所以本动作先读一次链、再动手，`changed` 就由"这个名字原来在不在"算出来。
+
+confirm:
+  title: 确认拍摄快照
+  body: |
+    即将在**宿主机**上给虚拟机「{vm_name}」（{vm_vmx}）建一条快照：**{snapshot}**。
+
+    会发生什么：
+      · 立刻在虚拟机的**当前状态**上落一条快照（含内存状态，取决于 VMware 的行为）
+      · ★ 它**占用宿主机磁盘**：虚拟机的增量盘从此多一条链
+      · 它**不改变 guest 里的任何东西**（不是"重启"、不是"改配置"）
+
+    能不能撤回：
+      · 能：删掉这条快照即可（本页暂无删除入口，可在 VMware 里删，或用 `vm.snapshot-revert` 回到它）
+      · ★ 回不去的部分：**磁盘空间被占用**这件事，删掉之前一直在
+
+    判据（做完怎么算成）：
+      · 不是"命令返回 0"，而是**再读一次快照链**：这个名字真的在上面
+  confirm_text: 我已确认要拍快照
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名
+
+  - name: snapshot
+    label: 快照名
+    type: str
+    required: true
+    default: aoc-变更前
+    pattern: '^[^\r\n]{1,80}$'
+    placeholder: 例如 aoc-变更前-20260928
+    help: 逐字算数（允许中文与空格，不允许换行）；★ 建议带 aoc- 前缀与日期，便于一眼认出是工作台拍的
+
+  - name: timeout_sec
+    label: 最多等多少秒（等它出现在链上）
+    type: int
+    required: true
+    default: 300
+    min: 10
+    max: 1800
+    help: 大磁盘上建快照可能要几十秒；超时 ⇒ 判红（如实说"链上还没有它"）
+
+precheck:
+  - name: vmx_ok
+    title: 确认这台虚拟机的 vmx 打得开
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "listSnapshots", "{{ vm_vmx }}"]
+    parser: raw
+    ok_exit_codes: [0]
+
+steps:
+  - name: before
+    title: 动手前先读一次链（★ changed 的判据来源）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "snapshots", "--vmx", "{{ vm_vmx }}"]
+    parser: json
+    timeout: 60
+
+  - name: create
+    title: 建快照（★ 这一步只是**收条**）
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "snapshot", "{{ vm_vmx }}", "{{ snapshot }}"]
+    parser: raw
+    timeout: 600
+    optional: true
+    note: |
+      ★ 为什么 optional：**同名快照**是否报错由 VMware 决定，而"这个名字本来就在链上"
+        属于**幂等路径**，不是失败。★ 但它只是**收条** —— 判据在下一步。
+
+  - name: wait_snap
+    title: 判据：再读一次链，这个名字真的在上面吗（★ 退出码就是结论）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_vmx }}", "--expect", "snapshot", "--snapshot", "{{ snapshot }}",
+          "--wait", "{{ timeout_sec }}"]
+    parser: json
+    timeout: 1980
+    ok_exit_codes: [0]
+    note: |
+      ★ 0 = 链上有它 · 3 = 等超时也没有（**判红**）· 2 = 读不到。
+      ★ 这一步**不许 optional**：它是本动作唯一的判据。
+
+verify:
+  - name: 必须读到"动手前"的链（否则 changed 无法判定）
+    from: before
+    field: snapshots
+    on_missing: 没读到动手前的快照链 ⇒ 这次到底新加了没有，**无法判定**
+  - name: 必须读到"动手后"的链
+    from: wait_snap
+    field: snapshot
+    on_missing: 判据那一步没有确认快照名 —— 本结论不可用
+
+conclusion: |
+  【{vm_name}】快照创建结果
+  · 快照名：{snapshot}
+  · 动手前链上：{before.count} 条
+  · 动手后链上：{wait_snap.snapshot_count} 条
+  · 判据来源：{wait_snap.checked}
+
+  ★ 这是护栏四件套的第 4 件（规范 §12.118）：与"改动前文件备份"并列，不互相替代 ——
+    快照回的是**整台机器**，文件备份回的是**某一个文件**。
+
+  判读：
+  · 要**回到**这条快照：`vm.snapshot-revert` 是 **red**（会丢掉当前状态，必须手输确认词、不许批量）；
+  · 快照会**一直占着磁盘**：变更确认没问题后，记得把不再需要的快照清掉（在 VMware 里删）；
+  · ★ 若这里红了：先 `vm.snapshot-list` 看链上实际有哪些名字（**逐字**比对，含中文与空格）。

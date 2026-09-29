@@ -1,0 +1,127 @@
+# ============================================================
+# 动作：事件时间线
+# 来源：T9·S2 —— 规范 §12.37.2（判据挂"必然有输出"那一步）
+# 形态：**只读**（green）
+# ============================================================
+
+id: k8s.events
+title: 事件时间线
+summary: 全命名空间事件按时间排（★ Warning 单独一段 ＋ 条数）—— "刚刚发生了什么"最直接的证据
+domain: J
+risk: green
+priority: P0
+tags: [只读, K8s, 事件, 排障]
+
+note: |
+  ★★ **为什么"事件"是排障的第一站**：Pod 的 `STATUS` 告诉你"它现在什么样"，
+  事件告诉你"**它为什么变成这样**"（`Insufficient cpu` / `FailedScheduling` / `BackOff` /
+  `FailedMount` / `Failed to pull image`…）。⇒ 它是 `k8s.diagnose` 的**输入之一**（规范 §12.39.4）。
+
+  ★ **`events` 有一个必须说清的脾气**：它**只保留最近一段时间**（kubelet/API 侧默认约 1 小时，
+  `--field-selector` / `--sort-by` 都改不了这个 TTL）⇒ **"这里没有 Warning" ≠ "从来没出过事"**。
+  这句话必须出现在结论里（否则会变成一句让人误判的承诺）。
+
+  ★ 判据挂 `api_alive`（§12.37.2）；两段事件都是 `optional` ——
+  ★★ **一个事件都没有是完全正常的**（刚建好的集群、或者事情刚好过了 TTL），
+  把它判红就是**假红**（清单 80 / 101）。
+
+params:
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+
+steps:
+  - name: api_alive
+    title: ★★ 中枢判据：集群 API 在应答（**这一步必然有输出**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: warnings
+    title: ★ Warning 事件（按最后时间排；这一步的**条数**就是结论的一部分）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - events
+      - --all-namespaces
+      - --field-selector=type=Warning
+      - --sort-by=.lastTimestamp
+      - --no-headers
+      - "-o"
+      - "custom-columns=TIME:.lastTimestamp,NS:.metadata.namespace,REASON:.reason,KIND:.involvedObject.kind,OBJECT:.involvedObject.name,COUNT:.count,MESSAGE:.message"
+    parser: lines
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★ 用 `custom-columns` 而不是默认表格：默认表格里的 `MESSAGE` 会被**截断成一列宽**，
+      而"为什么失败"恰恰在那一列里。★ 这一段用 `lines` 解析 ⇒ 结论里能给出 `{warnings.count}`。
+
+  - name: all_events
+    title: 全部事件（同样按时间排，含 Normal）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - events
+      - --all-namespaces
+      - --sort-by=.lastTimestamp
+      - "--no-headers"
+      - "-o"
+      - "custom-columns=TIME:.lastTimestamp,NS:.metadata.namespace,TYPE:.type,REASON:.reason,KIND:.involvedObject.kind,OBJECT:.involvedObject.name,COUNT:.count"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: >
+      `kubectl get namespaces` 没有给出任何一行 —— API server 没在应答，或这把 kubeconfig 不对。
+      ★ 注意区分：**"集群不可用"**（本步为空）与 **"没有任何事件"**（`warnings` / `all_events` 为空）——
+      后者是**结论**，不是故障。
+
+conclusion: |
+  【{host.name}】事件时间线（只读）
+  kubeconfig：{kubeconfig} ｜ ★ Warning 条数：{warnings.count}
+
+  ── ★ Warning 事件（按最后时间排）──
+  {warnings}
+  ── 全部事件（含 Normal）──
+  {all_events}
+  ── /etc/kubernetes 的路径状态（供对照）──
+  {api_alive}
+  ── 原文结束 ──
+
+  判读：
+    · ★★ **"这里没有 Warning" ≠ "从来没出过事"**：`kubectl get events` 只保留**最近**一段
+      （约 1 小时，这个 TTL 不由我们决定）⇒ 更早的事故要靠日志与 `k8s.diagnose` 的成因清单；
+    · ★ **先看 `REASON` 那一列**：`FailedScheduling` / `Insufficient cpu|memory`（调度不上）·
+      `BackOff`（反复重启）· `Failed`（拉镜像失败）· `FailedMount`（卷挂不上）—— 这四类占了绝大多数；
+    · ★ `COUNT` 大于 1 = **同一件事重复发生**（聚合计数），不是"有 COUNT 条不同的事件"；
+    · ★ `TYPE` 列里 `Normal` 也不都是噪音（`Started` / `Pulled` / `Scheduled` 是"成功的足迹"）；
+    · ★ 想知道某条事件的**完整上下文**：用 `k8s.describe` 看那个对象（`KIND` / `OBJECT` 两列就是它的坐标）；
+    · ★ 本动作**只读**：`changed` 恒 false。

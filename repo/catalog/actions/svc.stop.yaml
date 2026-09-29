@@ -1,0 +1,92 @@
+id: svc.stop
+title: 停止服务
+summary: 停止一个 systemd 服务（🔴 没有 undo，只能再启动一次），并自证它确实已停止
+domain: E
+risk: red
+priority: P0
+tags: [变更, 服务, 破坏性]
+
+note: |
+  ★ 停止是**不可 undo** 的：没有"撤销停止"，只能再执行一次启动。
+  所以它是红线级：必须手输确认词（服务端校验，见 engine.run），
+  而且**批量执行会被引擎直接拒绝**（规范 §9.3 的硬规矩）。
+
+confirm:
+  title: 确认停止服务
+  body: |
+    即将在「{host.name}」（{host.address}）上**停止**服务「{unit}」。
+
+    会发生什么：
+      · 该服务立刻中断；依赖它的服务与业务可能一并不可用
+      · 若它是数据库 / 网关 / 容器运行时这类基础件，影响面会扩散
+
+    能不能撤回：
+      · **没有 undo**，只能再执行一次「启动服务」
+      · 停机期间失败的请求恢复不了
+
+    提示：如果你的目的是"让配置改动生效"，你要的通常是「重启服务」，不是停止。
+  confirm_text: 我已确认要停止
+
+params:
+  - name: unit
+    label: 服务名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9@._:-]+$'
+    normalize: systemd_unit
+    default: aoc-lab.service
+    placeholder: aoc-lab 或 nginx
+    help: 不含「.」时自动补 .service；不允许通配符（一次只能停一个）
+
+precheck:
+  - name: unit_exists
+    title: 确认服务存在
+    run: [systemctl, cat, "{{ unit }}"]
+    parser: lines
+
+steps:
+  - name: before
+    title: 记录停止前的状态与主进程
+    run: [systemctl, show, -p, ActiveState, -p, SubState, -p, MainPID, "{{ unit }}"]
+    parser: shell_kv
+
+  - name: stop
+    title: 停止服务
+    run: [systemctl, stop, "{{ unit }}"]
+    parser: raw
+    timeout: 60
+
+  - name: isactive
+    title: 检查服务是否真的已停止（★ 这一步的退出码就是结论）
+    run: [systemctl, is-active, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [3]
+    note: |
+      ★ 与 svc.start **相反**的期望：探针实测 is-active 对"已停止"的服务返回 **3**
+      （stdout 是 inactive），所以这里只接受 3。
+      如果 stop 没生效（服务仍是 active），is-active 返回 0 —— 0 不在 ok_exit_codes 里，
+      整步判失败。这就是"停止生效"的自证，而不是"命令返回 0 就算停好了"。
+
+  - name: after
+    title: 读取停止后的状态
+    run: [systemctl, show, -p, ActiveState, -p, SubState, -p, MainPID, "{{ unit }}"]
+    parser: shell_kv
+
+verify:
+  - name: 停止后仍能读到状态（否则这一步没拿到数据）
+    from: after
+    field: ActiveState
+    on_missing: 读不到服务状态，停止结果不可信
+  - name: is-active 有返回（配合只接受退出码 3，等价于"确实不在 active"）
+    from: isactive
+    on_missing: is-active 没有返回内容
+
+conclusion: |
+  「{unit}」停止结果
+  · 现在状态：{after.ActiveState} / {after.SubState}
+  · 主进程 PID：{after.MainPID}（已停止时应为空）
+  · 停止前状态：{before.ActiveState} / {before.SubState}（PID {before.MainPID}）
+
+  判读：
+    · 现在应为 inactive；若显示 failed，说明它是"启动失败"而不是"被停止"；
+    · 要恢复服务：执行「启动服务」。

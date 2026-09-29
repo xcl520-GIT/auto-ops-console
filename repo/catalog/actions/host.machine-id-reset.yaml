@@ -1,0 +1,105 @@
+# ============================================================
+# 动作：重置 machine-id（身份五项之①）
+# 来源：规范 §12.128（五项身份与各自判据）· §12.129（拷贝件 ≠ 新机器）
+# 形态：脚本内部"动手前 → 重置 → 动手后 → 对比" ⇒ **退出码就是判据**
+# 风险：yellow（可恢复：旧值已备份）｜ 执行通道：ssh
+# ============================================================
+
+id: host.machine-id-reset
+title: 重置 machine-id（身份五项之①）
+summary: 换掉这台机器的 machine-id —— ★ 克隆机的"身份证"必须与母机不同
+domain: A
+risk: yellow
+priority: P0
+channel: ssh
+tags: [变更, 身份, 造机]
+
+note: |
+  ★★ 身份五项之一（规范 §12.128）。克隆出来的机器，machine-id **与母机逐字节相同** ——
+    它会让日志 / 审计 / 某些授权把**两台机器当成同一台**。
+  ★★ 判据（**问被重置的那一方**）：重置后重读 `/etc/machine-id` ⇒
+    **非空 ＋ 长度 32 ＋ 与动手前不同**。"命令返回 0"不算（§12.117 同源）。
+  ★ 演练开关 `dry_run=yes`：**只跑判据、不动手** ⇒ 判据**必须红** ——
+    这正是"这条判据真在盯着身份"的反例（断言 Ⓧ 的一半）。
+  ★ 顺序纪律（§12.128 第 2 条）：身份重置**先本机身份（machine-id / host key / 主机名）、后网络**。
+
+confirm:
+  title: 确认重置 machine-id
+  body: |
+    即将把「{host.name}」（{host.address}）的 machine-id 换成一个**新的**。
+
+    会发生什么：
+      · `/etc/machine-id` 被重写为新的 32 位十六进制 ID（旧值先备份到管理机）
+      · ★ 依赖 machine-id 的东西会认为"这是一台新机器"（journald / 某些授权与审计）
+      · ★ **不影响** SSH 信任、不影响主机名、不影响 IP
+
+    能不能撤回：
+      · 能：用任务详情里的「恢复此文件」把旧 machine-id 放回（★ 但那等于**又变回母机的身份**）
+      · 回不去的：已经按新 ID 建好的目录 / 索引（属于它们自己的账，本动作不负责回滚）
+
+    判据（做完怎么算成）：
+      · 重读 `/etc/machine-id` ⇒ **非空 ＋ 长度 32 ＋ 与动手前不同**
+  confirm_text: 我已确认要重置这台机器的 machine-id
+
+backup:
+  - path: /etc/machine-id
+    label: 重置前的 machine-id
+    required: false
+
+params:
+  - name: dry_run
+    label: 演练模式（只跑判据、不动手）
+    type: enum
+    required: true
+    choices: ["不演练：真的重置", "演练：只判定、不动手"]
+    values: ["no", "yes"]
+    default: "no"
+    help: ★ 演练是**反例工具**：判据会红（值没变）—— 它证明"这条判据真在盯着身份"
+
+steps:
+  - name: push_script
+    title: 把身份脚本推到目标机（只是脚本；★ 判据不认它，只认重读的值）
+    transfer: put
+    src: aoc-identity.sh
+    dst: /usr/local/sbin/aoc-identity.sh
+    parser: raw
+
+  - name: reset
+    title: 重置 + 自证（★ 脚本内部做了"动手前/动手后"对比，退出码就是结论）
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, reset, machine-id, "{{ dry_run }}"]
+    parser: raw
+    timeout: 180
+    ok_exit_codes: [0]
+    note: |
+      ★★ 这一步**既是变更、也是判据**（脚本内部：读旧值 → 重置 → 读新值 → 比对）。
+        为什么合起来：判据必须看"**同一个上下文里的旧值**"，把它拆到两个步骤里
+        就得靠平台跨步骤传值——那会把判据变成"平台自己的算术"，而不是"被管那一方的事实"。
+      ★ 0 = 变了（长度 32）· 3 = 没变 / 形状不对（**判红**）· 2 = 读不到（如实说读不到）
+      ★ 这一步**不许 optional**：它就是本动作的判据。
+
+  - name: after
+    title: 判据的**旁证**：再独立读一次（留给报告与人工核对）
+    run: [/bin/sh, /usr/local/sbin/aoc-identity.sh, show, machine-id]
+    parser: raw
+    timeout: 60
+    optional: true
+
+verify:
+  - name: 身份重置这条判据必须成立（否则任务已经是失败）
+    from: reset
+    on_missing: 重置那一步没有给出任何输出 —— 本结论不可用
+  - name: 必须能独立重读到新身份（旁证）
+    from: after
+    on_missing: 独立重读没有输出 —— ★ 这不等于"没成功"，但不该继续往下走
+
+conclusion: |
+  【{host.name}】machine-id 重置结果
+  · 脚本自证（含动手前后的 sha256）：{reset}
+  · 独立重读：{after}
+
+  ★ 判据（问被重置的那一方）：重读 `/etc/machine-id` ⇒ 非空 ＋ 长度 32 ＋ **与动手前不同**。
+  ★ 为什么"不同"就够：克隆机**动手前那个值就是母机的值** ⇒ 变了 = 不再与母机相同（规范 §12.128）。
+
+  判读：
+  · `verdict=unchanged`（红）⇒ ★ 串味没消除：先看 `dry_run` 是不是被填成了"演练"；
+  · `dry_run=yes` ⇒ 这是**故意的反例**（判据必须红）—— 它不是"动作坏了"。

@@ -1,0 +1,93 @@
+id: file.push
+title: 上传文件到目标机
+summary: 从受控目录上传文件（覆盖前自动备份目标文件），并用 sha256 双向校验
+domain: C
+risk: yellow
+priority: P1
+tags: [变更, 文件传输]
+
+note: |
+  ★ 只允许从**受控目录** `repo/var/uploads/` 取源文件 ——
+  否则这个动作就能把管理机上任意文件（包括你的私钥）传到任何一台机器上。
+  参数里只写文件名，不写路径；引擎还会再做一次"必须在受控目录内"的硬校验。
+  ★ 上传后引擎**自动做 sha256 双向比对**（管理机算 + 目标机算），
+  不一致即判失败 —— "scp 没报错"不等于"文件传完整了"。
+
+confirm:
+  title: 确认上传文件
+  body: |
+    即将把 `var/uploads/{local_name}` 上传到「{host.name}」（{host.address}）的
+    `{remote_path}`。
+
+    会发生什么：
+      · 若该路径已存在文件，**会被覆盖**（覆盖前自动备份，可恢复）
+      · 上传后会用 sha256 逐字节校验
+
+    可撤回：用任务详情里的「恢复此文件」把被覆盖的原文件还原。
+  confirm_text: 我已确认要上传
+
+backup:
+  - path: "{{ remote_path }}"
+    label: "被覆盖前的目标文件"
+    required: false
+
+params:
+  - name: local_name
+    label: 源文件（受控目录内的文件名）
+    type: str
+    required: true
+    default: aoc-demo.conf
+    pattern: '^[A-Za-z0-9._-]+$'
+    placeholder: aoc-demo.conf
+    help: '只写文件名；文件要先放进 repo/var/uploads/（不允许路径分隔符）'
+  - name: remote_path
+    label: 目标机上的绝对路径
+    type: str
+    required: true
+    default: /opt/aoc-lab/config/aoc.conf
+    pattern: '^/[A-Za-z0-9._@/+-]+$'
+    placeholder: /opt/aoc-lab/config/aoc.conf
+    help: '必须写绝对路径；允许字母数字与 / . _ @ + -'
+
+steps:
+  - name: exists_before
+    title: 看目标路径是否已有文件（对照"新增"还是"覆盖"）
+    run: [stat, -c, '%s\t%a\t%U\t%G\t%F', "{{ remote_path }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 1]
+
+  - name: push
+    title: 上传并逐字节校验
+    transfer: put
+    src: "{{ local_name }}"
+    dst: "{{ remote_path }}"
+    parser: raw
+    note: |
+      这一步由引擎完成：scp 上传 → 管理机算 sha256 → 目标机算 sha256 → 比对。
+      不一致会直接判这一步失败（不允许"传了个残缺文件还报成功"）。
+
+  - name: readback
+    title: 目标机侧复核（把两个指纹并排摆在结论里）
+    run: [sha256sum, "{{ remote_path }}"]
+    parser: raw
+
+verify:
+  - name: 上传并校验通过
+    from: push
+    on_missing: 上传步骤没有返回结果（可能被拒绝或失败）
+  - name: 目标机侧能读到指纹
+    from: readback
+    on_missing: 目标机上读不到该文件的指纹
+
+conclusion: |
+  文件上传结果（{host.name}）
+  · 源文件：var/uploads/{local_name}
+  · 目标路径：{remote_path}
+  · 之前是否已存在：{exists_before}
+  · 引擎校验：{push}
+  · 目标机复核：{readback}
+
+  判读：
+    · 两处指纹应完全一致（引擎已经比对过，不一致不会走到这里）；
+    · 覆盖了旧文件时，可在任务详情里点「恢复此文件」还原。

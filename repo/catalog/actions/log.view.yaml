@@ -1,0 +1,162 @@
+# ============================================================
+# 动作：日志查看器
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 E（P0 · 只读）
+# 形态：带参数（unit / 时间范围 / 级别 / 关键字 / 行数）
+# 风险：green
+#
+# 参数安全策略（开题单技术要求 #1「绝不拼接用户输入」）：
+#   1) 每个参数先过白名单校验（pattern / type / min / max）；
+#   2) 渲染成 argv 时，最终由 transport 层用 shlex.quote() 逐个元素转义，
+#      远端 shell 看到的是被单引号包裹的字面量，无法逃逸；
+#   3) argv 是数组，绝不做字符串拼接后交给 shell。
+#
+# ★ T4 收窄（T1 遗留 #8）：原来结论里直接把整段日志（最多 2000 行）糊进去 ——
+#   那是"把原始输出复制到结论区"，人反而看不出重点。现在结论只给
+#   「命中多少行 / 其中错误级多少行 / 最近 N 条 warning 级以上」，
+#   完整日志仍在下方「日志正文」那一步的原始输出里（要看就看，不占结论）。
+# ============================================================
+
+id: log.view
+title: 日志查看器
+summary: 按服务、时间范围、级别、关键字检索日志（结论只给重点，完整内容在步骤留证里）
+domain: E
+risk: green
+priority: P0
+tags: [只读, 日志, 带参数]
+
+params:
+  - name: unit
+    label: 服务单元
+    type: str
+    required: true
+    normalize: systemd_unit        # 规范化：不含「.」则补 .service（白名单字符内）
+    pattern: '^[A-Za-z0-9@._:-]+$'
+    placeholder: sshd.service
+    help: 服务名或单元名，例如 sshd.service、nginx、sshd（不含点号时自动补 .service）
+
+  - name: since
+    label: 时间范围
+    type: enum
+    choices: ["最近 15 分钟", "最近 1 小时", "最近 6 小时", "最近 24 小时", "最近 7 天"]
+    values:  ["-15min",      "-1h",        "-6h",        "-24h",        "-7d"]
+    default: "最近 1 小时"
+
+  - name: priority
+    label: 日志级别
+    type: enum
+    choices: ["不限", "emerg（最高）", "alert", "crit", "err", "warning", "notice", "info", "debug（最详细）"]
+    values:  ["",     "0",          "1",     "2",    "3",   "4",       "5",      "6",    "7"]
+    default: "不限"
+    help: 选择某一级别后，显示该级别及更严重的日志（journalctl -p 语义）
+
+  - name: grep
+    label: 关键字
+    type: str
+    required: false
+    # 只禁换行/回车，其余字符由 shlex.quote 兜底 —— 白名单不是唯一防线。
+    pattern: '^[^\r\n]{1,120}$'
+    placeholder: timeout
+    help: journalctl -g 关键字过滤（按正则匹配，区分大小写）
+
+  - name: lines
+    label: 最多取多少行日志
+    type: int
+    min: 1
+    max: 2000
+    default: 200
+    help: 这是**步骤留证**里的日志正文条数（结论里不放这么多）。
+
+  - name: head
+    label: 结论里显示最近几条
+    type: int
+    min: 3
+    max: 50
+    default: 8
+    help: 结论只放最近 N 条「warning 级及以上」的日志（T4 收窄，默认 8）。
+
+steps:
+  - name: tz
+    title: 目标机时区与同步状态
+    run: ["timedatectl", "show", "--no-pager",
+          "-p", "Timezone", "-p", "NTPSynchronized"]
+    parser: shell_kv
+    optional: true
+    note: 日志时间按目标机时区展示，这里显式取出来标注，避免"以为是自己时区"。
+
+  - name: unit_check
+    title: 服务单元状态
+    run: ["systemctl", "show", "{{ unit }}", "--no-pager",
+          "-p", "Id", "-p", "Description",
+          "-p", "ActiveState", "-p", "SubState", "-p", "FragmentPath"]
+    parser: shell_kv
+
+  - name: hit_count
+    title: 命中条数（用户选的级别与范围）
+    run: ["journalctl", "-u", "{{ unit }}", "--since", "{{ since }}", "-o", "cat", "--no-pager"]
+    parser: line_count
+    ok_exit_codes: [0, 1]
+    optional: true
+    note: |
+      实测：journalctl 无匹配时 rc=1 且 stdout 打一行 "-- No entries --"。
+      解析器 line_count 会把那一行**排除**（T4 修正），否则"没有日志"会被数成 1 行。
+
+  - name: err_count
+    title: err 级及以上条数（结论的重点）
+    run: ["journalctl", "-u", "{{ unit }}", "--since", "{{ since }}",
+          "-p", "err", "-o", "cat", "--no-pager"]
+    parser: line_count
+    ok_exit_codes: [0, 1]
+    optional: true
+    note: 只数错误级及以上 —— 结论里"有没有错"比"一共多少行"重要得多。
+
+  - name: recent
+    title: 最近 N 条 warning 级及以上（结论用）
+    run: ["journalctl", "-u", "{{ unit }}", "--since", "{{ since }}",
+          "-p", "warning", "-n", "{{ head }}", "--no-pager", "-o", "short-iso"]
+    parser: lines
+    ok_exit_codes: [0, 1]
+    optional: true
+    note: 这是 T4 收窄的落点：结论里只放这一小段，完整日志留给下面的 logs 步骤。
+
+  - name: logs
+    title: 日志正文（完整，进步骤留证）
+    run:
+      - journalctl
+      - -u
+      - "{{ unit }}"
+      - --since
+      - "{{ since }}"
+      - { when: priority, value: -p }        # priority 为空时，这两行整体不出现在 argv 里
+      - { when: priority, value: "{{ priority }}" }
+      - { when: grep, value: -g }
+      - { when: grep, value: "{{ grep }}" }
+      - -n
+      - "{{ lines }}"
+      - --no-pager
+      - -o
+      - short-iso
+    parser: lines
+
+verify:
+  - name: 服务单元必须存在
+    from: unit_check
+    field: Id
+    on_missing: 目标机上找不到该服务单元（检查 unit 名字，或用 svc.list 看全部服务）
+  - name: 日志步骤必须成功返回
+    from: logs
+    severity: warn                 # 空结果不是错误（该时间段确实可能没有日志）
+    on_missing: 该时间范围内未取到日志行
+
+conclusion: |
+  【{unit_check.Description}】（{unit_check.Id}）状态：{unit_check.ActiveState} / {unit_check.SubState}
+  时间范围 {since} ｜ 级别 {priority} ｜ 关键字 {grep} ｜ 目标机时区 {tz.Timezone}（已同步：{tz.NTPSynchronized}）
+  命中 {hit_count} 行 ｜ 其中「err 级及以上」{err_count} 行
+
+  最近 {head} 条「warning 级及以上」：
+  {recent}
+
+  判读：
+  · 「err 级及以上」为 0 → 这段时间**没有错误级日志**（若命中数也是 0，那就是这段范围里压根没日志）；
+  · 「err 级及以上」大于 0 → 先看上面那几行，定位到时间点后，去下方「日志正文」那一步按时间前后翻；
+  · 结论里**故意只放最近 {head} 条**（T4 收窄）：原来会把整段日志糊进来，几百行反而看不出重点；
+  · 要完整内容 → 看下方步骤留证里的「日志正文（完整）」原始输出。

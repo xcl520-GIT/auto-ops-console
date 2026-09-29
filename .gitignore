@@ -1,0 +1,44 @@
+# auto-ops-console · 项目根忽略清单（2026-09-25 建立）
+
+> 说明：代码子目录 `repo/` 有它自己的 `.gitignore`（管运行期数据：`ops.db` / `artifacts/` /
+> `backups/` / `downloads/` / `enroll/` 等）。**本文件只管"项目根"这一层**，
+> 外加一条最重要的红线规则。
+
+# ---- ★ 红线：凭据与密钥绝不进 Git（总纲 §8.2）----
+CREDENTIALS*.md
+CREDENTIALS-local.md
+*.credentials
+.env
+.env.*
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+known_hosts
+authorized_keys
+
+# ---- Git 自身的备份物（只在本地留底，不进仓库）----
+*.bundle
+
+# ---- ★ 截图脚本用的浏览器 profile（临时物，绝不入库；脚本每次自建）----
+_cdp-screenshots/
+_cdp-*/
+
+# ---- ★★ 开源脱敏（2026-09-29 · 规范 §12.158）：**截图不入 Git** ----
+#   为什么：截图是**图片** —— 里面的地址与主机名是**像素**，不是字节；
+#   文本脱敏器（以及交付物校验的扫描）**看不见它们**，而又没有可信的机械脱敏法。
+#   ⇒ 公开仓库只带**文字快照**（`界面-结论原文-*.md`：可逐字比对、可机械脱敏）；
+#     截图由读者**自己生成**：`工具\capture-screenshots.py`。
+#   ★ 本地这 12 张**留在磁盘上**，只是不提交（`git rm --cached`，文件原地不动）。
+docs/screenshots/*.png
+
+# ---- 交付物脚本的运行期产物 ----
+工具/__pycache__/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+~$*

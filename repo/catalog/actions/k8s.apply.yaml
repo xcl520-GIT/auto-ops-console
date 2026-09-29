@@ -1,0 +1,176 @@
+# ============================================================
+# 动作：应用 Kubernetes 清单
+# 来源：T8·S7 —— 规范 §12.34（"把一份声明变成集群里的对象"）
+# 形态：**变更**（yellow）—— 会创建 / 更新集群对象
+# ============================================================
+
+id: k8s.apply
+title: 应用 Kubernetes 清单
+summary: 把盘上的一份清单交给集群（先 `diff` 判"变了没有"，再 `apply`，最后 `get` 自证对象真的在）
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, K8s, 清单, kubectl]
+
+note: |
+  ★★ **清单从哪来**：由**配方**渲染模板写到目标机（`/etc/kubernetes/aoc/*.yaml`），
+  再交给本动作。★ 动作层**不内联任何 YAML**（那是"把内容写进动作"，§4 的老账），
+  动作只负责"**把盘上那份交给集群**"这一件事 —— 与 `file.cat` 的分工同族（§12.30.1）。
+
+  ★★ **判据与 `changed` 都挂在 `kubectl diff` 上**（规范 §12.34）：
+  · `kubectl diff -f <清单>` 的**退出码**就是它的一句话结论：
+    **0 = 盘上那份与集群里的对象一模一样**、**1 = 有差异**；
+  · ⇒ `changed`：0 → **false**（这次什么都没改，幂等）、1 → **true**（真的改了）；
+  · ★★ **不用**「`apply` 的输出里有没有 `created` / `configured`」——
+    服务端会给对象补默认字段，`configured` 可能在"**其实没变**"时**也**出现 ⇒
+    "第二次跑 changed 为空"这条验收就**永远做不到**（假变化）。
+    `diff` 判的是**差异本身**，不是"命令干了什么活"。
+
+  ★ **自证挂在 `get -f` 上**：`kubectl get -f <清单>` 问的是
+  "**清单里那些对象现在到底在不在**"（rc=0 = 全在），与"`apply` 返回 0"是两件事
+  （§12.6.5 同源：要的是终态，不是动作本身）。
+
+  ★★ **`diff` 为什么是 `optional`**：第一次装 CRD 时，
+  清单里那些**自定义资源**（如 Calico 的 `IPPool`）在 `diff` 那一刻**还没有 CRD 认得它们**，
+  `kubectl diff` 会报错。⇒ 把它标成可选 ⇒ **那一次 `changed` 是 `unknown`**（不是 false、也不是 true）——
+  ★ 这是**诚实**的做法：那一次我们**确实无法**回答"变了没有"（宪法 2：拿不到对照数据 ≠ 确实没变）。
+  第二次跑时 CRD 已在 ⇒ `diff` 正常 ⇒ `changed=false`（幂等成立）。
+
+confirm:
+  title: 确认应用清单
+  body: |
+    即将在「{host.name}」（{host.address}）上把这份清单交给集群：
+
+      {path}
+
+    会发生什么：`kubectl apply` 会**创建**清单里还不存在的对象、
+    **更新**已经存在且内容有差异的对象。清单里可能包含 CRD / RBAC / DaemonSet 等。
+
+    **回得来吗**：★ **一条条说清（规范 §12.19）**：
+    · 清单里**新建**的对象 —— 可以删（`kubectl delete -f <同一份清单>`），但**删之前要确认它没在提供服务**；
+    · 清单里**更新**过的对象 —— ★ **回不去**（`apply` 不保留上一版；要回退得自己留一份旧清单）；
+    · ★ 对象背后**真的存了数据的**（StatefulSet 的 PVC 等）—— ❌ 回不去，那是数据不是对象。
+
+    **幂等**：内容与集群里一致时 ⇒ `changed=false`（靠 `kubectl diff` 判）。
+  confirm_text: 我已确认应用这份清单
+
+params:
+  - name: path
+    label: 清单路径（目标机上的）
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/aoc/[A-Za-z0-9._-]+\.yaml$'
+    default: /etc/kubernetes/aoc/calico.yaml
+    help: '★ 白名单把清单钉在 `/etc/kubernetes/aoc/` 下：那一层是**本工作台自己的目录**（与包自带的 `/etc/kubernetes/*.conf` 分开），可枚举、可删净（§12.13.5 同源）。'
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+    help: '★ 与「集群节点树」用的是同一个入口。'
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+    note: ★ 不声明 `means_done`：缺工具是**真故障**（规范 §12.33 规矩 3）。
+
+  - name: kubeconfig_present
+    title: 确认 kubeconfig 在（★ 不在 = 集群还没建好，**真故障**）
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+    note: >
+      ★★ 它**不声明**守卫：`apply` 无事可做的情形**只有一种**——"清单里的对象已经一模一样"，
+      而那由 `diff` 回答。**"没有 kubeconfig"不是"已达终态"**，它是"这台机器还不是集群入口"。
+
+  - name: manifest_present
+    title: 确认清单文件在（★ 缺它是"配方没把模板写下来"，**真故障**）
+    run: [ls, -l, "{{ path }}"]
+    parser: raw
+    timeout: 20
+    note: ★ 同样不声明守卫。
+
+steps:
+  - name: diff
+    title: ★★ 先问一句"盘上那份与集群里的一致吗"（**这一步的退出码决定 `changed`**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - diff
+      - -f
+      - "{{ path }}"
+    parser: raw
+    ok_exit_codes: [0, 1]
+    optional: true
+    timeout: 300
+    note: >
+      ★ 退出码：**0 = 一模一样**、**1 = 有差异**（两者都算跑成）。
+      ★★ **它标了 optional**：第一次装 CRD 时，清单里的自定义资源在 `diff` 那一刻
+      还没有 CRD 认得它们 ⇒ 那一次会报错 ⇒ `changed` 记 **unknown**（诚实，不猜）。
+      第二次跑时 CRD 已在 ⇒ 正常给 0 ⇒ 幂等成立。
+
+  - name: apply
+    title: 把清单交给集群
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - apply
+      - -f
+      - "{{ path }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 600
+    note: >
+      输出形如 `configmap/calico-config created` / `daemonset.apps/calico-node configured` /
+      `… unchanged`。★ **不拿它当 `changed` 的判据**（服务端补默认字段会让 `configured` 假出现）。
+
+  - name: get
+    title: ★★ 自证：清单里那些对象**现在到底在不在**（`get -f` 的退出码）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - -f
+      - "{{ path }}"
+      - --no-headers
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 300
+    note: >
+      ★★ 这是"**对象真的在集群里**"的那条判据：由 **API server** 回答（在 = 0）。
+      ★ 它排在 `apply` 之后，与"`apply` 返回 0"是两件事（§12.6.5 同源）。
+
+verify:
+  - name: ★★ 清单必须真的被交给集群过（它没跑成，"在不在"就没有意义）
+    from: apply
+    on_missing: >
+      `kubectl apply` 没有成功 —— 清单没能交给集群。
+      ★ 先看它的原文：语法错 / 没有权限 / 连不上 API 各有各的原文。
+  - name: ★★ 清单里的对象必须真的在集群里（`get -f` 的退出码为 0）
+    from: get
+    on_missing: >
+      `kubectl get -f` 没能确认清单里的对象全在 —— 也就是说**有对象没建成**。
+      ★ `apply` 可能部分成功（前面几条建了、后面一条被拒）⇒
+      先看 `apply` 原文里哪一条带了 `Error`，再用 `diff` 那一步看差异。
+
+conclusion: |
+  【{host.name}】应用 Kubernetes 清单（变更）
+  · 清单：{path}
+  · ★★ 差异判据（`kubectl diff` 的原文与退出码）：{diff}
+  · apply 原文：
+  {apply}
+  · 对象现状（`kubectl get -f`）：
+  {get}
+
+  判读：
+    · ★★ **`changed` 看 `diff` 的退出码**：0 = 一模一样（本次幂等）、1 = 有差异（真的改了）、
+      其它 = **unknown**（第一次装 CRD 时会走到这里 —— 那一次我们**确实无法**回答，不猜）；
+    · ★ **自证是 `get -f`**：问的是"**对象现在在不在**"，不是"`apply` 返回了什么"；
+    · ★ **回不去的逐项**：清单里**新建**的对象可以删；**更新**过的对象 ❌ 回不去
+      （`apply` 不保留上一版）；对象背后真的存了数据的 ❌ 回不去（那是数据不是对象）；
+    · ★ 本动作**只碰清单里点名的那几个对象** —— 它不做 `delete`、不做 `scale`、
+      不碰清单之外的东西（删要通过明确点名的删除动作，见 `file.remove` / 后续阶段的删除类动作）。

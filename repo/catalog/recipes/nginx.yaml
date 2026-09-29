@@ -1,0 +1,155 @@
+# ============================================================
+# 配方：Nginx（T5 · 第二阶段第一个服务）
+# ------------------------------------------------------------
+# 一次点击 = 从"机器上什么都没有"到"服务可用且有健康检查"：
+#   预检 → 装包 → 渲染配置 → 校验语法 → 启动 + 自启 → （配置变了才）重启 → 健康检查
+# 反向操作：停止 / 卸载（保留数据）/ 卸载（全删）
+#
+# ★ 设计宪法（规范 §12.0）：
+#   ① 本文件只声明"要什么"，**判定与分支一律走平台侧**（没有一处命令、没有一处表达式）
+#   ② 「没变」可断言：平台采集 changed → 变更清单 → **第二次跑该清单为空**就是幂等证明
+#   ③ 每个正向步骤都有反向操作（见 uninstall）
+# ============================================================
+
+id: nginx
+name: Nginx
+version: "1"
+summary: 一键部署 Nginx（模板渲染 + 语法校验 + 健康检查 + 幂等重跑 + 可卸载）
+risk: yellow
+
+note: |
+  ★ 为什么 preflight 里**没有** `absent(pkg.installed nginx)` 和 `free_port`：
+  这两条看着很合理（"别重复部署"“端口别被占"），但它们会让**第二次跑必然中止** ——
+  而幂等要求第二次跑**成功且零变更**。所以 preflight 只放"部署前后都成立"的事实：
+  "这台机器上不该有 httpd"（Apache 会和 Nginx 抢端口与站点目录），它在装前装后都成立。
+
+  端口冲突不靠 preflight 猜，靠**真实失败**暴露：`svc.start` 之后紧跟 `systemctl is-active`，
+  Nginx 起不来时那一步会失败并带上远端原文 —— 这比"预检不通过"准确得多。
+
+  ★ `version` 是**配方自己的版本**（改配方就 +1），**不是 nginx 包版本**：
+  本配方不锁包版本（规范 §12.1.1）—— 装当前源里可用的版本，并把实际装到的版本写进报告。
+
+params:
+  - name: port
+    label: 监听端口
+    type: int
+    required: true
+    min: 1024
+    max: 65535
+    default: 8080
+    help: '默认 8080（避开 80）。改端口后重新跑一次配方即可（会写新配置并触发重启）。'
+  - name: server_name
+    label: 域名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9._*-]{1,64}$'
+    default: "_"
+    help: '没域名就保持 _（匹配任意主机名）。'
+  - name: root_dir
+    label: 站点目录
+    type: str
+    required: true
+    pattern: '^/var/www/[A-Za-z0-9][A-Za-z0-9._-]{0,40}$'
+    default: /var/www/aoc-nginx
+    help: '必须落在 /var/www/<名字>；配方会**自己创建**它（不用你提前建目录）。'
+  - name: worker
+    label: worker 进程数
+    type: int
+    required: true
+    min: 1
+    max: 8
+    default: 2
+    help: 'Nginx 的工作进程数；两台 CPU 的机器填 2 就够。'
+
+preflight:
+  - expect:
+      absent: { action: pkg.installed, args: { pkg: httpd } }
+    fail_reason: '这台机器上已经装了 httpd（Apache）：它会与 Nginx 抢端口与站点目录。先确认那是不是你要的，再决定要不要继续。'
+
+steps:
+  - name: install
+    title: 安装 nginx 包
+    action: pkg.install
+    args: { package: nginx }
+
+  - name: render_conf
+    title: 渲染主配置
+    template: nginx/nginx.conf
+    dest: /etc/nginx/nginx.conf
+    mode: "0644"
+    notify: [restart_nginx]
+
+  - name: render_index
+    title: 渲染首页
+    template: nginx/index.html
+    dest: "{{ root_dir }}/index.html"
+    mode: "0644"
+
+  - name: config_test
+    title: 校验配置语法（nginx -t）
+    action: svc.configtest
+    args: { binary: nginx }
+
+  - name: start
+    title: 启动服务
+    action: svc.start
+    args: { unit: nginx }
+
+  - name: enable
+    title: 设为开机自启
+    action: svc.enable
+    args: { unit: nginx }
+
+  - name: restart_nginx
+    title: 重启 Nginx（仅当配置真的变了）
+    action: svc.restart
+    args: { unit: nginx }
+    trigger_only: true
+    note: '由 render_conf 的 notify 唤起；第二次跑（内容没变）**根本不会执行** —— 幂等靠这个成立。'
+
+health:
+  - expect:
+      state: { unit: nginx, equals: active }
+  - expect:
+      http_status: { url: "http://127.0.0.1:{{ port }}/", equals: 200 }
+
+uninstall:
+  stop:
+    - action: svc.stop
+      args: { unit: nginx }
+  disable:
+    - action: svc.disable
+      args: { unit: nginx }
+  # ★ 只删**配方自己写出来的**那份配置。
+  #   ★★ 绝对不要再写 `/etc/nginx` —— 那是**包自带的目录**，里面还有 mime.types 等
+  #      rpm 管的文件。T5 真跑时踩过：删掉整个 /etc/nginx 之后包进入**残缺状态**，
+  #      `nginx -t` 永久报 open() "/etc/nginx/mime.types" failed，
+  #      而重跑配方**只能重写它自己管的那个文件**，修不回来（要靠 dnf reinstall 或恢复备份）。
+  remove_config:
+    - action: file.remove
+      args: { path: /etc/nginx/nginx.conf }
+  # ★ 包目录留给「全删」——那时包也会被卸掉，目录随之由 rpm 清理/重装还原。
+  purge_paths:
+    - "{{ root_dir }}"
+    - /var/log/nginx
+    - /etc/nginx
+  keep_data:
+    - "{{ root_dir }}"
+    - /var/log/nginx
+  remove_packages:
+    - nginx
+  stop_confirm_text: 我已确认要停止服务
+  purge_confirm_text: 我已确认全删
+  # ★ 停止 / 「保留数据」卸载**之后**应当成立的事实（规范 §12.6.3）。
+  #   没有它就会去套部署段那句 `state: active` —— 服务刚被停掉必然判红，
+  #   于是「停止服务」这个正向操作会**永远显示失败**（T5 真跑时抓到的缺陷）。
+  #
+  #   ★★ 判据选的是**端口空闲**，不是 `state: {equals: inactive}`：
+  #     实测 `svc.disable` 会让 systemd 把 nginx.service **从内存里卸载**
+  #     （`systemctl list-units --all` 也查不到它，只有 `list-unit-files` 里还写着 disabled），
+  #     于是 `svc.list` 的自然列表里没有它 → 判定变成"系统里没有这个服务" →
+  #     **明明停得干干净净却判红**（「保留数据」卸载就踩了这个）。
+  #     「8080 上没人听」才是这件事真正等价、且不依赖 systemd 内部记账的判据。
+  health:
+    - expect:
+        free_port: "{{ port }}"

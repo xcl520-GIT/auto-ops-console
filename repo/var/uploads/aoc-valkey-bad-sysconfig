@@ -1,0 +1,1 @@
+OPTIONS="--port 6379 --bind 127.0.0.1 --this-option-does-not-exist 1"

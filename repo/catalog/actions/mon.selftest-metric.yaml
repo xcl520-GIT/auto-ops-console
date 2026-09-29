@@ -1,0 +1,129 @@
+# ============================================================
+# 动作：监控 · 人造自检指标（T10 · 造告警条件的**唯一入口**）
+# 来源：开题单 §10.2.10（造条件只许三种）＋ §10.2.1 #5（实测修订后的形态）
+# 形态：往 node_exporter 的 **textfile collector** 目录写一个 .prom 文件
+# 风险：yellow（在 /opt/aoc-monitoring 白名单目录里新增/更新一个小文件）
+# ============================================================
+
+id: mon.selftest-metric
+title: 监控 · 人造自检指标（造告警条件）
+summary: 往 node_exporter 的 textfile 目录写 aoc_mon_selftest=<值>，用它把告警从 inactive 推到 firing
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, 监控, 造条件, 靶子, T10]
+
+confirm:
+  title: 确认写入人造自检指标
+  body: |
+    即将在「{host.name}」（{host.address}）上写：
+      /opt/aoc-monitoring/_target/{target}.prom  →  aoc_mon_selftest {value}
+
+    会发生什么：
+      · node_exporter 的下一个抓取周期会多出这条指标；
+      · 规则 `aoc_mon_selftest >= 1`（warning）/ `>= 2`（critical）会随后进入 pending，
+        过了 `for` 变成 firing，并**真的投递到收端**。
+
+    ★★ 这是**故意的靶子**：它只写一个几行的文本文件，**不动磁盘水位、不动集群、不排空节点** ——
+       告警验证的代价必须小于它要防的事故。
+    ★ **回得去**：把值写回 0，或删掉这个文件；告警随后 resolved。
+    ★ **回不去**：那段样本已进 TSDB（受 retention 约束）。
+  confirm_text: 我已确认要写入人造指标
+
+note: |
+  ★★ 规范 v1.13 §12.59「**告警靶子的代价必须小于它要防的事故**」：
+    造告警条件**只许**用这种方式（或"临时停一个 exporter"）。**不许**为了看它响一次，
+    就去弄挂控制面、排空节点、或者把真磁盘写满。
+  ★★ **为什么是 textfile collector**（这是 S0 之后的**实测修订**，见 开题单 §10.2.1 #5）：
+    原计划写的是"在 `/opt/aoc-monitoring/_target/` 造一个**稀疏文件**（磁盘水位）" ——
+    ★ **那条路实测不成立**：稀疏文件用 `truncate`/`seek` 造出来**不占实际块**，
+    `df` 与 `node_filesystem_avail_bytes` **都不会动**（稀疏 = 不分配块），告警永远不会触发。
+    真正能"一写就动、一删就回"的等价物是 **node_exporter 的 textfile collector**：
+    放一个 `.prom` 文件 ⇒ 立刻多出一条真实指标；删掉 ⇒ 指标消失。
+    ★ 代价有界（几行文本）、零风险、而且**走的是真实的采集链路**（scrape → 规则求值 → 告警 → 投递）。
+  ★ 值 0 等价于"不触发"：规则是 `aoc_mon_selftest >= 1`，写 0 时它照样是 **inactive**
+    （但指标存在 —— 这比"文件删了指标消失"更容易看出链路是通的）。
+  ★ `changed` = 那个文件内容的 sha256 变了没有（写同一个值 ⇒ `False`）。
+
+params:
+  - name: value
+    label: aoc_mon_selftest 的值
+    type: int
+    required: true
+    min: 0
+    max: 100
+    default: 0
+    help: '0 = 不触发；1 = 触发 warning 那条；≥2 = 触发 critical 那条（并**抑制** warning，见 mon.alerts 的判读）。'
+  - name: target
+    label: 指标文件在目标机上的名字
+    type: str
+    required: true
+    default: aoc-mon-selftest
+    pattern: '^(aoc-mon-selftest|aoc-mon-selftest-alt)$'
+    help: ★ 只许这两个值（等价于枚举，但写成 `pattern` 是为了让**配方 args 里的写法与它逐字一致** —— 枚举的"选择项文本"与"预设值"是两套字符串，配方里传错一个就静默错一个）。
+
+backup:
+  - path: "/opt/aoc-monitoring/_target/{{ target }}.prom"
+    label: "被覆盖前的指标文件"
+    required: false
+
+steps:
+  - name: before
+    title: 记下这个指标文件现在的样子
+    run: [cat, "/opt/aoc-monitoring/_target/{{ target }}.prom"]
+    parser: raw
+    ok_exit_codes: [0, 1]
+    timeout: 20
+    note: rc=1 = 还没有这个文件（第一次造条件）。
+
+  - name: write
+    title: 写入指标
+    write_file:
+      path: "/opt/aoc-monitoring/_target/{{ target }}.prom"
+      content: |
+        # managed by auto-ops-console (T10) — 人造自检指标，用完请删
+        # 落点：node_exporter 的 --collector.textfile.directory
+        aoc_mon_selftest {{ value }}
+      mode: "0644"
+    parser: raw
+    note: ★ 0644：node_exporter 以 aocmon 身份跑，只要**可读**就行。
+
+  - name: after
+    title: 复读这个文件
+    run: [cat, "/opt/aoc-monitoring/_target/{{ target }}.prom"]
+    parser: raw
+    timeout: 20
+
+  - name: dir
+    title: textfile 目录现状（可枚举的证据）
+    run: [ls, -l, /opt/aoc-monitoring/_target]
+    parser: lines
+    timeout: 20
+
+verify:
+  - name: 指标文件必须真的写下来了
+    from: after
+    on_missing: 写完之后读不回来 —— 目录不存在？权限不对？
+
+conclusion: |
+  【{host.name}】监控 · 人造自检指标
+  文件：/opt/aoc-monitoring/_target/{target}.prom ｜ 值：**aoc_mon_selftest {{ value }}**
+  写前：{before}
+  写后：{after}
+  目录现状：
+  {dir}
+
+  判读：
+  · ★ 写完之后**要等一个抓取周期**（`scrape_interval` 15 秒）指标才会进 Prometheus ——
+    不是"写完就响"。次序是：**写文件 → 等 scrape → 规则求值 → pending →（过 `for`）→ firing → 投递**；
+  · ★★ **判据的次序**（规范 §12.55.2）：造条件**之前**先用「监控 · 当前告警」查一次（应当没有这条）
+    ⇒ 造完**立刻**查（应当 **pending**）⇒ 过了 `for` 再查（应当 **firing**）；
+    **只查一次看到 firing 说明不了 `for` 生效**；
+  · `value = {{ value }}`：`>= 1` 触发 warning 那条；`>= 2` 触发 critical 那条，
+    而按抑制规则 critical 会**压住**同实例同组的 warning —— 于是 `AocMonSelfTestWarning` 应当**消失**；
+  · ★★ **回得去 / 回不去**（规范 §12.38）：
+    - **回得去**：把值写回 0，或用受限删除把 `/opt/aoc-monitoring/_target/{target}.prom` 删掉；
+      告警随后进入 resolved（收端会收到一条 `resolved` 投递，这是**正常**的）；
+    - **回不去**：**那段 aoc_mon_selftest 样本已进 TSDB**，删文件不会让它消失
+      （受 `retention.time` / `retention.size` 约束）。★ 造条件要记着这一点：你留下的是**数据**。
+  · ★ 本动作只往自己的白名单目录里写一个小文件，**不碰任何真实资源**（不动磁盘水位、不动集群、不排空节点）。

@@ -1,0 +1,102 @@
+id: cron.upsert
+title: 新增/更新定时任务
+summary: 往 /etc/cron.d/ 写一条工作台管理的定时任务（不碰你自己的 crontab）
+domain: E
+risk: yellow
+priority: P1
+tags: [变更, 定时任务]
+
+note: |
+  ★ 只写 `/etc/cron.d/aoc-<名字>`，**绝不改你的 crontab**。
+  原因：`crontab -` 是**覆盖式**写入 —— 一次写错就把整份任务表替换掉。
+  独立文件则天然可备份、可回退、可对照，而且 `aoc-` 前缀一眼能看出"这是工作台建的"。
+  （探针实测：docker-01 上 root 的 crontab 里已有一条你自己的任务 `check_users.sh`，
+   所以这条规矩不是洁癖，是防止误伤。）
+
+confirm:
+  title: 确认写入定时任务
+  body: |
+    即将在「{host.name}」（{host.address}）上写入 `/etc/cron.d/aoc-{name}`。
+
+    将要写入的内容：
+      {{ schedule }} root {{ command }}
+
+    会发生什么：crond（本机已 active）会在下一个匹配的时间点执行这条命令。
+    可撤回：用「删除定时任务」按同一个名字删除；写入前也会自动备份同名旧文件。
+  confirm_text: 我已确认要写入
+
+backup:
+  - path: "/etc/cron.d/aoc-{{ name }}"
+    label: "同名定时任务文件（首次创建时不存在，属正常）"
+    required: false
+
+params:
+  - name: name
+    label: 任务名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]{0,29}$'
+    default: demo
+    placeholder: aoc-demo
+    help: '小写字母/数字/短横线，最长 30 位；最终文件名是 aoc-<名字>'
+  - name: schedule
+    label: 执行时间（5 段 cron 表达式）
+    type: str
+    required: true
+    pattern: '^[0-9*/,\-]+ [0-9*/,\-]+ [0-9*/,\-]+ [0-9*/,\-]+ [0-9*/,\-]+$'
+    default: '*/5 * * * *'
+    help: '五段：分 时 日 月 周。例：*/5 * * * * = 每 5 分钟；0 2 * * * = 每天 2:00'
+  - name: command
+    label: 要执行的命令
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9/._:@=+,\- ]+$'
+    default: /bin/true
+    help: '只允许字母数字与 / . _ : @ = + , - 和空格；不允许管道、重定向、分号（在界面上写清楚，胜过在服务器上出事）'
+
+steps:
+  - name: exists_before
+    title: 看同名文件是否已存在（对照"新增"还是"覆盖"）
+    run: [ls, -l, "/etc/cron.d/aoc-{{ name }}"]
+    parser: raw
+    optional: true
+    ok_exit_codes: [0, 2]
+    note: |
+      ls 对不存在的文件返回 **2**（探针实测）。把 0 与 2 都声明为"正常报告"，
+      这一步就永远不会阻断动作，只在结论里告诉我们"这是新增还是覆盖"。
+
+  - name: write
+    title: 写入任务文件
+    write_file:
+      path: "/etc/cron.d/aoc-{{ name }}"
+      content: |
+        # managed by auto-ops-console (T3) — 请勿手工编辑
+        SHELL=/bin/bash
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        {{ schedule }} root {{ command }}
+      mode: "0644"
+    parser: raw
+
+  - name: readback
+    title: 读回文件内容（自证写进去了什么）
+    run: [cat, "/etc/cron.d/aoc-{{ name }}"]
+    parser: raw
+
+verify:
+  - name: 任务文件已写入且非空
+    from: write
+    on_missing: 文件没有写成功（回读不到字节数）
+  - name: 能读回内容
+    from: readback
+    on_missing: 读不回任务文件内容
+
+conclusion: |
+  定时任务写入结果（{host.name}）
+  · 文件：/etc/cron.d/aoc-{name}
+  · 之前是否已存在：{exists_before}
+  · 读回内容：
+  {readback}
+
+  判读：
+    · crond 本机 active，**无需 reload**，下一个匹配时间点即生效；
+    · 撤销：执行「删除定时任务」，任务名填 {name}。

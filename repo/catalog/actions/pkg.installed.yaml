@@ -1,0 +1,108 @@
+# ============================================================
+# 动作：已装软件与文件归属
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 H（P0 · 只读）
+# 形态：一次给全结论（已装包总数 + 单包详情 + 文件归属）
+# 风险：green
+# ============================================================
+
+id: pkg.installed
+title: 已装软件与文件归属
+summary: 已装包总数、某个包的详情，或某个文件属于哪个包（rpm 查询，全部离线）
+domain: H
+risk: green
+priority: P0
+tags: [只读, 包管理, rpm]
+note: |
+  全部走 rpm 的**本地数据库**查询（不联网、秒级返回），这是 RHEL 系最可靠的一手信息。
+  `rpm -qi` 的输出是 `Key : Value` 形状 → 直接用 colon_kv 解析，不解析 dnf 的表格
+  （T1 已确认：dnf 是 4 还是 5 取决于机器，**格式不可假设**）。
+  两个可选参数分别对应"看某个包"和"看某个文件"，不填就整步跳过（只给总数）。
+
+params:
+  - name: pkg
+    label: 查看某个包的详情
+    type: str
+    required: false
+    pattern: '^[A-Za-z0-9._+-]{1,64}$'
+    placeholder: openssh-server
+    help: 包名（不带版本）。留空则跳过"包详情"一步。
+  - name: file
+    label: 查看某个文件属于哪个包
+    type: str
+    required: false
+    pattern: '^/[A-Za-z0-9._/+-]{1,200}$'
+    placeholder: /usr/sbin/sshd
+    help: 必须是绝对路径。留空则跳过"文件归属"一步。
+
+steps:
+  - name: count
+    title: 已装包总数
+    run: ["rpm", "-qa"]
+    parser: line_count
+    timeout: 60
+
+  - name: sanity
+    title: rpm 数据库自检
+    run: ["rpm", "-q", "rpm"]
+    parser: raw
+    note: >
+      查"rpm 包自己"是最轻量的数据库自检：它必须存在且版本可读。
+      如果连这条都查不到，说明 rpm 数据库本身有问题 —— 后面的结论都不要信。
+
+  - name: info
+    title: 包详情
+    run:
+      - { when: pkg, value: rpm }
+      - { when: pkg, value: -qi }
+      - { when: pkg, value: "{{ pkg }}" }
+    parser: colon_kv
+    pick:
+      "Name": name
+      "Version": version
+      "Release": release
+      "Architecture": arch
+      "Install Date": install_date
+      "Size": size
+      "License": license
+      "Summary": summary
+      "Vendor": vendor
+    optional: true
+    note: 未装该包时 rpm 返回非零 → 本步（可选）标记失败，其余结论照常给。
+
+  - name: owner
+    title: 文件归属
+    run:
+      - { when: file, value: rpm }
+      - { when: file, value: -qf }
+      - { when: file, value: "{{ file }}" }
+    parser: raw
+    optional: true
+    note: 输出形如 openssh-server-10.0p2-1.el10.x86_64；文件不属于任何包时 rpm 会报"not owned by any package"。
+
+verify:
+  - name: rpm 数据库必须可读
+    from: sanity
+    on_missing: rpm -q rpm 无输出 —— 本地包数据库可能已损坏，本结论不可信
+  - name: 必须统计出已装包数
+    from: count
+    severity: warn
+    on_missing: 已装包数为 0（异常：正常系统至少有几十个包）
+
+conclusion: |
+  【{host.name}】已装软件与文件归属
+  已装包总数：{count} ｜ rpm 数据库自检：{sanity}
+  包详情（查询 {pkg}）：
+    名称 {info.name} ｜ 版本 {info.version}-{info.release} ｜ 架构 {info.arch}
+    安装日期 {info.install_date} ｜ 体积 {info.size} ｜ 许可 {info.license}
+    摘要 {info.summary}
+    提供者 {info.vendor}
+  文件归属（查询 {file}）：
+    {owner}
+
+  判读：
+  · 「文件归属」回答的是"这个二进制/配置是哪个包装的"—— 判断"能不能用 dnf 直接管它"的关键：
+    有归属 → 用 dnf 升级/卸载；无归属 → 手工装的，升级时要格外小心；
+  · 包详情显示（无）→ 该包未安装（或包名拼写不对），用「包搜索」确认包名；
+  · 已装包总数异常少（几十以内）说明这是最小化安装的系统，很多工具（dig/traceroute/mtr）确实没有，
+    这也是「连通性与路径」「DNS 解析链路」里那些"工具缺失"提示的根源；
+  · 本动作只读：不会安装、升级或删除任何包（那属 T3 的变更动作）。

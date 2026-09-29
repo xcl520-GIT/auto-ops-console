@@ -1,0 +1,149 @@
+# ============================================================
+# 动作：把这台机器登记进 hosts.yaml（★ 自动纳管的最后一步）
+# 来源：规范 §12.131（自动纳管的写前备份）· §12.116（归属唯一来源）
+# 形态：local 通道跑 tools\host_register.py —— 写前备份 → 文本插入 → 前后各算 sha256
+# 风险：yellow（改的是**管理机自己**的配置文件；可逐字节回退）｜ 执行通道：local（§12.115）
+# ============================================================
+
+id: host.register
+title: 把这台机器登记进 hosts.yaml
+summary: 写 hosts.yaml（主机条目 ＋ 虚拟化登记 vm.vmx）—— ★ 写前备份、可逐字节回退、对外可见
+domain: A
+risk: yellow
+priority: P0
+channel: local
+tags: [变更, 纳管, 造机]
+
+note: |
+  ★★ 规范 §12.131：`hosts.yaml` 是**平台自己的配置文件** ⇒ 写入必须三件齐：
+    ① **写前备份**（`var/backups/hosts.yaml.<时间戳>.bak`）
+    ② **逐字节可回退**（`python tools\host_register.py --revert <备份>` ⇒ 回退后 sha256 必须与备份一致）
+    ③ **对外可见**（结论里看得见改了什么、备份在哪、怎么退回去）
+  ★★ "登记"= **两件事一起写**：主机条目（地址 / 用户 / 密钥）**＋ `vm:` 虚拟化登记** ——
+    少了后者，这台机就是"**能被 ssh、但不能被开关机**"（§12.116 归属唯一来源）。
+    ⇒ 所以 `vmx` 那个路径**不由人敲**：它来自平台的 `{{ vm_new_vmx }}`（唯一来源 = `vm.allow_vmx_dirs`）。
+  ★★ **不覆盖**：id 已存在且 address / vmx 对不上 ⇒ **拒绝**（让人来定），
+    与"克隆不许覆盖"同一条精神（§12.130 第 4 条）：**覆盖比失败严重得多**。
+  ★ **幂等**：id 已在、且 address 与 vmx 逐字对得上 ⇒ **已达终态**（`changed=false`），不是失败。
+  ★ 为什么它是 local 通道：它改的是**管理机自己**的文件，与 `vm.*` 同一个执行面（§12.115 规矩 1）。
+
+confirm:
+  title: 确认登记这台机器
+  body: |
+    即将把「{vm_new_id}」写进管理机的 `hosts.yaml`：
+
+      · id：{vm_new_id}
+      · address：{address}（用户 {user}）
+      · vm.vmx：{vm_new_vmx}
+      · 来源母机：{from_mother}
+
+    会发生什么：
+      · `hosts.yaml` 里**新增一条**主机条目（含 `vm:` 虚拟化登记）⇒ 它会出现在**目标机下拉 / 批量 / 体检 / AI 工具面**里
+      · ★ 写入前会**整文件备份**；写入后结论里给出备份路径与前后 sha256
+      · ★ **不动**任何别的条目、**不重排**文件、**不丢注释**（文本插入，不是"读出来再 dump 回去"）
+
+    能不能撤回：
+      · 能，而且是**逐字节**的：`python tools\host_register.py --revert "<备份文件>"`
+      · 回不去的：无（这一条**可以**完整回退）
+
+    判据（做完怎么算成）：
+      · 写进去了（`written=true`）或**已达终态**（`already=true`）—— 两者都算成，并如实区分
+  confirm_text: 我已确认要把这台机器登记进 hosts.yaml
+
+params:
+  - name: id
+    label: 主机 id（也是 hosts.yaml 里的 id）
+    type: str
+    required: true
+    default: aoc-tpl-01
+    pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{1,38}$'
+    placeholder: aoc-tpl-01
+    help: ★ 建议与 VM 的 id 一致（但**不是靠名字猜**：归属判据在 vm.vmx 那一行上）
+
+  - name: address
+    label: 静态地址
+    type: str
+    required: true
+    default: 192.0.2.14
+    pattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    placeholder: 192.0.2.14
+    help: ★ 地址的来源只有两个：**用户点名**，或平台**只读扫描**未用地址后挑（规范 §12.132）
+
+  - name: new_id
+    label: 新机 id（★ 用来算出 vm.vmx，不靠人敲路径）
+    type: str
+    required: true
+    default: aoc-tpl-01
+    pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{1,38}$'
+    help: 与 `vm.clone` 的 new_id 一致；平台据此注入 `{{ vm_new_vmx }}`（唯一来源）
+
+  - name: from_mother
+    label: 从哪台母机克隆来的（写进 note）
+    type: str
+    required: true
+    default: Rocky Linux 64 位
+    placeholder: Rocky Linux 64 位
+
+  - name: update_mode
+    label: 同名但地址不同时怎么办
+    type: enum
+    required: true
+    choices: ["拒绝覆盖（默认）", "允许只改地址（用于地址按计划变了）"]
+    values: ["refuse", "address"]
+    default: "refuse"
+    help: |-
+      ★ 默认 **拒绝**：id 已在而内容不一致 ⇒ 报错让人来定（覆盖比失败严重得多）。
+      ★ `address` 只允许改**地址那一行**，其余一个字都不动；★ 仍然**先备份**。
+      ★ 什么时候用它：配方 `vm-provision` 的最后一步 ——
+        克隆机先按"母机的地址"登记（因为那时它用的就是那个地址），
+        身份重置把地址改成计划值之后，再把登记改成最终地址。
+
+  - name: user
+    label: 登录用户
+    type: str
+    required: true
+    default: root
+    pattern: '^[a-z_][a-z0-9_-]{0,31}$'
+
+steps:
+  - name: register
+    title: 写 hosts.yaml（★ 备份 ＋ 插入 ＋ 前后 sha256；退出码就是结论）
+    run: ["{{ vm_probe_py }}", "{{ host_register_script }}",
+          "--id", "{{ id }}", "--address", "{{ address }}", "--user", "{{ user }}",
+          "--vmx", "{{ vm_new_vmx }}", "--from-mother", "{{ from_mother }}",
+          "--update-mode", "{{ update_mode }}"]
+    parser: json
+    timeout: 120
+    ok_exit_codes: [0]
+    note: |
+      ★ 0 = 成功（新增 / 只改地址 / **已达终态** —— 三者由 JSON 里的 `written` / `already` 如实区分）
+        · 2 = 读不到 / 写不了 / **id 已存在但内容不一致**（★ 拒绝静默覆盖，要人来定）
+      ★★ 为什么"已达终态"不用退出码 3：**本地通道上 `ok_exit_codes` 不生效** ——
+        `app/engine.py::_to_step_out` 里 `host.transport == "local"` 那一支先判"非零即失败"。
+        ⇒ 本地通道的状态要**回 0 ＋ JSON 里说清**（T17·S5 真跑抓到的平台事实）。
+      ★ 判据没变弱：仍然是**逐字比对 hosts.yaml**（id ＋ address ＋ vmx），只是"没变"由 JSON 承载。
+
+verify:
+  - name: 必须拿到 sha256 与（或）结论（否则"改了什么"无从核对）
+    from: register
+    field: checked
+    on_missing: 登记那一步没有给出对照信息 —— 本结论不可用
+
+conclusion: |
+  【{vm_new_id}】登记结果
+  · 判据：{register.verdict}
+  · hosts.yaml 改前 sha256：{register.hosts_sha256_before}
+  · hosts.yaml 改后 sha256：{register.hosts_sha256_after}
+  · 本条目的 vmx：{register.vmx} · address：{register.address}
+  · （`already` 路径下只有 `hosts_sha256`，没有"改前/改后"—— 因为**它没被改**）
+
+  ★★ 三件齐（规范 §12.131）：
+  · 写前备份：{register.backup}（sha256 {register.backup_sha256}）
+  · 逐字节回退：`python tools\\host_register.py --revert "<上面那个备份>"`
+  · 对外可见：本结论就是"改了什么"的那份交代
+
+  判读：
+  · `written=true` ⇒ 新增了一条登记：它**现在**才是"本项目管的一台机"（可开关机 / 可体检 / 可纳管）；
+  · `already=true` ⇒ **已达终态**（幂等），这次什么都没改；
+  · 拒绝（`REGISTER_CONFLICT`）⇒ ★ 有人在 hosts.yaml 里已经用了这个 id 而内容不同 —— **请人工定**，
+    平台不做静默覆盖。

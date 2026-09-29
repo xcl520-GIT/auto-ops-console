@@ -1,0 +1,55 @@
+# ============================================================
+# 动作：Valkey 探活（真问一句"它活着吗"）
+# 来源：T6 服务铺量 —— `expect` 第 6 类 `responds` 的采集来源（规范 §12.11）
+# 形态：**只读**（green）—— 不重启、不写任何文件
+# ============================================================
+
+id: db.valkey-ping
+title: Valkey 探活
+summary: 真问一句 Valkey 活着吗（valkey-cli PING → PONG），只读、不改任何状态
+domain: E
+risk: green
+priority: P1
+tags: [只读, 服务, 缓存]
+
+note: |
+  ★ 与 `db.mariadb-ping` 同一个理由：健康检查要"真问一句"，不能只看单元与端口。
+
+  ★ **没有 `redis-cli` 兜底**：Rocky/RHEL 10 起 Redis 被 Valkey 取代，
+  实测（`dnf repoquery`）只有 `valkey-*` 命令名，**没有 `redis-*` 兼容名** ——
+  所以命令写 `valkey-cli`，不要写 `redis-cli`（写错就是 rc=127）。
+
+  ★ 命令名与端口以**真机实测**为准（T6·S3 会确认，必要时修正并同步规范 §12.11.3）。
+  ★ 本动作**只读**（green）：`changed` 恒 `false`（规范 §12.3）。
+
+params:
+  - name: port
+    label: 监听端口
+    type: int
+    required: true
+    min: 1
+    max: 65535
+    default: 6379
+    help: '默认 6379；配方部署时用的是哪个端口，这里就填哪个。'
+
+steps:
+  - name: probe
+    title: 问一句 Valkey
+    run: [/usr/bin/valkey-cli, -h, 127.0.0.1, -p, "{{ port }}", PING]
+    parser: raw
+    timeout: 30
+    note: >
+      成功时输出 `PONG`（配方里 `equals` 写 `PONG`，★ **全等、不是子串**）。
+      服务没起来 → 命令非 0 → 动作失败 → 期望判 **fail**；
+      客户端没装 → rc=127 → `TOOL_MISSING` → 期望判 **unknown**（无法判定，**不是**通过）。
+
+verify:
+  - name: 探活必须有输出（没输出 = 这次根本没问到）
+    from: probe
+    on_missing: 拿不到探活输出 —— 这次"问一句"没有结果
+
+conclusion: |
+  【{host.name}】Valkey 探活 · 端口 {port}
+  应答：{probe}
+  判定：上面是**服务自己的应答原文**（正常时应为 `PONG`）。
+  说明：本动作**只读** —— 不重启服务、不写任何文件。

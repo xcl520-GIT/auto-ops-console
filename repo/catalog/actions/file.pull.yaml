@@ -1,0 +1,54 @@
+id: file.pull
+title: 从目标机取回文件
+summary: 把目标机上的文件下载到管理机 var/downloads/（取证、对比、留档）
+domain: C
+risk: green
+priority: P1
+tags: [文件传输, 只读]
+
+note: |
+  只读动作（不修改目标机），所以没有二次确认。取回的文件落在管理机的
+  `repo/var/downloads/`，并在结论里给出本地路径与字节数 —— 方便直接拿去做对照。
+
+params:
+  - name: remote_path
+    label: 目标机上要取回的文件（绝对路径）
+    type: str
+    required: true
+    default: /etc/cron.d/0hourly
+    pattern: '^/[A-Za-z0-9._@/+-]+$'
+    placeholder: /etc/cron.d/0hourly
+    help: '必须写绝对路径；允许字母数字与 / . _ @ + -'
+
+steps:
+  - name: stat_remote
+    title: 先确认文件存在并记录元数据
+    run: [stat, -c, '%s\t%a\t%U\t%G\t%F', "{{ remote_path }}"]
+    parser: raw
+    note: 文件不存在 → stat 返回 1 → 预检性质的一步失败，动作会中止并说明原因
+
+  - name: pull
+    title: 下载到管理机
+    transfer: get
+    src: "{{ remote_path }}"
+    dst: ""
+    parser: raw
+    note: dst 留空 → 落到 var/downloads/（引擎的受控目录）
+
+verify:
+  - name: 下载步骤返回了结果
+    from: pull
+    on_missing: 下载没有产生结果（可能失败）
+  - name: 读到了远端元数据
+    from: stat_remote
+    on_missing: 读不到该文件的元数据
+
+conclusion: |
+  文件取回结果（{host.name}）
+  · 目标机路径：{remote_path}
+  · 元数据（大小|权限|属主|属组|类型）：{stat_remote}
+  · 下载结果：{pull}
+
+  判读：
+    · 本地文件在 repo/var/downloads/ 下，文件名与远端一致；
+    · 结论里的字节数可与上方元数据的第一段对照（应相等）。

@@ -1,0 +1,83 @@
+id: svc.restart
+title: 重启服务
+summary: 重启一个 systemd 服务，并用「启动时间戳变了」自证真的重启了（不是"命令返回 0"）
+domain: E
+risk: yellow
+priority: P0
+tags: [变更, 服务]
+
+note: |
+  ★ 重启的难点在于"证明它**真的重启了**"。
+  服务本来就 active 时，`systemctl restart` 返回 0 只能说明"命令没报错"。
+  本动作的做法：**对比重启前后的 ActiveEnterTimestamp** —— 结论区把两个时间戳并排摆出来，
+  人一眼就能看出"变了没有"。这是规范 §8.7 #1（结论模板不能做运算）的诚实绕法：
+  引擎不做判断，把判断所需的两个事实都摆给你。
+
+confirm:
+  title: 确认重启服务
+  body: |
+    即将在「{host.name}」（{host.address}）上重启服务「{unit}」。
+
+    影响面：重启期间该服务短暂不可用（秒级；若服务启动慢则更久）。
+    可撤回：无需撤回 —— 重启失败时服务可能停在 inactive，用「启动服务」可再次拉起。
+  confirm_text: 我已确认要重启
+
+params:
+  - name: unit
+    label: 服务名
+    type: str
+    required: true
+    pattern: '^[A-Za-z0-9@._:-]+$'
+    normalize: systemd_unit
+    default: aoc-lab.service
+    placeholder: aoc-lab 或 nginx
+    help: '不含「.」时自动补 .service；只允许字母、数字与 @ . _ : - 这些字符'
+
+precheck:
+  - name: unit_exists
+    title: 确认服务存在
+    run: [systemctl, cat, "{{ unit }}"]
+    parser: lines
+
+steps:
+  - name: before
+    title: 记录重启前的状态与时间戳
+    run: [systemctl, show, -p, ActiveState, -p, SubState, -p, ActiveEnterTimestamp, -p, MainPID, "{{ unit }}"]
+    parser: shell_kv
+
+  - name: restart
+    title: 重启服务
+    run: [systemctl, restart, "{{ unit }}"]
+    parser: raw
+    timeout: 120
+
+  - name: isactive
+    title: 检查重启后是否 active（★ 退出码就是结论）
+    run: [systemctl, is-active, "{{ unit }}"]
+    parser: raw
+    ok_exit_codes: [0]
+
+  - name: after
+    title: 读取重启后的状态与时间戳
+    run: [systemctl, show, -p, ActiveState, -p, SubState, -p, ActiveEnterTimestamp, -p, MainPID, -p, ExecMainStatus, "{{ unit }}"]
+    parser: shell_kv
+
+verify:
+  - name: 重启后服务处于 active
+    from: isactive
+    on_missing: 重启后服务不是 active —— 可能启动失败，看原始输出与 journalctl
+  - name: 能读到新的启动时间戳
+    from: after
+    field: ActiveEnterTimestamp
+    on_missing: 读不到 ActiveEnterTimestamp，无法证明重启真的发生过
+
+conclusion: |
+  「{unit}」重启结果
+  · 现在状态：{after.ActiveState} / {after.SubState}
+  · 主进程 PID：{after.MainPID}（重启后应为**新** PID）
+  · 重启前：状态 {before.ActiveState}｜PID {before.MainPID}｜时间戳 {before.ActiveEnterTimestamp}
+  · 重启后：状态 {after.ActiveState}｜PID {after.MainPID}｜时间戳 {after.ActiveEnterTimestamp}
+
+  判读（**对照两个时间戳**）：
+    · 时间戳变了 = 真的重启过；时间戳没变 = 很可能没重启（去看原始输出）；
+    · 该动作不替你做这个判断（结论模板不做运算），但把两个事实都摆在了这一屏。

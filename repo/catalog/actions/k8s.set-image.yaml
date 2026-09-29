@@ -1,0 +1,233 @@
+# ============================================================
+# 动作：换镜像
+# 来源：T9·S4 —— 规范 §12.37.1 ①、§12.38（"回得去"的值必须进报告）
+# 形态：**可恢复变更**（yellow）
+# ============================================================
+
+id: k8s.set-image
+title: 换镜像
+summary: 把某个容器的镜像换成指定版本 —— ★ **旧镜像写进报告**（这就是"回得去"的兑现依据）
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, K8s, 工作负载, 发布]
+
+note: |
+  ★★ **判据两条**（规范 §12.37.1 ①）：
+  ① **读回来的 `image` 与参数逐字相符**（不是"命令返回 0"）；
+  ② **`rollout status` 的退出码为 0**（新镜像真的起来了）。
+  ⇒ ★ 少了 ②，"镜像写了、容器起不来"会被报成成功（**假绿**）；
+  少了 ①，"参数没生效"也会被报成成功。
+
+  ★★ **回得去 / 回不去**（规范 §12.38 / 清单 103）：
+  · ✅ **回得去**：**旧镜像写进报告** ⇒ 再用本动作换回去（或 `k8s.rollout-undo` 回上一版）；
+  · ❌ **回不去**：旧镜像对应的**容器进程**已经不存在了（数据卷不受影响，但内存态没了）。
+
+  ★ **镜像来源**：本环境的可用来源见既有配方（`--image-repository` 用的是实测可拉的那一个）。
+  ★★ 换成一个**拉不到**的镜像 ⇒ 本动作会在 `rollout status` 那一步**红**（那是正确的）。
+
+params:
+  - name: kind
+    label: 对象类型
+    type: enum
+    required: true
+    choices: [Deployment, StatefulSet, DaemonSet]
+    values: [deployment, statefulset, daemonset]
+    default: Deployment
+  - name: name
+    label: 对象名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: t9-web
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+  - name: container
+    label: 容器名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    default: web
+    help: '★ 容器名从 `k8s.workloads` / `k8s.describe` 里看。'
+  - name: image
+    label: 新镜像（含标签）
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9./_-]*:[A-Za-z0-9._-]+$'
+    placeholder: docker.io/library/busybox:1.36
+    help: '★ **必须带明确的标签**（`:1.36` 这种）—— 不带标签的 `latest` 会让"回滚到上一版"失去意义。'
+  - name: wait_seconds
+    label: 等滚动完成超时（秒）
+    type: int
+    required: true
+    min: 10
+    max: 900
+    default: 180
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认更换镜像
+  body: |
+    即将把「{namespace}/{kind}/{name}」的容器 **{container}** 的镜像换成 **{image}**。
+    · 能不能撤：✅ **能** —— 报告里会给出**旧镜像**，用本动作换回去即可；
+      ❌ 但旧镜像对应的**容器进程**回不来（内存态没了；数据卷不受影响）。
+    · 影响面：会触发一次**滚动更新**（新旧容器短暂并存）；★ 新镜像**拉不到**就会滚动失败（会红）。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认要更换镜像
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: target_exists
+    title: ★ 对象必须存在
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: image_before
+    title: ★★ 改之前的镜像（**这就是"回得去"的兑现依据**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.spec.template.spec.containers[*].image}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★ 用 `[*]` 取**全部容器**的镜像：单容器时就是一个值；多容器时是并列的一串
+      （★ 如实说明：本动作改的是**指定容器**，这一段是给人对照用的全景）。
+
+  - name: act
+    title: 提交新镜像（★ 只说明"声明被收下了"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - set
+      - image
+      - "{{ kind }}/{{ name }}"
+      - "{{ container }}={{ image }}"
+      - "-n"
+      - "{{ namespace }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: wait
+    title: ★★ 判据②：等新镜像**真的起来**（`rollout status` 的退出码）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - rollout
+      - status
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "--timeout={{ wait_seconds }}s"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 920
+
+  - name: image_after
+    title: ★★ 判据①：读回来的镜像必须**与参数逐字相符**
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.spec.template.spec.containers[*].image}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: pods_after
+    title: 现在的 Pod（与镜像对读：新 Pod 的 AGE 应该很短）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - pods
+      - "-n"
+      - "{{ namespace }}"
+      - "-l"
+      - "aoc-t9=t9-web"
+      - "-o"
+      - wide
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对），本次没有改任何东西。
+  - name: ★★ 改完之后必须读得到镜像（拿不到对照数据 = 不能下结论）
+    from: image_after
+    on_missing: >
+      改完之后读回来的 `image` 是空的 —— 这次拿不到对照数据。
+      ★ **不许**把它当成"换好了"（拿不到对照数据 ≠ 已经生效）。
+
+conclusion: |
+  【{host.name}】换镜像 · {namespace}/{kind}/{name} · 容器 {container}（变更）
+  · ★★ **旧镜像（回退用）**：{image_before}
+  · 新镜像（本次要的）：{image}
+  · 改之后读回来的镜像：{image_after}
+  · `rollout status` 原文：{wait}
+  ── 现在的 Pod ──
+  {pods_after}
+
+  ★★ 回得去 / 回不去（规范 §12.38 / 清单 103）：
+    · ✅ **回得去**：把上面那个**旧镜像**填回来再跑一次本动作即可（★ 这就是"旧镜像必须进报告"的理由）；
+    · ✅ 或者用 `k8s.rollout-undo` 回到上一版（它按 revision 回退，不看镜像名）；
+    · ❌ **回不去**：旧镜像对应的**容器进程**（内存态）—— 数据卷不受影响；
+    · ⚠️ 若这次"换不成"（滚动超时），集群**仍然是旧镜像在跑**（滚动不会把老容器先撤掉）——
+      ★ 这一点请以本报告里的"改之后读回来的镜像"为准。
+
+  判读：
+    · ★★ 判据是 **① 读回来的镜像与参数相符** ＋ **② `rollout status` 退出码为 0**；
+    · ★ 参数里的镜像**必须带明确标签**（`:latest` 会让"回滚到上一版"失去意义）；
+    · ★ 拉不到镜像时**滚动会失败并红**（那是正确行为）—— 常见原因是仓库不可达或标签不存在，
+      用 `k8s.diagnose` 能直接读出成因。

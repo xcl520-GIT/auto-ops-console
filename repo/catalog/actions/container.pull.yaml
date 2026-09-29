@@ -1,0 +1,148 @@
+# ============================================================
+# 动作：按 CRI 路拉一个镜像（链路最末端）
+# 来源：T8·S5 —— "镜像到底拉不拉得下来"只能是"真拉过一次"（规范 §12.31.3）
+# 形态：**变更**（yellow）—— 会往 /var/lib/containerd 的镜像缓存里写东西
+# ============================================================
+
+id: container.pull
+title: 按 CRI 路拉取镜像
+summary: 走 kubelet 用的那条路（CRI）真拉一个镜像 —— "能不能拿到"只能由"真的拿到过一次"回答
+domain: J
+risk: yellow
+priority: P1
+tags: [变更, 容器, containerd, 镜像]
+
+note: |
+  ★★ **为什么必须有它**（规范 §12.31.3）：T8 开工前拿到的"可达性"证据全是**间接**的 ——
+  `registry.probe` 的 `401` 只说明"**仓库活着**"，`net.http` 的 `307` 只说明
+  "**这个 manifest 存在且可匿名取**"。本环境当场撞到一个**反例**：
+  `certs.d` 里配的加速地址 `m.daocloud.io/registry.k8s.io` 的 `/v2/` 给 **403**，
+  而同一仓库的**直连**给 **307** —— 两份证据都"看着像通"，**只有真拉能分出胜负**。
+
+  ★★ **为什么用 `crictl` 而不是 `ctr images pull`**：
+  · `kubelet` 拉镜像走的是 **CRI 插件**（用 containerd **守护进程**那份配置：
+    `registry.config_path = /etc/containerd/certs.d`、`pinned_images.sandbox`…）；
+  · `crictl` 走的是**同一条路**；而 `ctr images pull` 是**客户端自己**解析 hosts
+    （要额外 `--hosts-dir`）。
+  ⇒ ★ **测哪条路，就得走哪条路** —— 否则又是"测了一个没人用的通路"（§12.28.1 的老账）。
+
+  ★ **`--timeout` 必须显式给**：crictl 的连接超时默认极短（秒级），
+  拉一个镜像根本不够用 —— 不给它就会出现"拉失败但其实是超时太短"这种**假红**，
+  而假红会让人去改一个**本来没问题**的镜像源。
+
+  ★ 拉的 `ref` 由调用方给（本话题的配方传的是**实际会被用到的那一个**，
+  即主配置里 `pinned_images.sandbox` 的值）—— ★ **挑一个好拉的镜像来"证明链路"= 自己骗自己**。
+
+  ★ **幂等**：`changed` 只认"**`after` 里出现了 `before` 里没有的 ref**"这一个方向
+  （规范 §12.31.5）—— 第二次跑时它已经在本地 ⇒ 不新增 ⇒ `changed=false`。
+
+confirm:
+  title: 确认拉取镜像
+  body: |
+    即将在「{host.name}」（{host.address}）上**拉取**镜像：
+
+      {ref}
+
+    会发生什么：走 containerd 的 **CRI 路**（与 kubelet 同一条）把该镜像拉到本地镜像缓存
+    （`/var/lib/containerd`）。拉取会**按 `certs.d` 配的路**走（可能有多个加速地址）。
+
+    影响面：只写镜像缓存（磁盘占用按镜像大小）；不启停任何服务、不改任何配置。
+    可撤回：可以不再使用该镜像（清理镜像缓存不属本动作职责）。
+
+params:
+  - name: ref
+    label: 镜像引用
+    type: str
+    required: true
+    pattern: '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,180}(:[A-Za-z0-9._-]{1,128})?$'
+    placeholder: registry.aliyuncs.com/google_containers/pause:3.10.1
+    help: '形如 <仓库>/<名>:<tag>；首字符必须是字母或数字（于是它永远不会被当成命令行开关）。'
+
+precheck:
+  - name: crictl_present
+    title: 确认这台机器上有 crictl（cri-tools 包，★ 缺它就说清"缺工具"，不是"拉了个空"）
+    run: [ls, -l, /usr/bin/crictl]
+    parser: raw
+    timeout: 20
+    note: >
+      ★ 预检不通过 ⇒ 整条动作 aborted、目标机零改动，并给出"先装 cri-tools"的建议。
+      ★ 这比跑到一半报 `crictl: command not found` 好得多：后者会被误读成"镜像拉不下来"。
+
+steps:
+  - name: before
+    title: 拉之前的本地镜像清单（★ 幂等判据的"前"）
+    run: [ctr, -n, k8s.io, images, ls, -q]
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: pull
+    title: ★★ 真拉一次（走 CRI 路；★ 这一步的退出码就是"末端结论"）
+    run:
+      - crictl
+      - --runtime-endpoint=unix:///run/containerd/containerd.sock
+      - --image-endpoint=unix:///run/containerd/containerd.sock
+      - --timeout=5m
+      - pull
+      - "{{ ref }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 360
+    note: >
+      ★ 成功时 crictl 什么都不打印（或只打一行）—— 所以**不能**拿它的输出去做非空断言（§9.6）；
+      自证挂在下一步（`exists`），那一步问的是"**镜像现在到底在不在**"。
+      ★ 失败时 crictl 会带远端原文（`context deadline exceeded` / `403 Forbidden` / `unauthorized`…），
+      那是判断"是网络问题还是鉴权问题"的依据。
+
+  - name: after
+    title: 拉之后的本地镜像清单（★ 幂等判据的"后"）
+    run: [ctr, -n, k8s.io, images, ls, -q]
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: exists
+    title: ★★ 自证：这个 ref **真的在** CRI 镜像库里了
+    run:
+      - crictl
+      - --runtime-endpoint=unix:///run/containerd/containerd.sock
+      - --image-endpoint=unix:///run/containerd/containerd.sock
+      - --timeout=30s
+      - inspecti
+      - "{{ ref }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ 这是"**真拉到**"的那条判据：`inspecti` 的退出码由**镜像库**回答
+      （在 = 0、不在 = 非 0），与"拉取命令返回 0"是两件事
+      （§12.6.5 同源：**要的是终态，不是动作本身**）。
+
+verify:
+  - name: ★★ 拉取必须真的跑过（它没跑就没法谈"末端"）
+    from: pull
+    on_missing: 拉取步骤没有返回结果（被拒绝 / 被中止 / 超时）—— "能不能拿到"这个问题本次没有答案
+  - name: ★★ 自证：镜像必须真的在镜像库里
+    from: exists
+    on_missing: >
+      `inspecti` 没能确认这个 ref 在镜像库里 —— 也就是说**没拉下来**。
+      ★ 先看 `pull` 那一步的远端原文，再对照 `backup` 里留档的 `/etc/containerd/certs.d`：
+      403 / 超时 / 鉴权失败各对应不同的下一步。
+
+conclusion: |
+  【{host.name}】按 CRI 路拉取镜像（变更）
+  镜像引用：{ref}
+  · 拉之前本地镜像 **{before.count}** 条 ｜ 拉之后 **{after.count}** 条
+  · 拉取命令的远端原文：{pull}
+
+  判读：
+    · ★★ 这一步是"**能不能拿到**"的**唯一**末端判据：`registry.probe` 的 401 与
+      `net.http` 的 307 都只说明"仓库/清单活着"，**不等于**"运行时这条路能拉下来"；
+    · ★ 走的是 **CRI 路**（`crictl` ↔ containerd 守护进程，与 kubelet 同一条），
+      所以它按的是 **守护进程那份配置**里的 `registry.config_path`（本环境 = `/etc/containerd/certs.d`）；
+    · ★ 拉下来之后这个镜像**就留在本地缓存里了** ⇒ 后面用到它的步骤**不再依赖这份网络不确定性**
+      （这正是"把不确定性一次性买断"）；
+    · ★ 若本次**没新增**任何镜像（前后条数相同）⇒ 说明它**本来就在本地** ——
+      这是**幂等的正面证据**，不是失败；
+    · 失败时按远端原文分档：`context deadline exceeded` / 连接超时 ⇒ 路不通（看 `certs.d` 里的加速地址）；
+      `403` / `unauthorized` ⇒ 仓库拒绝（换源或改加速）；`not found` ⇒ 这个 ref 不存在（先核对名字）。

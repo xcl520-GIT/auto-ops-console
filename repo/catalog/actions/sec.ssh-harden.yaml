@@ -1,0 +1,142 @@
+# ============================================================
+# 动作：SSH 加固与密钥查看
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 G（P1 · 只读）
+# 形态：一次给全结论（sshd 最终生效的加固项 + 授权公钥清单与指纹）
+# 风险：green
+# ============================================================
+
+id: sec.ssh-harden
+title: SSH 加固与密钥查看
+summary: sshd 最终生效的加固项（sshd -T）+ root 授权公钥数量与指纹（只读）
+domain: G
+risk: green
+priority: P1
+tags: [只读, 安全, SSH, 密钥]
+note: |
+  ★ 判"加固"要看**最终生效值**，不是"配置文件里写没写"：
+  OpenSSH 的**默认值** + `Include /etc/ssh/sshd_config.d/*.conf` 进来的那些文件，
+  合起来才是真正生效的那一套 —— 只有 `sshd -T` 能回答（要求 root；我们本来就是 root）。
+  ⇒ 这是 §12.13.5「找服务自己留的钩子」那条规矩在**只读侧**的同一个道理：
+  判"生效了什么"要用服务自己的入口，别去猜它读了哪些文件。
+
+  ★ 为 `sshd -T` 的输出加了 `space_kv` 解析器（**指令名 值**，空格分隔）：§5 的三条判定同时成立 ——
+  ① 格式被版本锁死（OpenSSH 7.x~10.x 没变过，且没有 `--json` 之类的替代）；
+  ② 没有更结构化的来源（读配置文件只能回答"写没写"）；
+  ③ 动作层禁止管道 ⇒ "grep 出那几行"写不了。理由详见规范 §12.23。
+
+  ★ 公钥清单只给**数量 + 指纹 + 注释**（`ssh-keygen -l -f`），**不打印公钥本身** ——
+  这里要回答的是"有几把钥匙、什么时候轮换过"，不是把内容抄进报告（`ssh-keygen -l` 本来也只给指纹）。
+
+  ★★ **真跑核到的一条环境事实**（2026-09-26 · node-03 · RHEL 10 / OpenSSH 9.9 一系）：
+  `sshd -T` 的输出里**没有** `challengeresponseauthentication`（104 行里逐行找过）——
+  它已经是 `kbdinteractiveauthentication` 的**别名**、不再单独打印。
+  ⇒ 本动作**不再取它**：取一个永远取不到的键，只会让结论里多一个"（无）"，
+  而那会被读成"这项有问题"（与"空结果 ≠ 空数据"同族的假警报）。
+
+  ★ `authorized_keys` 的权限也看一眼：`600` + 属主 root 是期望值；
+  权限过宽（如 644/666）说明有人手动动过，是**加固上真正该管**的那类细节。
+
+params:
+  - name: top_n
+    label: 指纹清单显示条数
+    type: int
+    min: 1
+    max: 50
+    default: 10
+    help: 只影响"指纹列前几条"（规范 §10.5）；"共几把钥匙"是精确值，不受它影响。
+
+steps:
+  - name: effective
+    title: sshd 最终生效的加固项（sshd -T）
+    run: ["sshd", "-T"]
+    parser: space_kv
+    pick:
+      permitrootlogin: permit_root_login
+      passwordauthentication: password_auth
+      pubkeyauthentication: pubkey_auth
+      permitemptypasswords: permit_empty_passwords
+      kbdinteractiveauthentication: kbd_interactive
+      hostbasedauthentication: hostbased_auth
+      permituserenvironment: permit_user_env
+      x11forwarding: x11_forwarding
+      allowtcpforwarding: allow_tcp_forwarding
+      maxauthtries: max_auth_tries
+      logingracetime: login_grace_time
+      clientaliveinterval: client_alive_interval
+      clientalivecountmax: client_alive_count_max
+      usepam: use_pam
+      printlastlog: print_last_log
+    note: >
+      ★ 全部取**最终生效值**（`sshd -T` 会把默认值与 Include 进来的文件合并后打出来）。
+      `pick` 只做改名：结论模板里的 `{effective.permit_root_login}` 比
+      `{effective.permitrootlogin}` 好读，也避免模板取值歧义（规范 §12.6）。
+
+  - name: keys_perm
+    title: 授权公钥文件的权限（ls -l）
+    run: ["ls", "-l", "/root/.ssh/authorized_keys"]
+    parser: raw
+    ok_exit_codes: [0, 2]
+    optional: true
+    note: >
+      ★★ `ok_exit_codes: [0, 2]` —— `ls` 对**不存在的文件**给 **rc=2**，
+      而"**这个文件根本不在**"是这条动作**该报出来的结论**（没有公钥 = 没有这条加固面）。
+      ★ 只标 `optional` 不够：那让**任务**不失败，但这一步仍被记成「步骤失败」
+      ⇒ 一个**只读**动作挂着「步骤失败」= 假警报（规范 §12.64 ⑥ / 检查清单 154）。
+
+  - name: keys_fp
+    title: 授权公钥指纹（前 N 条）
+    run: ["ssh-keygen", "-l", "-f", "/root/.ssh/authorized_keys"]
+    parser: head_lines
+    parser_arg: "{{ top_n }}"
+    optional: true
+    note: 一把钥匙一行（`位数 + SHA256 指纹 + 注释`）；★ 不含公钥内容本身。
+
+  - name: keys_count
+    title: 授权公钥数量
+    run: ["ssh-keygen", "-l", "-f", "/root/.ssh/authorized_keys"]
+    parser: line_count
+    optional: true
+    note: >
+      同一个文件、同一条命令的**第二个解析器**：`head_lines` 给人看、`line_count` 给机器数。
+      空行不会被 `ssh-keygen -l` 计入（它是按**钥匙**输出，不是按行）。
+
+verify:
+  - name: 加固项必须读得出来（按最终生效值）
+    from: effective
+    field: permit_root_login
+    on_missing: >
+      `sshd -T` 没给出 permitrootlogin —— 要么目标机上没有可用的 sshd 配置（配置坏了/没装），
+      要么 `space_kv` 与它的输出格式对不上。
+      ★ 这条自证**必须**存在：拿不到生效值就**不许**给出"加固得怎么样"的结论（§10.6.3「空结果 ≠ 空数据」）。
+  - name: 授权公钥数量必须读得出来
+    from: keys_count
+    severity: warn
+    on_missing: >
+      读不到 /root/.ssh/authorized_keys（不存在或权限不足）——
+      本动作是用 root 跑的，所以"不存在"通常意味着这台机器**不靠公钥**登录（例如只留密码/控制台）。
+      ★ 这一条判 warn 不判 fail：没有公钥文件本身就是一条**结论**，不是动作失败。
+
+conclusion: |
+  【{host.name}】SSH 加固与密钥查看（★ 取的是 **sshd 最终生效值**）
+
+  认证方式：PermitRootLogin={effective.permit_root_login} ｜ PasswordAuthentication={effective.password_auth} ｜ PubkeyAuthentication={effective.pubkey_auth}
+  空密码 / 键盘交互：PermitEmptyPasswords={effective.permit_empty_passwords} ｜ KbdInteractive={effective.kbd_interactive}
+  其他开关：X11Forwarding={effective.x11_forwarding} ｜ AllowTcpForwarding={effective.allow_tcp_forwarding} ｜ UsePAM={effective.use_pam} ｜ PrintLastLog={effective.print_last_log}
+  抗暴力：MaxAuthTries={effective.max_auth_tries} ｜ LoginGraceTime={effective.login_grace_time}
+  连接保活：ClientAliveInterval={effective.client_alive_interval} ｜ ClientAliveCountMax={effective.client_alive_count_max}
+  其他：HostbasedAuthentication={effective.hostbased_auth} ｜ PermitUserEnvironment={effective.permit_user_env}
+
+  root 授权公钥：{keys_count} 把 ｜ 文件权限：{keys_perm}
+  指纹（前 {top_n} 条）：
+  {keys_fp}
+
+  判读：
+  · ★ 上面每一项都是**最终生效值**（OpenSSH 默认值 + Include 的文件合并后的结果）——
+    所以"配置文件里写了 PermitRootLogin no 但这里是 yes"这种矛盾**只会在这里暴露**；
+  · `permit_root_login=yes` + `password_auth=yes`（尤其再加 `permit_empty_passwords=yes`）是**最弱的一组**；
+    这台机器是我们**用公钥登录**的，理想组合是 `prohibit-password`（或 `no`）+ `password_auth=no`；
+  · `password_auth=yes` 时 `max_auth_tries` 建议 ≤ 4（默认 6）；`login_grace_time` 建议 ≤ 60s（默认 120s）；
+  · `x11_forwarding=yes` 与 `allow_tcp_forwarding=yes` 在纯运维机上通常可以关掉（缩小面）；
+  · `client_alive_interval=0` 表示**没开**保活 —— 长连接容易被中间设备悄悄掐断（对批量执行是干扰项）；
+  · 公钥只给**数量与指纹**：数量突然变多（有人加了一把）比指纹本身更值得追；
+  · 本动作只读：不会改任何 sshd 配置，也不会动 authorized_keys。

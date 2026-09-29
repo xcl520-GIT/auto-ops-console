@@ -1,0 +1,209 @@
+# ============================================================
+# 动作：删除一个工作负载对象
+# 来源：T9·S4 —— 规范 §12.37.1 ①（**删除类的判据是终态**）、§12.38（delete-pod 要看 owner）
+# 形态：**可恢复变更**（yellow）
+# ============================================================
+
+id: k8s.delete-workload
+title: 删除工作负载对象
+summary: 删掉指定对象（Pod / Deployment / STS / DS / Job / CronJob）—— ★ 判据是"它真的不在了"，不是"命令返回 0"
+domain: J
+risk: yellow
+priority: P1
+tags: [变更, K8s, 清理]
+
+note: |
+  ★★ **删除类的判据必须是终态**（规范 §12.37.1 ① / T6 §12.6.5 的老账）：
+  `kubectl delete` 返回 0 **只说明删除请求被接受了**（对象会先进 `Terminating`）。
+  ⇒ 本动作的最后一步是 **`kubectl get` 退出码非 0**（"它真的不在了"），
+  ★ 并且 `ok_exit_codes: [1]` —— ★ **在 T8 修好 `ok_exit_codes` 的语义之后**，
+  这才表达得了"**这条命令必须失败**"（否则就是假绿）。
+
+  ★★ **Pod 的 owner 必须记进报告**（规范 §12.38 / 清单 104）：
+  · **有控制器**（ReplicaSet / DaemonSet / Job…）⇒ 删掉它会被**重建**（新 Pod、新 IP，不是原来那个）；
+  · **裸 Pod**（没有 `ownerReferences`）⇒ **永久没了**。
+  ★ 本动作对"裸 Pod"会**明确警告**（这是它能保持 `yellow` 而不是 `red` 的前提）。
+
+  ★ **`--wait=true` 是默认**：命令会等到对象真的被删掉才返回 —— 但我们**仍然**用自己的终态判据复核
+  （"命令说等完了" 与 "它真的不在了" 是两件事）。
+
+params:
+  - name: kind
+    label: 对象类型
+    type: enum
+    required: true
+    choices: [Pod, Deployment, StatefulSet, DaemonSet, Job, CronJob]
+    values: [pod, deployment, statefulset, daemonset, job, cronjob]
+    default: Pod
+  - name: name
+    label: 对象名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+  - name: wait_seconds
+    label: 等删除完成超时（秒）
+    type: int
+    required: true
+    min: 10
+    max: 600
+    default: 120
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认删除对象
+  body: |
+    即将删除「{namespace}/{kind}/{name}」。
+    · 能不能撤：❌ **对象本身回不去**（重建出来的是**新对象**：新名字/新 UID/新 IP）。
+      ★ 有控制器的工作负载（Deployment/STS/DS/Job）再 `kubectl apply` 一份等价清单就能恢复"形状"，
+      **但容器里的临时数据与内存态不会回来**。
+    · ★★ **如果这是一个裸 Pod（没有控制器）⇒ 它永久消失**，不会被重建 —— 报告里会明确标出来。
+    · 影响面：该对象承载的服务会中断（有控制器时通常几十秒内被重建）。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认要删除这个对象
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: target_exists
+    title: ★ 对象必须存在（不存在就中止：不能"删一个空气"还报成功）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: owner_before
+    title: ★★ 它的 owner 是谁（Pod 才有；**决定"删了会不会被重建"**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.metadata.ownerReferences[*].kind}/{.metadata.ownerReferences[*].name}"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: before
+    title: 删除前它长什么样（★ 留证）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - wide
+      - --no-headers
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: act
+    title: 提交删除（★ 只说明"请求被接受了"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - delete
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --wait=true
+      - "--timeout={{ wait_seconds }}s"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 620
+
+  - name: after
+    title: "★★ **判据：它真的不在了**（这条命令**必须失败**，`ok_exit_codes: [1]`）"
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    ok_exit_codes: [1]
+    timeout: 60
+    note: >
+      ★★ 这是本动作的**终态判据**：`kubectl get` 返回 **1**（NotFound）才算"真的删掉了"。
+      ★ **0 不在 `ok_exit_codes` 里** ⇒ 对象还在就是**红**（这正是 T8 修好的那条语义：
+      `ok_exit_codes` 是唯一准绳，见规范 §12.36）。
+      ★ 所以这一步的原文里会出现 `Error from server (NotFound): ...` —— 那是**预期结论**，不是故障。
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对），本次没有改任何东西。
+  # ★★ §12.49（T9·S4 真跑抓到的**真缺陷 ⑨**）：这里**原先还有一条** `from: after` 的"内容非空"自证 ——
+  #   **已删掉**。原因：`after` 是「**必须失败型**」步骤（`ok_exit_codes: [1]`，**不含 0**），
+  #   它的**成功态就是"命令报错"**，而 NotFound 的原文走 **stderr** ⇒ **stdout 本来就是空的**。
+  #   叠一条"必须有输出"的断言 ⇒ **100% 假红**（真跑现场：删 Pod 每一步都对，整条动作却 VERIFY_FAILED）。
+  # ★ 判据由 `ok_exit_codes: [1]` 承担（§12.36：**唯一准绳**）——
+  #   **对象还在 ⇒ `get` 返回 0 ⇒ 那一步红 ⇒ 整条动作红**；判据完整，没有被削弱。
+
+conclusion: |
+  【{host.name}】删除对象 · {namespace}/{kind}/{name}（变更）
+  · ★★ owner：{owner_before}（★ **这一格才是"删了会不会被重建"的依据**：显示"（无）"= 裸对象，有值 = 有控制器）
+  · 删除前：{before}
+  · 删除后 `get` 的原文（★ **NotFound 的报错在 stderr 上，stdout 本来就空** —— 这一格显示"（无）"是
+    **预期**，**不是**"没取到"；真正的判据是那一步的**退出码 = 1**）：{after}
+
+  ★★ 回得去 / 回不去（规范 §12.38 / 清单 104）：
+    · ❌ **对象回不去**：重建出来的是**新对象**（新 UID / 新 IP / 新启动时间）；
+    · ✅ **"形状"可以恢复**（仅限有控制器的工作负载）：再 apply 一份等价清单即可 —— 但那是**新的**实例；
+    · ⚠️ ★★ **会不会被重建，看上面那行 `owner`**（★ 规范 §12.49 的 ⑩：这里**不替你下结论**）：
+      · `owner` **有值**（形如 `ReplicaSet/t9-web-8475c7bd74`）⇒ **有控制器** ⇒ 会被**重建**（但是**新对象**）；
+      · `owner` 显示 **"（无）"** ⇒ **裸对象**（没有控制器）⇒ **它永久消失了**，不会被重建；
+    · ❌ 对象背后真的存了数据的话（如 StatefulSet 的 PVC 数据）—— **删对象不等于删数据**，
+      但也不等于"数据没事"：要看它的卷策略（`Retain` / `Delete`）。
+
+  判读：
+    · ★★ 判据是 **`get` 退出码为 1**（真的不在了），不是 `delete` 那一步的返回；
+    · ★ 对象**停在 `Terminating`** 时本动作会**红** —— 那通常意味着有 `finalizer` 在等别的东西
+      （例如 Calico 的 IP 回收、或 PVC 还挂着）⇒ 看 `k8s.describe` 的 Events；
+    · ★ 本动作**只删清单里点名的这一个对象**，不级联删别的（删命名空间请用 `k8s.delete-namespace`）。

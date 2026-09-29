@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>auto-ops-console · Nginx 部署成功</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+           margin: 3rem auto; max-width: 44rem; line-height: 1.7; color: #222; }
+    h1 { font-size: 1.6rem; }
+    code { background: #f4f4f4; padding: .1rem .35rem; border-radius: 4px; }
+    ul { padding-left: 1.2rem; }
+    .ok { color: #1a7f37; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1><span class="ok">✓</span> Nginx 已由工作台部署</h1>
+  <p>这个页面由 <code>auto-ops-console</code> 的配方引擎渲染并写入，说明整条链路是通的：
+     装包 → 渲染配置 → 语法校验 → 启动 → HTTP 200。</p>
+  <ul>
+    <li>监听端口：<code>{{ port }}</code></li>
+    <li>域名（server_name）：<code>{{ server_name }}</code></li>
+    <li>站点目录：<code>{{ root_dir }}</code></li>
+    <li>worker 进程数：<code>{{ worker }}</code></li>
+  </ul>
+  <p>重复执行同一配方不会产生变更（幂等）：配置内容一致时平台会跳过写盘。</p>
+</body>
+</html>

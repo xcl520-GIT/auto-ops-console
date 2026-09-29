@@ -1,0 +1,116 @@
+# ============================================================
+# 动作：强制关闭虚拟机（= 拔电源）
+# 来源：设计\05-虚拟化层-架构设计.md §4 · 总纲 §8.2 红线 15
+# 形态：VMware 直接断电（hard）—— 不等 guest 停服务
+# 风险：🔴 red（可能丢数据）｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.stop-hard
+title: 强制关闭虚拟机（拔电源）
+summary: 🔴 等于拔电源 —— 可能丢数据；必须手输确认词，且禁止批量
+domain: M
+risk: red
+priority: P1
+channel: local
+tags: [变更, 虚拟化, 电源, 破坏性]
+
+note: |
+  ★★ 红线 15：这个动作**永远 red** —— 手输确认词（服务端逐字比对）+ **禁止批量**。
+    它不是"更快一点的关机"，而是**把电源拔掉**：guest 里的文件系统只能靠日志回放自己收拾。
+  ★★ 真实的先例就在本项目的记录里：`开发记录\环境事件-20260926-靶机硬断电体检.md`
+    —— 宿主机被硬关机时，4 台靶机就是这么"断电"的：**这次运气好**（XFS 日志回放成功、
+    Harbor 9 个容器全部 healthy），但那是**运气**，不是保证。
+  ★ 判据仍然问 VMware（`vmrun list`）—— 与 `vm.stop` 一样，不看"命令返回 0"。
+
+confirm:
+  title: 确认强制关闭（拔电源）
+  body: |
+    即将在**宿主机**上**强制关闭**虚拟机「{vm_name}」（{vm_vmx}），方式：**hard（= 拔电源）**。
+
+    会发生什么：
+      · VMware **立刻**切断这台虚拟机的电源，**不会**等 guest 停服务、**不会**等它刷盘
+      · guest 的文件系统处于"未干净卸载"状态 —— 下次开机只能靠日志回放自己收拾
+
+    能不能撤回：
+      · 机器能再开（`vm.start`）
+      · ★★ **数据回不来**：正在写的文件、还没落盘的数据库事务、内存里的状态 —— **全部丢失**
+      · ★ 这不是"理论上可能"，本项目就记录过一次真实硬断电（见 note 里的环境事件）
+
+    ★ 如果你的目的是"正常关机"，请关掉这个弹窗，改用「关闭虚拟机（优雅关机）」。
+  confirm_text: 我知道会丢数据，强制关闭
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名
+
+  - name: timeout_sec
+    label: 最多等多少秒（等它真的从运行清单里消失）
+    type: int
+    required: true
+    default: 90
+    min: 10
+    max: 900
+    help: 强制断电通常很快；等不到 ⇒ 判红（如实说"它还在运行"）
+
+precheck:
+  - name: vmx_ok
+    title: 确认这台虚拟机的 vmx 打得开
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "listSnapshots", "{{ vm_vmx }}"]
+    parser: raw
+    ok_exit_codes: [0]
+
+steps:
+  - name: probe_before
+    title: 动手前先问一次：它现在在跑吗
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "state", "--vmx", "{{ vm_vmx }}"]
+    parser: json
+    timeout: 60
+
+  - name: stop_hard
+    title: 拔电源（★ 这一步只是**收条**）
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "stop", "{{ vm_vmx }}", "hard"]
+    parser: raw
+    timeout: 120
+    optional: true
+    note: |
+      ★ `hard` = **拔电源**：不等 guest 停服务、不等刷盘。
+      ★ 它只是**收条**（"VMware 收下了这个请求"）—— "它真的断电了吗"由下一步回答。
+
+  - name: wait_stopped
+    title: 判据：再问一次 VMware，它真的不在运行清单里了吗（★ 退出码就是结论）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_vmx }}", "--expect", "stopped", "--wait", "{{ timeout_sec }}"]
+    parser: json
+    timeout: 960
+    ok_exit_codes: [0]
+
+verify:
+  - name: 必须读到"动手前"的状态
+    from: probe_before
+    field: was_running
+    on_missing: 没读到动手前的状态 ⇒ 这次到底改没改，**无法判定**
+  - name: 必须读到"动手后"的状态
+    from: wait_stopped
+    field: state
+    on_missing: 判据那一步没有给出状态 —— 本结论不可用
+
+conclusion: |
+  【{vm_name}】强制关闭结果（hard = 拔电源）
+  · 动手前：{probe_before.state}（was_running={probe_before.was_running}）
+  · 动手后：{wait_stopped.state}（等了几秒 {wait_stopped.waited_sec}）
+  · 判据来源：{wait_stopped.checked}
+
+  ★ **回不去的东西**（逐项说清，没有也写「无」）：
+  · 正在写但未落盘的文件内容 —— **回不来**；
+  · 内存中的服务状态与未提交事务 —— **回不来**；
+  · guest 文件系统的"干净卸载"状态 —— 只能靠下次开机的**日志回放**自己收拾
+    （★ 回放成功 = 没坏，但那是它自己修好的，不是这次操作"没造成影响"）。
+
+  判读：
+  · 下次开机后请先跑一次「一键体检」：确认文件系统回放无错误、`systemctl --failed` 为空；
+  · ★ 若只是为了"省点时间"而用它 —— 请改回优雅关机（`vm.stop`）。

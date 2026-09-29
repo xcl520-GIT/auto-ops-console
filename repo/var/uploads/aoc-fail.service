@@ -1,0 +1,9 @@
+[Unit]
+Description=AOC selftest fixture (intentionally fails; failure-detection comparison)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/false
+
+[Install]
+WantedBy=multi-user.target

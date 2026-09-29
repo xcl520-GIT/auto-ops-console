@@ -1,0 +1,27 @@
+id: rb.extra
+title: 坏动作-run_by
+summary: 故意违规
+domain: A
+risk: green
+priority: P0
+params:
+  - name: which
+    label: 选哪个
+    type: enum
+    required: true
+    choices: [甲, 乙]
+    values: [a, b]
+    default: 甲
+steps:
+  - name: s1
+    title: x
+    run_by:
+      param: which
+      cases:
+        a: ["true"]
+        b: ["false"]
+        c: ["true"]
+    parser: raw
+verify:
+  - name: v
+    from: s1

@@ -1,0 +1,278 @@
+# ============================================================
+# 动作：引导控制面（kubeadm init）
+# 来源：T8·S6 —— 规范 §12.32.1 / §12.32.2 / §12.32.3
+# 形态：**变更**（yellow）—— 它在**已被 reset 干净**的机器上新建（不删既有数据）
+# ============================================================
+
+id: k8s.kubeadm-init
+title: 引导控制面（kubeadm init）
+summary: 拉齐组件镜像（不确定性先买断）→ kubeadm init（显式 --cri-socket / endpoint 写 IPv4 / 显式 --image-repository）→ 自证 API 真在应答
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, K8s, kubeadm, 控制面]
+
+note: |
+  ★★ **判据是"终态"，不是"命令返回 0"**（规范 §12.32.2）：
+  `kubeadm init` 失败时会**留下半个集群**（证书写了、apiserver 起不来）——
+  那时"命令返回 0"和"集群可用"分得越开越好。⇒ 自证挂在
+  **`kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw /livez` 的退出码**上：
+  那是 **API server 自己的回答**（§12.6.5 同源：要的是终态，不是动作本身）。
+
+  ★★ **四条参数化口径，全部由实测逼出来**（规范 §12.32.3）：
+
+  | # | 口径 | 为什么 |
+  |---|---|---|
+  | ① | `--cri-socket unix:///run/containerd/containerd.sock` **写在 argv 里** | 三台都有 `cri-docker.service`（inactive）⇒ 不排除会挑错运行时（硬约束②）。★ 写死而不是做成参数：**它本来就只有一个正确答案** |
+  | ② | `--control-plane-endpoint` **由参数给 IPv4**，默认 `192.0.2.11` | `getent hosts node-01` 第一条给的是 **IPv6 link-local** ⇒ 写主机名必踩（硬约束③） |
+  | ③ | `--image-repository` **必须显式** | S5 实测 `registry.k8s.io` 直连走不通（307 → `*.pkg.dev` → IPv6 `network is unreachable`）⇒ **默认值在本环境必然是坑** |
+  | ④ | ★★ **先把镜像拉齐，再动集群**（第一步就是 `kubeadm config images pull`） | 镜像拉取**必须带重试 + 兜底**（硬约束④）。拉失败时**在集群还没被碰过的地方就停住**；重试 = 再跑一次这个动作（已缓存的会跳过，天然幂等） |
+
+  ★★ **为什么"拉镜像"不是一只独立的手**（与 S5 的 `container.pull` 分工）：
+  · `container.pull` 拉的是**一个** ref，用来回答"**这条路通不通**"（链路最末端）；
+  · 这里拉的是 `kubeadm` **自己算出来的那一整套**（7 个组件镜像，tag 与 `--kubernetes-version` 绑定）——
+    让 `kubeadm` 自己列清单，才不会有"人手抄漏一个"这种事。
+  ⇒ 一只管"通不通"，一只管"齐不齐"，不重复。
+
+  ★★ **幂等守卫**（规范 §12.33）：预检 `not_yet` 声明"`admin.conf` 已在 ⇒ 已经是控制面 ⇒ 已达终态"。
+  于是**配方第二次跑这一步会判「跳过」而不是失败** —— 这就是"再点一次不破坏集群"的落点。
+  ★ 而 `kubeadm_present` / `cri_socket_present` **两条都不声明守卫**：缺工具 / 缺运行时 socket
+  是**真故障**，必须中止（把它们一起放行就是把"缺东西"吞成"已达终态"）。
+
+confirm:
+  title: 确认引导控制面
+  body: |
+    即将在「{host.name}」（{host.address}）上执行 **`kubeadm init`**：
+
+      kubeadm config images pull --image-repository {{ image_repository }} --kubernetes-version {{ kubernetes_version }}
+      kubeadm init --control-plane-endpoint {{ control_plane_endpoint }} \
+                   --image-repository {{ image_repository }} --kubernetes-version {{ kubernetes_version }} \
+                   --pod-network-cidr {{ pod_subnet }} --service-cidr {{ service_subnet }} \
+                   --cri-socket unix:///run/containerd/containerd.sock
+
+    **会发生什么**：
+    · 把 k8s 组件镜像拉到本地（走 `{{ image_repository }}`，**会联网**，可能要十几分钟）；
+    · 生成证书与 kubeconfig，起 apiserver / controller-manager / scheduler / etcd（静态 Pod）；
+    · 把 `kubelet` 重新配好并让它报到（这时节点是 `NotReady` —— **还没装 CNI**，正常）。
+
+    **回得来吗**：reset 一次即可退回"没有集群"（`k8s.kubeadm-reset`）；★ 但**证书不能复用**，
+    重建就是**一套新 CA**。
+
+    **幂等**：★ 已经是控制面的机器（`admin.conf` 在）会被判「已达终态」跳过 —— **不会**重复 init。
+  confirm_text: 我已确认引导控制面
+
+backup:
+  - path: "/etc/kubernetes/aoc-owned.json"
+    label: "本工作台的所有权标记（首次创建时不存在，属正常）"
+    required: false
+
+params:
+  - name: control_plane_endpoint
+    label: 控制面端点（★ 写 IPv4 地址，别写主机名）
+    type: str
+    required: true
+    pattern: '^(\d{1,3}\.){3}\d{1,3}$'
+    default: 192.0.2.11
+    help: '★ 实测：`getent hosts node-01` 第一条给的是 IPv6 link-local ⇒ 写主机名会让 kubeconfig 里出现一个连不上的地址（硬约束③）。'
+  - name: kubernetes_version
+    label: Kubernetes 版本
+    type: str
+    required: true
+    pattern: '^v1\.[0-9]{1,2}\.[0-9]{1,2}$'
+    default: v1.34.10
+    help: '★ 默认值 = 三台已装的 `kubeadm/kubelet/kubectl` 版本（实测 1.34.10-150500.1.1）。'
+  - name: image_repository
+    label: 组件镜像仓库
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)+$'
+    default: registry.aliyuncs.com/google_containers
+    help: '★ 默认值由**实测**定：S5 用这个源真拉成功过（rc=0），且旧集群缓存里的组件镜像**正是这个前缀**（实物口径）。不要写 registry.k8s.io（直连走不通）。'
+  - name: pod_subnet
+    label: Pod 网段
+    type: str
+    required: true
+    pattern: '^(\d{1,3}\.){3}\d{1,3}/[0-9]{1,2}$'
+    default: 10.244.0.0/16
+    help: '★ 与 Calico 的 IPPool 必须一致（实物口径 = 10.244.0.0/16）。'
+  - name: service_subnet
+    label: Service 网段
+    type: str
+    required: true
+    pattern: '^(\d{1,3}\.){3}\d{1,3}/[0-9]{1,2}$'
+    default: 10.10.0.0/12
+    help: '★ 实物口径 = 10.10.0.0/12（kubeadm 默认是 10.96.0.0/12，这里刻意对齐旧集群）。'
+
+precheck:
+  - name: kubeadm_present
+    title: 确认这台机器上有 kubeadm（★ 缺工具必须中止）
+    run: [ls, -l, /usr/bin/kubeadm]
+    parser: raw
+    timeout: 20
+    note: ★ 不声明 `means_done`：它是"工具在不在"，不是"目标达成了没有"（规范 §12.33 规矩 3）。
+
+  - name: cri_socket_present
+    title: 确认容器运行时的 CRI socket 在（★ 缺它必然挑错运行时）
+    run: [ls, -l, /run/containerd/containerd.sock]
+    parser: raw
+    timeout: 20
+    note: >
+      ★ 同样**不声明**守卫：socket 不在是**真故障**（多半是 containerd 没起来），
+      必须停下来说清楚，而不是被吞成"已达终态"。
+
+  - name: not_yet
+    title: 这台机器**还不是**控制面吗（★ 是 ⇒ 已达终态）
+    run: [ls, -ld, /etc/kubernetes/admin.conf]
+    parser: raw
+    ok_exit_codes: [2]
+    timeout: 20
+    means_done: true
+    means_done_why: >
+      `admin.conf` 已在 ⇒ 这台机器**已经是控制面** ⇒ `kubeadm init` 想达成的终态
+      （"这台机器上有一个我们建好的控制面"）**已经达成**。
+    note: >
+      ★★ 它**只问"是不是已经 init 过"**。工具在不在（`kubeadm_present`）、
+      运行时 socket 在不在（`cri_socket_present`）由**另外两步**回答 ——
+      它们失败时照旧中止。**这正是"守卫挂在步骤上而不是动作上"的理由**（规范 §12.33 规矩 3）。
+      ★ 旧集群态（`admin.conf` 还在）也会命中这一步 ⇒ 判「已达终态」跳过。
+      这是**故意的**：拆旧集群是 `k8s.kubeadm-reset` 的职责（它是 red、要人确认），
+      不该由"引导步骤"顺手替你决定（配方 `k8s-init` 会把 reset 排在它前面）。
+
+steps:
+  - name: prepull
+    title: ★★ 先把组件镜像拉齐（不确定性先买断；拉失败时集群还**没被碰过**）
+    run:
+      - kubeadm
+      - config
+      - images
+      - pull
+      - --cri-socket
+      - unix:///run/containerd/containerd.sock
+      - --image-repository
+      - "{{ image_repository }}"
+      - --kubernetes-version
+      - "{{ kubernetes_version }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 3600
+    note: >
+      ★★ **它天然幂等**：已经在本地镜像库里的会**跳过**（S5 实测过 `crictl pull` 回
+      `Image is up to date`）⇒ 「重试」就是**再跑一次这个动作**。
+      ★ 走的是 `--cri-socket` 指定的那条路（与 kubelet 同一条，规范 §12.31.3）。
+      ★ 这一步失败 ⇒ 整条动作 **aborted** ⇒ 集群**一个字都还没被改**（这是刻意的顺序安排）。
+
+  - name: manifests_before
+    title: init 之前的静态 Pod 清单条数（★ 幂等判据的"前"）
+    run: [ls, -1, /etc/kubernetes/manifests]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+
+  - name: init
+    title: ★★ 引导控制面（四条口径全部显式写在 argv 里）
+    run:
+      - kubeadm
+      - init
+      - --control-plane-endpoint
+      - "{{ control_plane_endpoint }}"
+      - --cri-socket
+      - unix:///run/containerd/containerd.sock
+      - --image-repository
+      - "{{ image_repository }}"
+      - --kubernetes-version
+      - "{{ kubernetes_version }}"
+      - --pod-network-cidr
+      - "{{ pod_subnet }}"
+      - --service-cidr
+      - "{{ service_subnet }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 1800
+    note: >
+      ★ 它的 stdout 里有那段"To start using your cluster…"与 join 命令 ——
+      ★★ 但**不要**拿它去自动化下一步：`join` 的 token 与 CA 指纹是**参数**给的
+      （规范 §12.32.3 第 4 条：平台没有 output→input 的管道，也不该有）。
+
+  - name: manifests_after
+    title: ★★ 自证① 静态 Pod 清单**至少三条**（apiserver / controller-manager / scheduler）
+    run: [ls, -1, /etc/kubernetes/manifests]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+
+  - name: api
+    title: ★★ 自证② API server **真的在应答**（`/livez` 的退出码就是结论）
+    run:
+      - kubectl
+      - --kubeconfig=/etc/kubernetes/admin.conf
+      - --request-timeout=15s
+      - get
+      - --raw
+      - /livez
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+    note: >
+      ★★ 这是"**集群真的起来了**"的那条判据：`/livez` 由 **API server 自己**回答
+      （在 = 0、不在 = 非 0），与"`kubeadm init` 返回 0"是两件事。
+      ★ 它排在 `manifests_after` **之后**：先看"清单写出来了没有"（静态事实），
+      再问"API 真在不在"（活的终态）—— 失败时能一眼分出卡在哪一层。
+
+  - name: marker
+    title: 写所有权标记（★ 它决定"以后再点一次要不要拆这个集群"）
+    write_file:
+      path: "/etc/kubernetes/aoc-owned.json"
+      content: |
+        {
+          "owner": "auto-ops-console",
+          "stage": "T8",
+          "note": "本工作台建的控制面。★ 它的存在 = 「这台机器上的集群是我们建的」，因此 k8s.kubeadm-reset 会按已达终态跳过。kubeadm reset 会把它一起删掉（拆完就没主了）。",
+          "role": "control-plane",
+          "control_plane_endpoint": "{{ control_plane_endpoint }}",
+          "kubernetes_version": "{{ kubernetes_version }}",
+          "image_repository": "{{ image_repository }}",
+          "pod_subnet": "{{ pod_subnet }}",
+          "service_subnet": "{{ service_subnet }}"
+        }
+      mode: "0644"
+    parser: raw
+    note: >
+      ★ 它不是"我们发明的状态"用来绕过判定 —— 它是**所有权这件事的落点**：
+      "这个集群是不是本工作台建的"除此之外**没有任何可观测的凭据**
+      （"活不活"回答不了这个问题，规范 §12.32.4 / §12.33）。
+      ★ 写盘走引擎的**幂等写**（sha256 相同则不写，规范 §12.4）。
+
+verify:
+  - name: ★★ 静态 Pod 清单必须真的写出来了（数行数这一步必须问得出来）
+    from: manifests_after
+    on_missing: >
+      连清单条数都数不出来 —— 无法判定"控制面到底起没起"。
+  - name: ★★ API server 必须真的在应答（`/livez` 的退出码为 0）
+    from: api
+    on_missing: >
+      `kubectl get --raw /livez` 没能成功 —— 也就是说**控制面没真正起来**。
+      ★ 先看 `init` 那一步的原文（它会把失败原因写在最后 10 行里），
+      再对照 `manifests_before/after`：**"文件写了"与"进程起来了"是两件事**。
+
+conclusion: |
+  【{host.name}】引导控制面（变更）
+  · 端点：{control_plane_endpoint} ｜ 版本：{kubernetes_version} ｜ 镜像源：{image_repository}
+  · 网段：Pod {pod_subnet} ｜ Service {service_subnet}
+  · 静态 Pod 清单：init 前 **{manifests_before}** 条 → init 后 **{manifests_after}** 条
+  · ★★ API server 的应答（`/livez`）：{api}
+
+  判读：
+    · ★★ **判据是 `/livez` 的退出码**（API server 自己的回答），不是"`kubeadm init` 返回 0"：
+      init 失败时会**留下半个集群**（证书写了、apiserver 起不来），
+      "命令跑完了"与"集群可用"必须分得开（规范 §12.32.2）；
+    · ★ **镜像源是显式给的**：默认值 `{image_repository}` 由实测选出来
+      （`registry.k8s.io` 在本环境直连走不通：307 → `*.pkg.dev` → IPv6 `network unreachable`）；
+    · ★ **接下来一定是 `NotReady`** —— 还没有 CNI。★ 这是**顺序**不是缺陷：
+      先 init，再装 Calico，再回来看节点状态；
+    · ★ **回得去**：跑一次「退出集群（kubeadm reset）」即可退回"没有集群"；
+      ★★ **回不去**：这一套 **CA 与证书**（重建 = 全新一套），以及**这次 init 之后写进 etcd 的每一个对象**；
+    · ★ **幂等**：已经是控制面的机器会被 `not_yet` 判「已达终态」跳过，**不会**重复 init；
+    · ★ **join 需要的两样东西**不在本步的输出里自动化：
+      `token` 与 `ca_cert_hash` 由参数给（规范 §12.32.3 第 4 条）。
+      取 CA 指纹的口令与命令写在成本阶段的证据文档里（★ token 会出现在配置与报告里，
+      **只适用于实验环境** —— 换生产要走"短期 token + 手动确认"，这条**留档**）。

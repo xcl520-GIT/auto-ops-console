@@ -1,0 +1,187 @@
+# ============================================================
+# 配方：K8s 工作节点（T8 · S6 · 第三阶段）
+# ------------------------------------------------------------
+# 一次点击 = 从「这台机器上停着/活着一个上一版集群」到「它成为集群的一员」：
+#   运行时就位 → 拆掉旧集群（red · 人确认 · 有守卫）→ ★ 预拉 kube-proxy → kubeadm join（有守卫）
+#
+# ★★ **可以批量吗？装载期给了答案：不可以。**
+#   一开始把本配方写成 `yellow`（想着"两个工作节点对等，批量正合适"）⇒ **装载期当场拒**：
+#   「`risk=yellow` 低于其步骤引用的动作最高风险 `red`（配方风险取步骤内最严）」。
+#   ★★ 而这条规则**正好挡住了本话题最危险的一个错误设计** —— 见下面"拆与建必须同一次"。
+#
+# ★★ **为什么"拆"与"建"必须在同一次配方里（本话题最值钱的一条结论）**：
+#   设想把 `k8s.kubeadm-reset` 从本配方里拿掉（"拆是人的决定，单独做"），只留 join——
+#   那么在一台**还带着旧集群**的工作节点上，join 的幂等守卫会判
+#   「`kubelet.conf` 已在 ⇒ 已入列过 ⇒ 已达终态」**跳过**；
+#   而健康检查那两条旁证（`kubelet` active ＋ 10250 在听）在**旧集群的 kubelet** 上**全都成立**
+#   ⇒ ★★ **报告会说"成功"，而这个节点根本不在我们的集群里**（**假绿**）。
+#   控制面那份配方同理、而且更凶：旧集群**是活着的、`Ready` 的** ⇒ `k8s.nodes` 会给绿灯。
+#   ⇒ ★★ 规矩：**跨状态的配方必须把"起点"和"终点"都包进来 —— 只写终点，起点会被当成终点。**
+#     ★ 这条与 `risk` 的最严取法是**互相印证**的：装载期那条规则不是官僚，它挡的就是这个。
+#
+# ★★ **关于"节点 Ready"这条判据放在哪**（如实说清，这是本配方的一处边界）：
+#   "这个节点在集群里 Ready 了吗"**只有控制面能回答** —— 而配方**只在一台机器上执行**，
+#   工作节点上**没有** `/etc/kubernetes/admin.conf`（那是控制面专有的）。
+#   ⇒ 本配方的健康检查用**旁证**（kubelet 拿着节点凭据真的起来并开始服务了），
+#     ★★ **它不等于"节点 Ready"**；真正的三节点 Ready 由**控制面上的** `k8s.nodes` 回答
+#     （即 `k8s-init` 的最后一步）。★ 这条边界**明说**，不含糊过去（§12.19 同族）。
+# ============================================================
+
+id: k8s-join
+name: K8s 工作节点（一键：拆旧 → join）
+version: "1"
+summary: 工作节点一键：运行时就位 → 拆掉旧集群（需手输确认词）→ 预拉 kube-proxy → kubeadm join
+risk: red
+
+note: |
+  ★★ **为什么它 `red`**：本配方里有一步 `k8s.kubeadm-reset`（不可逆）。
+  ★ 装载期把 `yellow` 当场拒掉了（「配方风险取步骤内最严」）—— ★★ 而那条规则**正好挡住了
+  本话题最危险的一个错误设计**（把"拆"拿出去单独做 ⇒ 旧集群会被判成"已达终态" ⇒ **假绿**）。
+  ⇒ 代价如实写：**它因此不能批量**（§12.18 的闸门挂在配方 `risk` 上）。
+  两个工作节点要**各点一次**、**各自手输一次确认词** —— ★ 这其实更对：
+  「拆掉这台机器上的旧集群」本来就是**每一台各自的决定**（§12.32.4）。
+  ★★ **本话题"red 禁止批量"这条闸门的反例**，就是用本配方当场打出来的（见 S8 的反例证据）。
+
+  ★★ **两步"拆"与"建"都带幂等守卫**（§12.33）：
+  · `k8s.kubeadm-reset`：判"没有任何集群态"或"这个集群是我们建的" ⇒ **已达终态跳过**；
+  · `k8s.kubeadm-join`：判"`kubelet.conf` 已在（已入列过）" ⇒ **已达终态跳过**。
+  ⇒ 第二次点击本配方：**这两步都跳过**，节点**一个字都不会被动**。
+
+  ★★ **加入之前必须先把 `kube-proxy` 镜像拿到手**（本配方第 4 步）：
+  工作节点上 `kubelet` 会在 `kube-proxy` 那个 DaemonSet 调度过来时才去拉镜像 ——
+  那时它在**引导流程之外**，失败只会体现成 Pod 一直 `ImagePullBackOff`（**最难查的一种**）。
+  ⇒ 用 S5 那只手（`container.pull`）把不确定性**提到前面**买断。
+  ★ 只拉 `kube-proxy`（★ **不拉整套控制面镜像** —— 那在工作节点上是纯浪费，
+  且 `kubeadm config images pull` 不认角色，会一股脑拉 7 个）。
+
+  ★ 监控/网络那一侧不需要本配方操心：Calico 是 DaemonSet，节点一入列**它自己会跑过来**
+  （镜像三台本地都有 ⇒ 不需要联网）。
+
+params:
+  - name: control_plane_endpoint
+    label: 控制面端点（★ IPv4）
+    type: str
+    required: true
+    pattern: '^(\d{1,3}\.){3}\d{1,3}$'
+    default: 192.0.2.11
+    help: '★ 与 `k8s-init` 用的是同一个值（硬约束③：写 IPv4，别写主机名）。'
+  - name: token
+    label: 入列 token
+    type: str
+    required: true
+    pattern: '^[a-z0-9]{6}\.[a-z0-9]{16}$'
+    help: '★ 由控制面上的 `kubeadm token create <指定串>` 造出来（★ 不是从上一步输出里抓 —— 平台没有也不该有那条管道）。★ 它会出现在报告里：只用于实验环境。'
+  - name: ca_cert_hash
+    label: 控制面 CA 指纹
+    type: str
+    required: true
+    pattern: '^sha256:[a-f0-9]{64}$'
+    help: '★ 公开信息（不是秘密）；由控制面上 `openssl x509 -in /etc/kubernetes/pki/ca.crt -pubkey -noout` 那一路算出来。'
+  - name: kube_proxy_image
+    label: kube-proxy 镜像（★ 要本地已有或可拉）
+    type: str
+    required: true
+    pattern: '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,180}(:[A-Za-z0-9._-]{1,128})?$'
+    default: registry.aliyuncs.com/google_containers/kube-proxy:v1.34.10
+    help: '★ 前缀与 `--image-repository` 一致；tag 要与集群版本对得上（本环境实测该源可拉、且三台缓存里都是这个前缀）。'
+  - name: sandbox_image
+    label: 沙箱镜像（pause）
+    type: str
+    required: true
+    pattern: '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,180}(:[A-Za-z0-9._-]{1,128})?$'
+    default: registry.aliyuncs.com/google_containers/pause:3.10.1
+    help: '★ 与 `k8s-init` 同一个值（抄自实物：S3 留证的 `config.toml` 里 `pinned_images.sandbox` 那一行）。'
+
+# ★★ 正向部署里含 red 动作（`k8s.kubeadm-reset`）⇒ **必须手输确认词**（规范 §12.32.4）。
+deploy_confirm_text: 我已确认拆掉这个节点上的旧集群并重新入列
+
+steps:
+  - name: runtime_install
+    title: 安装 containerd.io（已装则不动它）
+    action: pkg.install
+    args: { package: containerd.io }
+
+  - name: runtime_cri_tools
+    title: 安装 cri-tools（提供 crictl）
+    action: pkg.install
+    args: { package: cri-tools }
+
+  - name: runtime_enable
+    title: 容器运行时设为开机自启
+    action: svc.enable
+    args: { unit: containerd }
+
+  - name: runtime_start
+    title: 启动容器运行时
+    action: svc.start
+    args: { unit: containerd }
+
+  - name: runtime_pull_sandbox
+    title: 按 CRI 路确认沙箱镜像在本地
+    action: container.pull
+    args: { ref: "{{ sandbox_image }}" }
+
+  - name: pull_kube_proxy
+    title: ★★ 预拉 kube-proxy（★ 不这么做的话，失败会藏在 DaemonSet 的 ImagePullBackOff 里）
+    action: container.pull
+    args: { ref: "{{ kube_proxy_image }}" }
+    note: >
+      ★★ 这一步是"**把不确定性一次性买断**"（§12.31.3）：镜像到手之后，
+      节点入列时 `kube-proxy` 那个 DaemonSet **不再依赖这份网络不确定性**。
+      ★ 幂等：第二次跑时镜像已在本地 ⇒ `changed=false`。
+
+  - name: reset_old
+    title: ★★ 拆掉这台机器上的上一版集群（red · 需手输确认词 · **有幂等守卫**）
+    action: k8s.kubeadm-reset
+    note: >
+      ★ 它对**工作节点**同样成立：`kubeadm reset` 会清掉 `kubelet.conf` 与 `/etc/cni/net.d` 的站点文件。
+      ★★ 幂等守卫：判"没有任何集群态"或"这个集群是我们建的" ⇒ **已达终态跳过**。
+
+  - name: join
+    title: ★★ 入列（token 与 CA 指纹由参数给；`--cri-socket` 显式）
+    action: k8s.kubeadm-join
+    args:
+      control_plane_endpoint: "{{ control_plane_endpoint }}"
+      token: "{{ token }}"
+      ca_cert_hash: "{{ ca_cert_hash }}"
+    note: >
+      ★★ **幂等守卫**：`kubelet.conf` 已在 ⇒ 判「已达终态」跳过（不会把一个已入列的节点再 join 一遍）。
+      ★ `kubeadm join` 在**已加入**的节点上**必然拒绝** —— 我们不去绕它，而是**换一个判读**（§12.33）。
+
+health:
+  # ★★ 旁证（**不等于"节点 Ready"**）：kubelet 拿着节点凭据真的在跑。
+  #   ★ 真正的"节点 Ready"由**控制面**回答 —— 见配方头那段"边界"。
+  - expect:
+      state: { unit: kubelet.service, equals: active }
+  # ★ 旁证二：kubelet 的 server 端口**真的在听**（它开始服务了，而不只是"进程还在"）。
+  - expect:
+      port_open: "10250"
+  # ★ 旁证三：运行时真的在应答。
+  - expect:
+      responds: { action: container.runtime, first_field: "Server:" }
+
+uninstall:
+  # ★★ 反向操作 = 把节点退回"未入列"（与控制面的反向是同一只 red 手）。
+  stop:
+    - action: k8s.kubeadm-reset
+  disable:
+    - action: svc.disable
+      args: { unit: kubelet }
+    - action: svc.disable
+      args: { unit: containerd }
+  # ★ 本配方**没有自己写出来的配置文件** ⇒ 不声明 remove_config（选了就必须真删得掉，而这里确实没有）。
+  # ★★ 本工作台在这个节点上留下的**唯一**产物是那个**所有权标记**
+  #   （`/etc/kubernetes/aoc-owned.json`，由 join 成功后写）—— 它**会被 `kubeadm reset` 一起清掉**，
+  #   所以这里列它，全删时若它已不在会按「已达终态」跳过（规范 §12.16）。
+  purge_paths:
+    - /etc/kubernetes/aoc-owned.json
+  keep_data:
+    - /var/lib/containerd
+  stop_confirm_text: 我已确认把节点退出集群
+  purge_confirm_text: 我已确认全删
+  # ★ 「停止 / 保留数据卸载」**之后**应当成立的事实：
+  #   ★★ 判据选"**kubelet.conf 不在了**"这种**外部可观测**的东西（不用 `state: inactive`——
+  #     那依赖"单元还驻留在 systemd 内存里"，T5 真跑踩过）。
+  health:
+    - expect:
+        absent: { action: file.stat, args: { path: /etc/kubernetes/kubelet.conf } }

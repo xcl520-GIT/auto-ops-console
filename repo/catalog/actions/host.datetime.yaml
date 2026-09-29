@@ -1,0 +1,95 @@
+# ============================================================
+# 动作：时间与时区
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 A（P0 · 只读）
+# 形态：一次给全结论（时区 / 系统时间 / RTC / NTP 同步状态 / 时间源）+ 不一致时的排查方向
+# 风险：green —— 全部只读，不改动目标机
+# ============================================================
+
+id: host.datetime
+title: 时间与时区
+summary: 时区、系统时间、RTC 与 NTP 同步状态（不同步直接给排查方向）
+domain: A
+risk: green
+priority: P0
+tags: [只读, 主机, 时间同步]
+note: |
+  ① 用 `timedatectl show -p KEY` 拿**属性式**输出，而不是解析 timedatectl status 的人读文本；
+  ② 再做一次**交叉验证**：timedatectl 声称的时区，必须与 /etc/localtime 指向的 zoneinfo 一致。
+     这一步是专门防 T1 踩坑 #1 那类事故（字段名随 locale 变化 → 静态取空 → 界面显示"成功"但结论全空）。
+
+params: []
+
+steps:
+  - name: show
+    title: 时间与时区（属性式）
+    run: ["timedatectl", "show", "-p", "Timezone", "-p", "NTPSynchronized", "-p", "NTP", "-p", "LocalRTC"]
+    parser: shell_kv
+
+  - name: status
+    title: 时间详情
+    run: ["timedatectl", "status"]
+    parser: colon_kv
+    pick:
+      "Local time": local_time
+      "Universal time": utc_time
+      "RTC time": rtc_time
+      "Time zone": timezone_full
+      "System clock synchronized": synced
+      "NTP service": ntp_service
+      "RTC in local TZ": rtc_local
+    optional: true
+    note: >
+      远端 locale 已由 config.yaml 的 ssh.remote_env 强制为 C（LC_ALL=C LANG=C），
+      否则中文系统会输出「本地时间」这类字段名，按英文字段名解析会静默取空。
+      pick 同时解决"键里带空格没法在模板里引用"的问题。
+
+  - name: localtime_link
+    title: 时区链接（交叉验证）
+    run: ["readlink", "-f", "/etc/localtime"]
+    parser: raw
+    note: 用 -f 取绝对路径（/etc/localtime 通常是相对软链，直接 readlink 会得到 ../usr/share/... 这种不好读的结果）。
+
+  - name: chrony
+    title: NTP 同步详情
+    run: ["chronyc", "tracking"]
+    parser: colon_kv
+    pick:
+      "Reference ID": ref_id
+      "Stratum": stratum
+      "System time": system_time
+      "Last offset": last_offset
+      "Root delay": root_delay
+      "Leap status": leap_status
+    optional: true
+    note: chronyd 没在跑时这条会失败；它是可选步骤，不影响其余结论。
+
+  - name: sources
+    title: 时间源
+    run: ["chronyc", "sources"]
+    parser: lines
+    optional: true
+    note: 刻意**不加** -v：-v 会附带一大段图例，反而看不懂。带 ^* 的行是当前使用的时间源。
+
+verify:
+  - name: 必须读到时区
+    from: show
+    field: Timezone
+    on_missing: timedatectl 没有给出时区 —— 目标机可能不是 systemd 系统，或 timedatectl 不可用
+  - name: 时区链接必须可读（与 timedatectl 交叉验证）
+    from: localtime_link
+    on_missing: /etc/localtime 不是指向 zoneinfo 的有效链接，时区配置可能被手工改坏
+
+conclusion: |
+  【{host.name}】时区 {show.Timezone}（timedatectl）｜时区链接 → {localtime_link}
+  系统时钟同步：{show.NTPSynchronized} ｜ NTP 服务：{show.NTP} ｜ RTC 采用本地时区：{show.LocalRTC}
+  本机时间 {status.local_time} ｜ UTC {status.utc_time} ｜ RTC {status.rtc_time}
+  同步详情：层级 {chrony.stratum} ｜ 系统时间偏差 {chrony.system_time} ｜ 上次偏移 {chrony.last_offset} ｜ Leap {chrony.leap_status}
+  时间源（带 ^* 的行为当前使用）：
+  {sources}
+
+  判读：
+  · 同步 = yes → 正常，无需处理。
+  · 同步 = no → ① 看 NTP 服务是否 active（若为 inactive 先起 chronyd）；
+    ② 看上面时间源是否为（无）或带 ?（不可用）；
+    ③ 全 NAT 环境下 UDP 123 可能被上游挡住 —— 检查时间源的 Reach 列是否长期为 0。
+  · 若 timedatectl 的时区与 /etc/localtime 链接不一致 → 说明有人手工改过链接，以链接为准并复核配置。

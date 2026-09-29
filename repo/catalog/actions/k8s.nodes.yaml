@@ -1,0 +1,185 @@
+# ============================================================
+# 动作：集群节点树与就绪状态
+# 来源：T8·S6 —— 规范 §12.32.1「判据的家」
+# 形态：**只读**（green）—— kubectl 的原文是"集群真的起来了"的唯一一手证据
+# ============================================================
+
+id: k8s.nodes
+title: 集群节点树与就绪状态
+summary: kubectl 原文（节点表 / kube-system Pod / 存储对象）+ 等所有节点 Ready —— "集群真的可用了吗"的判据家
+domain: J
+risk: green
+priority: P0
+tags: [只读, K8s, cluster, 判据]
+
+note: |
+  ★★ **为什么"节点 Ready"必须由 `kubectl` 回答**（规范 §12.32.2）：
+  "`kubeadm init` 返回 0"只说明**引导命令跑完了**；它离"集群可用"还有两根链条：
+  ① 静态 Pod（apiserver / controller-manager / scheduler）真的起来了；② 节点真的注册并**报到了 Ready**。
+  这两件事只有 **API server 自己的回答** 能证明 —— 所以本动作是整套引导流程里**唯一**的判据家。
+
+  ★★ **判据为什么是 `kubectl wait` 的退出码**（规范 §12.32.5）：
+  `kubectl wait --for=condition=Ready nodes --all` 的输出形如
+  `node/node-01 condition met`（多节点时**多行**）——
+  ★ 行首字段是**节点名**，它**不构成**"所有节点都 Ready"的判据（一个 Ready 就够撑起一行）。
+  而**退出码**天然等价于"全都就绪"：超时 ⇒ 非 0 ⇒ 判红。
+  ⇒ 又一次：**判据要选与实现细节无关的那一个**（§12.6.3 同源）。
+
+  ★ 本动作**只读**：`get` / `wait` / `diff` 都不是变更命令；`changed` 恒 `false`（§12.3）。
+
+  ★★ **它同时是"拆旧集群"之前的对照物**：T8·S6 侦察时发现旧集群**是活着的**
+  （S5 起了 containerd 之后，kubelet 把上一版控制面拉起来了）——
+  于是本动作可以在 `kubeadm reset` **之前**把"活着的旧集群长什么样"留成原文，
+  这是 S3 只能读磁盘时**拿不到**的那一份证据。
+
+params:
+  - name: wait_seconds
+    label: 等 Ready 的超时（秒）
+    type: int
+    required: true
+    min: 1
+    max: 900
+    default: 300
+    help: '★ 超时**不是**失败的同义词：Calico 没装时节点会一直是 NotReady，那时给再长也等不到。'
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+    help: '★ 白名单只放行 `/etc/kubernetes/*.conf`（admin.conf / super-admin.conf）。工作节点上没有它 —— 这是**结论**，会明确报出来。'
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl（缺它就说清"缺工具"，不是"集群没起来"）
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+    note: >
+      ★ 预检不通过 ⇒ 整条动作 aborted、目标机零改动，并给出"先装 kubeadm/kubelet/kubectl"的建议。
+      ★ 这比跑到一半报 `kubectl: command not found` 好得多：后者会被误读成"集群坏了"。
+  - name: kubeconfig_present
+    title: 确认这台机器上有 kubeconfig（★ 工作节点上"没有"是**结论**，不是故障）
+    run: [ls, -l, "{{ kubeconfig }}"]
+    parser: raw
+    timeout: 20
+    note: >
+      ★ 与 `kubectl_present` 一样**不声明** `means_done`：缺 kubeconfig **不是**"已达终态"，
+      它是"这台机器不是一个能读集群的入口"—— 必须中止并说清楚（规范 §12.33 规矩 3）。
+
+steps:
+  - name: nodes
+    title: 节点表（★ `-o wide` 原文：名字 / 状态 / 角色 / 版本 / 内网 IP / 内核 / 运行时）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - nodes
+      - -o
+      - wide
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: system
+    title: kube-system 的 Pod（★ "控制面组件真的在跑吗"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - -n
+      - kube-system
+      - get
+      - pods
+      - -o
+      - wide
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: storage
+    title: 存储对象（StorageClass / PV / PVC）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - storageclass,persistentvolume,persistentvolumeclaim
+      - --all-namespaces
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: workloads
+    title: 工作负载（Deployment / DaemonSet / StatefulSet）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - deployment,daemonset,statefulset
+      - --all-namespaces
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: ready
+    title: ★★ 等所有节点 Ready（**本步的退出码就是判据**：超时 ⇒ 非 0 ⇒ 判红）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - wait
+      - --for=condition=Ready
+      - nodes
+      - --all
+      - --timeout={{ wait_seconds }}s
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 920
+    note: >
+      ★★ **它等的是"节点 Ready"**，而节点 Ready 要求 CNI 就绪（Calico）。
+      ⇒ 在 Calico 还没装的那一段，这里会**如实超时判红** —— 那是**正确的**中间态，
+      不是把"没装网络"说成"集群好了"（§12.6.5 同族：**跑完了 ≠ 事情成了**）。
+      ★ 输出形如 `node/node-01 condition met`（一个节点一行）。
+      ★ 它的**退出码**才是判据；**不要**去数输出行数（多节点时行数 = 节点数，
+      而"是不是全都 Ready"仍要看退出码）。
+
+verify:
+  - name: ★★ 节点表必须读得出来（读不出来 = API 没在应答，那是"集群不可用"的一手证据）
+    from: nodes
+    on_missing: >
+      `kubectl get nodes` 没能给出原文 —— 说明 API server 没在应答（或 kubeconfig 不对）。
+      ★ 这时**不要**去看 `systemd`：`kubelet` 是 active 与"集群可用"是两件事（§12.31.4 同族）。
+  - name: ★★ 所有节点必须真的 Ready（`kubectl wait` 的退出码为 0）
+    from: ready
+    on_missing: >
+      `kubectl wait --for=condition=Ready nodes --all` 超时或被拒绝 —— 也就是说
+      **至少有一个节点没到 Ready**。★ 先看上面那份 `-o wide` 原文里哪个节点是 `NotReady`，
+      再按"是不是 CNI 还没装 / kubelet 有没有起来"往下查。
+
+conclusion: |
+  【{host.name}】集群节点树与就绪状态（只读）
+  kubeconfig：{kubeconfig} ｜ 等 Ready 超时：{wait_seconds} 秒
+
+  ── kubectl get nodes -o wide ──
+  {nodes}
+  ── kube-system Pod ──
+  {system}
+  ── 存储对象 ──
+  {storage}
+  ── 工作负载 ──
+  {workloads}
+  ── kubectl wait 的原文 ──
+  {ready}
+  ── 原文结束 ──
+
+  判读：
+    · ★★ **节点 `Ready` 是"集群可用"的判据**：`kubeadm init` 返回 0 只说明引导命令跑完了，
+      离它还有"静态 Pod 起来了吗 / 节点真的报到 Ready 了吗"两根链条——只有 API server 自己的回答算数；
+    · ★ **判据是 `kubectl wait` 的退出码**（超时 ⇒ 非 0 ⇒ 判红），不是输出行数：
+      多节点时一个 Ready 节点也能撑起一行，它回答不了"是不是**全都**就绪"；
+    · ★ 节点 `NotReady` 时先看 `-o wide` 那一列：★ **没有 CNI 的集群天生全是 NotReady**
+      （这不是缺陷，是顺序——先 `kubeadm init`，再装 Calico，再回来看这一屏）；
+    · ★ `storage` / `workloads` 两段是**可选**的：一个刚建好的集群里它们是空的，
+      那是**结论**（"还没有这些东西"），不是"读不到"；
+    · ★ 本动作**只读**：不创建、不修改、不删除任何对象（`changed` 恒 false）。

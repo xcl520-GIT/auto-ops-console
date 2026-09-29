@@ -1,0 +1,59 @@
+id: block.overview
+title: 磁盘与分区总览
+summary: 块设备 → 分区 → 挂载点一屏看清（含文件系统类型与容量）
+domain: D
+risk: green
+priority: P0
+tags: [磁盘]
+
+note: |
+  与「磁盘用量总览」的分工：那个回答"用满了没有"，这个回答"**这块盘长什么样**"
+  （设备树、分区、文件系统类型、挂载点）。排查"扩容了但文件系统没跟上"这类问题要靠它。
+
+steps:
+  - name: lsblk
+    title: 块设备树（结构化输出）
+    run: [lsblk, -J, -o, "NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,RO"]
+    parser: json
+    note: |
+      ★★ 真跑抓到的坑（比"参数写错"更隐蔽）：`-o` 的字段列表**必须加引号**。
+      因为 `run:` 用的是 YAML **流式数组** `[a, b, c]`，**逗号就是元素分隔符** ——
+      写成 `NAME,KNAME,TYPE` 会被拆成 3 个独立元素，远端收到的是
+      `lsblk -J -o NAME KNAME TYPE`（lsblk 把 KNAME/TYPE 当成设备名 → 找不到设备 →
+      返回 32 并给出**合法的空设备树** `{"blockdevices": []}`）。
+      危害在于：退出码非 0、输出还是合法 JSON，看起来像"这台机器没有磁盘"。
+      **加载期校验抓不到它**（拆开后的每个元素都合法），只能靠真跑 + 留证里的命令原文发现。
+      已验证：手工跑同一条命令 rc=0 且列出 sr0/nvme0n1/rl-root。
+
+  - name: blkid
+    title: 设备 UUID 与文件系统
+    run: [blkid]
+    parser: lines
+
+  - name: mounts
+    title: 挂载点用量（df -P）
+    run: [df, -P]
+    parser: df_rows
+    note: 与 disk.usage 用同一个解析器，保持一致的口径
+
+verify:
+  - name: 块设备树可读
+    from: lsblk
+    on_missing: 读不到 lsblk 输出 —— 无法给出设备树
+  - name: 挂载点可解析
+    from: mounts
+    on_missing: df 没有解析出挂载点
+
+conclusion: |
+  磁盘与分区总览（{host.name}）
+  · 设备树（lsblk -J）：
+  {lsblk}
+  · 设备 UUID / 文件系统：
+  {blkid}
+  · 挂载点用量（{mounts.count} 个挂载点）：
+  {mounts}
+
+  判读：
+    · TYPE=disk 是整盘、part 是分区、lvm 是逻辑卷；
+    · 若某分区**没有** MOUNTPOINT，说明它尚未挂载（或用的是别的挂载路径）；
+    · 扩容后如果容量没变，先看这里：可能是"分区扩了、文件系统没扩"。

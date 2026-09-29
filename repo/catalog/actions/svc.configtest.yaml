@@ -1,0 +1,81 @@
+# ============================================================
+# 动作：配置语法校验（-t）
+# 来源：T5 配方引擎缺的那只手（规范 §12.8）
+# 形态：**只校验语法、不改任何状态**（不重启、不写文件）
+# 风险：green
+# ============================================================
+
+id: svc.configtest
+title: 配置语法校验
+summary: 校验服务配置的语法（内置静态表：nginx -t / sshd -t / mariadbd --verbose --help），不重启、不改动任何文件
+domain: E
+risk: green
+priority: P1
+tags: [只读, 服务, 配置]
+
+note: |
+  ★ 存在的理由：既有 42 个动作里**没有**"校验配置但不改状态"这一类 ——
+  而"改完配置先 `-t` 一遍，通过了再重启"是运维最省钱的一道闸门
+  （不校验就重启 = 拿线上服务当语法检查器）。
+
+  ★ 只支持**内置的几段静态命令**（枚举），**不接受任意命令**：
+  这条是安全契约（规范 §4）的落点 —— 一旦允许传命令，动作层就变成了 shell 通道。
+  ★ T6（规范 v1.7 §12.10）起，这层映射改用 `run_by`：**静态 argv 表 + 按 enum 取值选段** ——
+  参数只用来**选段**，命令本身写死在 YAML 里，**永远不由参数拼出来**。
+
+  ★ 退出码就是结论：0 = 语法通过；非 0 = 配置有错（整条动作失败，远端原文进错误详情）。
+  `sshd -t` 需要 root（工作台正是以 root 连接）。RHEL 系下 nginx 装在 /usr/sbin/nginx。
+
+params:
+  - name: binary
+    label: 要校验的程序
+    type: enum
+    required: true
+    choices: [Nginx, SSH 服务, MariaDB]
+    values: [nginx, sshd, mariadbd]
+    default: Nginx
+    help: '只支持这两个：Nginx 走 nginx -t，SSH 走 sshd -t。★ 校验命令是平台内置的**静态表**（规范 §12.10 的 run_by），不接受任何来自界面的命令片段。'
+
+precheck:
+  - name: binary_present
+    title: 确认目标程序存在（不能校验一个没装的服务）
+    run: [ls, -l, "/usr/sbin/{{ binary }}"]
+    parser: raw
+    timeout: 20
+    note: >
+      不存在时 rc=2 → 预检不通过 → 整条动作 aborted（目标机零改动），
+      并给出"先确认这个服务装没装"的建议。这比让 -t 去报 /usr/sbin/nginx: command not found 清楚得多。
+
+steps:
+  - name: test
+    title: 校验配置语法
+    # ★ v1.7（T6）改用 `run_by` 的**静态 argv 表**（规范 §12.10）：
+    #   参数 `binary` 只用来**选段**，命令本身写死在这里。
+    #   加一个程序 = ① 规范 §12.10 登记一行 ② 这里加一段 case + 扩 values
+    #   ★ 且**命令必须先真机跑通**才许登记（没验证过的预设 = 多一道假闸门）。
+    #   例：MariaDB 的候选（`mariadbd --verbose --help`）待 T6·S2 真机验证后追加。
+    run_by:
+      param: binary
+      cases:
+        nginx: ["/usr/sbin/nginx", "-t"]
+        sshd: ["/usr/sbin/sshd", "-t"]
+        mariadbd: ["/usr/sbin/mariadbd", "--verbose", "--help"]   # ★ 真机验证过（T6·S2）：rc=0；写坏配置会判失败
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+    note: |
+      ★ **只接受退出码 0**。若配置有错，nginx/sshd 会返回非 0，
+      于是这一步判失败 → 整条动作失败 → 调用它的配方会**立刻中止**（不会带着坏配置去重启）。
+      远端原文（"nginx: configuration file /etc/nginx/nginx.conf test failed" 等）在错误详情里。
+
+verify:
+  - name: 目标程序必须存在（它的输出，就是"这台机器上确实有这个程序"的证据）
+    from: binary_present
+    on_missing: 没找到 /usr/sbin/<程序> —— 无法校验配置，先确认这个服务到底装没装
+
+conclusion: |
+  【{host.name}】配置语法校验 · {binary}
+  目标程序：{binary_present}
+  校验结果：✅ 语法通过（退出码 0）
+  说明：本动作**只读** —— 不重启服务、不写任何文件。
+  建议：改完配置先跑本动作，通过后再执行「重启服务」。

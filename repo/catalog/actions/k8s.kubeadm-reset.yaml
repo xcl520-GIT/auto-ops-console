@@ -1,0 +1,193 @@
+# ============================================================
+# 动作：退出集群（kubeadm reset）
+# 来源：T8·S6 —— 规范 §12.32.1（五只手里的第一只，也是唯一一只 red）
+# 形态：**变更**（red）—— ★ 不存在"撤销 reset"这个动作
+# ============================================================
+
+id: k8s.kubeadm-reset
+title: 退出集群（kubeadm reset）
+summary: 把一台机器退回"未加入任何集群"—— 清掉静态 Pod 清单 / 证书 / etcd 数据 / kubelet.conf
+domain: J
+risk: red
+priority: P1
+tags: [变更, K8s, kubeadm, 不可逆]
+
+note: |
+  ★★ **为什么它必须是 `red`，而不是"反正 A7 已经批了"**（规范 §12.32.4）：
+  A7 批的是「**允许做这件事**」，`red` 管的是「**做的时候必须有人当下知道并同意**」——
+  两者不是一回事（总纲铁律 9）。★ 而且它**禁止批量**：三台各自的 reset 是**三次独立的**人的确认。
+
+  ★★ **它删掉的东西回不来**（规范 §12.19 的"回不去"分类）：
+  · `etcd` 数据（`/var/lib/etcd`）—— ★ 旧集群的**对象**（PV/PVC/StorageClass/工作负载）随它一起消失；
+  · kubelet 证书与 kubeconfig（`/etc/kubernetes/pki`、`admin.conf`、`kubelet.conf`）—— reset 即删；
+  · Pod 运行时状态。
+  ★ **回来靠两样东西**：① S3 的全量留证（12 个目录 × 3 台 + 52 份原文）；
+  ② ★★ **用户手打的三个 VM 快照**（master01 Snapshot7 / node01 Snapshot4 / node02 Snapshot4）。
+
+  ★★ **两条预检，两条语义完全不同 —— 这就是「幂等守卫」为什么必须挂在步骤上**（规范 §12.33）：
+
+  | 预检步骤 | 它在问什么 | 不成立时 |
+  |---|---|---|
+  | `has_traces` | 这台机器上**有没有集群态** | ★ **已达终态**（本来就没集群，没什么可清）⇒ 跳过 |
+  | `not_ours` | 这个集群**是不是本工作台建的** | ★ **已达终态**（是我们建的就**不该拆**）⇒ 跳过 |
+  | `kubeadm_present` | 工具在不在 | **真故障** ⇒ 中止（缺工具绝不能吞成"已达终态"） |
+
+  ★★ **`not_ours` 判的是「所有权」，不是「活不活」** —— 这条要特别说清：
+  T8·S6 侦察时发现旧集群**是活着的**（S5 起了 containerd 之后 kubelet 把上一版控制面拉起来了）。
+  ⇒ "一个**活着的**集群该不该被拆"**不是能靠观测回答的问题**，它是**人的决定**。
+  所以判据换成："**这个集群是不是本工作台建的**"——
+  `k8s.kubeadm-init` / `k8s.kubeadm-join` 成功后会写一个所有权标记
+  `/etc/kubernetes/aoc-owned.json`；标记在 = 我们建的 = **不拆**。
+  ★ 而 reset 会把标记**一起删掉** —— 这正是我们要的语义："拆完就没主了"。
+  ★★ **代价如实写**：**不是本工作台建的活集群，会被当成"旧集群"拆掉**。
+  所以它只许用在**演练机**上（这也是它保持 `red` + 禁止批量的原因）。
+
+confirm:
+  title: 确认退出一台机器的集群态
+  body: |
+    即将在「{host.name}」（{host.address}）上执行 **`kubeadm reset`**：
+
+      kubeadm reset --force --cri-socket unix:///run/containerd/containerd.sock
+
+    **会发生什么**（不可逆）：
+    · 清掉静态 Pod 清单（`/etc/kubernetes/manifests`）⇒ **这台机器上的控制面/组件容器会停**；
+    · 清掉证书与 kubeconfig（`/etc/kubernetes/pki`、`admin.conf`、`kubelet.conf`）；
+    · 清掉 etcd 数据（`/var/lib/etcd`）⇒ ★ **旧集群的全部对象（PV / PVC / StorageClass / 工作负载）随之消失**
+      （数据本身还在 NFS 目录里，但**对象回不来**）。
+
+    **回得来吗**：★ **没有"撤销 reset"**。回来只有两条路 ——
+    ① T8·S3 的全量留证（12 目录 × 3 台 + 52 份原文）；② **VM 快照**（master01 Snapshot7 / node01·node02 Snapshot4）。
+
+    **幂等**：★ 再跑一次**不会**再拆一遍 —— 预检会判"已无集群态"或"这个集群是我们建的"，
+    两者都按「已达终态」跳过（规范 §12.33）。
+  confirm_text: 我已确认退出集群
+
+backup:
+  - path: "/etc/kubernetes/aoc-owned.json"
+    label: "本工作台的所有权标记（★ 它会被 reset 一起删掉：拆完就没主了）"
+    required: false
+
+params: []
+
+precheck:
+  - name: kubeadm_present
+    title: 确认这台机器上有 kubeadm（★ 缺工具必须中止，**不许**判"已达终态"）
+    run: [ls, -l, /usr/bin/kubeadm]
+    parser: raw
+    timeout: 20
+    note: >
+      ★★ 这一步**故意不声明** `means_done`：它是"工具在不在"，不是"目标达成了没有"。
+      把它一起放行，就等于把"缺工具"静默吞成"已达终态"（规范 §12.33 规矩 3 要挡的正是这个）。
+
+  - name: has_traces
+    title: 这台机器上有集群态吗（★ 没有 ⇒ 没什么可清）
+    run: [ls, -ld, /etc/kubernetes/kubelet.conf]
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 20
+    means_done: true
+    means_done_why: >
+      `kubelet.conf` 不在 ⇒ 这台机器**本来就不在任何集群里** ⇒
+      `kubeadm reset` 想达成的终态（"这台机器上没有集群态"）**已经达成**。
+    note: >
+      ★ 它**只问"有没有集群态"**；工具在不在由 `kubeadm_present` 回答，与它无关。
+
+  - name: not_ours
+    title: 这个集群是**本工作台**建的吗（★ 是 ⇒ 不该拆）
+    run: [ls, -ld, /etc/kubernetes/aoc-owned.json]
+    parser: raw
+    ok_exit_codes: [2]
+    timeout: 20
+    means_done: true
+    means_done_why: >
+      所有权标记 `/etc/kubernetes/aoc-owned.json` **在** ⇒ 这台机器上的集群是**本工作台建的** ⇒
+      `kubeadm reset` 想达成的终态（"这台机器应该有一个属于我们的集群"）**已经是当前状态**，
+      而且"再点一次不许破坏集群"这条验收要求这里必须**什么都不做**。
+    note: >
+      ★★ 判据是**所有权**，不是"集群活不活"。"一个活着的集群该不该被拆"是**人的决定**，
+      不该由平台替你做（规范 §12.33 / §12.32.4）。
+      ★ 标记由 `k8s.kubeadm-init` / `k8s.kubeadm-join` 在成功后写入；
+      ★ reset 会把标记**一起删掉** —— 拆完就没主了，下一次再来它仍然是"旧集群"。
+
+steps:
+  - name: manifests_before
+    title: 清之前的静态 Pod 清单条数（★ 幂等判据的"前"）
+    run: [ls, -1, /etc/kubernetes/manifests]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+
+  - name: reset
+    title: ★★ 执行 kubeadm reset（--force：远端 stdin 是关掉的，不给它交互的机会）
+    run:
+      - kubeadm
+      - reset
+      - --force
+      - --cri-socket
+      - unix:///run/containerd/containerd.sock
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 600
+    note: >
+      ★ `--cri-socket` **每次显式写**（硬约束②）：三台上都有 `cri-docker.service`（inactive），
+      不排除它会被挑错运行时。
+      ★ `--force` 是必需的：传输层**关掉了远端 stdin**（规范 §8.5），
+      没有它 kubeadm 会在 "Are you sure…?" 那里拿不到回答。
+
+  - name: manifests_after
+    title: ★★ 自证① 静态 Pod 清单**真的空了**（数行数：0 才是"清干净了"）
+    run: [ls, -1, /etc/kubernetes/manifests]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+    note: >
+      ★ 自证挂在**数行数**这一步上（`line_count` 对空输出给 **0 这个结论**），
+      不是挂在原文那一步上 —— 空目录的输出本来就是空的，拿它做"非空断言"是 100% 假失败（§9.6 / 清单 80）。
+
+  - name: kubelet_conf_after
+    title: ★★ 自证② kubelet.conf **不在了**（0 = 不在）
+    run: [ls, -ld, /etc/kubernetes/kubelet.conf]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+
+  - name: pki_after
+    title: 自证③ 证书目录**空了**（0 = 没东西了）
+    run: [ls, -1, /etc/kubernetes/pki]
+    parser: line_count
+    ok_exit_codes: [0, 2]
+    timeout: 20
+
+verify:
+  - name: ★★ 静态 Pod 清单必须真的清空（判据是"条数"，不是"命令返回 0"）
+    from: manifests_after
+    on_missing: >
+      `ls -1 /etc/kubernetes/manifests` 连行数都数不出来（权限 / 路径不可达）——
+      ★ 这时**无法判定**它清干净了没有，不要当成"清干净了"。
+  - name: ★★ kubelet.conf 必须不在了
+    from: kubelet_conf_after
+    on_missing: >
+      读不出 `kubelet.conf` 的条数 —— 无法判定"退出集群"是否真的发生了。
+
+conclusion: |
+  【{host.name}】退出集群（变更 · 不可逆）
+  · 清之前静态 Pod 清单：**{manifests_before}** 条 ｜ 清之后：**{manifests_after}** 条
+  · kubelet.conf 还在吗：**{kubelet_conf_after}**（0 = 不在了）｜ 证书目录剩余：**{pki_after}** 条
+  · kubeadm 原文：
+  {reset}
+
+  判读：
+    · ★★ **三件终态一起看才算"退干净了"**（规范 §12.32.2）：
+      ① 静态 Pod 清单**空**；② `kubelet.conf` **不在**；③ 证书目录**空**。
+      ★ **不看"`kubeadm reset` 返回 0"** —— 那条命令会跳过它够不着的东西并照样返回 0；
+    · ★★ **回不去的东西（逐项，规范 §12.19）**：
+      · `etcd` 数据 —— ❌ 回不去（旧集群的 PV / PVC / StorageClass / 工作负载**对象**随之消失，
+        数据本身还在 NFS 目录里，但对象要**重新声明**才接得回来）；
+      · kubelet 证书与 kubeconfig —— ❌ 回不去（只有 sha256 指纹留在 S3 的留证里，**私钥永不读**）；
+      · Pod 运行时状态 —— ❌ 回不去；
+      · **包 / 单元启用状态 / 配置文件** —— ✅ 回得去（S3 的 52 份原文 + `dnf history undo`）；
+      · **外部影响** —— ✅ **无**（三台只对内网服务；Harbor 9 个容器、`/data/nfs`、`sshd` 全程未碰）；
+    · ★★ **最稳的还原 = 用户手打的 VM 快照**（master01 Snapshot7 / node01 Snapshot4 / node02 Snapshot4）；
+    · ★ **幂等**：再跑一次**不会**再拆一遍 —— 预检会判"已无集群态"或"这个集群是我们建的" ⇒ 按「已达终态」跳过；
+    · ★ 清完之后 `kubelet` 会一直重启失败（它已经没有 kubeconfig 了）——
+      这是**预期现象**，`kubeadm init` / `join` 会把它重新配好。

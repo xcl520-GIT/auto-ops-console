@@ -1,0 +1,100 @@
+# ============================================================
+# 动作：监控 · 注销一个抓取目标（T10 · 扩展点的反方向）
+# 来源：开题单 §7 验收 #8（"删掉 ⇒ 它消失"）
+# 形态：删掉 file_sd 目录里那个 aoc-mon-*.json；同样**不需要 reload**
+# 风险：yellow（只删自己前缀的文件）
+# ============================================================
+
+id: mon.target-remove
+title: 监控 · 注销一个抓取目标（扩展点反方向）
+summary: 删掉 /opt/aoc-monitoring/etc/targets/aoc-mon-<name>.json，并自证"它已经不在了"
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, 监控, 采集面, 扩展点, T10]
+
+confirm:
+  title: 确认注销这个抓取目标
+  body: |
+    即将在「{host.name}」（{host.address}）上删除：
+      /opt/aoc-monitoring/etc/targets/{name}.json
+
+    会发生什么：
+      · 该目标**不再被抓取**（file_sd 每 10 秒重读，不需要 reload）；
+      · ★ **已经抓进 TSDB 的历史样本不会消失** —— 删掉目标只是"不再抓"；
+      · 删除前自动备份这**一个**文件，可在「历史」里点「恢复此文件」还原。
+
+    ★ 本动作结构上**只可能删 `aoc-mon-` 前缀的文件**（参数白名单钉死），删不到配方自己的 node-base.json。
+  confirm_text: 我已确认要注销这个目标
+
+note: |
+  ★★ 验收 #8 要求"**可正可反**"：只验"加了"不验"删了" ⇒ 不合格。
+    本动作就是那个反方向，而且它的自证**由退出码承担**（规范 §9.6）：
+    删完之后 `ls` 该文件必须返回 **rc=2（不存在）**。
+  ★ **改文件名的越界防护**：`name` 的口令是 `^aoc-mon-...` —— 于是它
+    **结构上不可能**删到别的目标文件（包括配方自己渲染的 `node-base.json`）。
+  ★ 备份：删之前自动备份那一个文件（护栏三件套之一），可在「历史」里点「恢复此文件」还原。
+
+params:
+  - name: name
+    label: 要注销的目标名
+    type: str
+    required: true
+    default: aoc-mon-demo
+    pattern: '^aoc-mon-[a-z0-9][a-z0-9-]{1,32}$'
+    help: ★ 必须以 `aoc-mon-` 开头 —— 配方自己渲染的 `node-base.json` 结构上删不到。
+
+backup:
+  - path: "/opt/aoc-monitoring/etc/targets/{{ name }}.json"
+    label: "待删除的目标文件"
+    required: true
+    note: required=true：本来就不存在时这是"无事可做"，应当**中止**而不是假装删过。
+
+precheck:
+  - name: exists
+    title: 确认它存在（★ 这一步的输出就是"确实有东西被删"的证据）
+    run: [ls, -l, "/opt/aoc-monitoring/etc/targets/{{ name }}.json"]
+    parser: raw
+    timeout: 20
+    note: 不存在时 rc=2 ⇒ 预检不通过 ⇒ 整条 aborted、目标机零改动。
+
+steps:
+  - name: remove
+    title: 删除目标文件
+    run: [rm, -f, "/opt/aoc-monitoring/etc/targets/{{ name }}.json"]
+    parser: raw
+    timeout: 30
+
+  - name: gone
+    title: 自证：它已经不在了（★ 退出码 2 就是结论）
+    run: [ls, -l, "/opt/aoc-monitoring/etc/targets/{{ name }}.json"]
+    parser: raw
+    ok_exit_codes: [2]
+    timeout: 20
+    note: ★ 规范 §9.6：证明"某物不存在"必须由**退出码**承担，不能写成 verify 的非空断言（那是 100% 假红）。
+
+  - name: list
+    title: 扩展点目录剩什么
+    run: [ls, -1, /opt/aoc-monitoring/etc/targets]
+    parser: lines
+    timeout: 20
+
+verify:
+  - name: 删除前的存在性检查必须有输出
+    from: exists
+    on_missing: 删除前的存在性检查没有输出 —— 这次删除不可信
+
+conclusion: |
+  【{host.name}】监控 · 注销抓取目标
+  目标名：{name} ｜ 删除前的样子：{exists}
+  删除后目录里还剩：
+  {list}
+
+  判读：
+  · ★ 自证已完成：`ls` 对那个文件返回 **退出码 2（不存在）** —— 不符合预期就会判红；
+  · ★ **同样不需要 reload**：`file_sd` 每 10 秒自动重读；等一个周期后用「监控 · 抓取目标健康度」查，
+    它应当**从目标列表里消失**；
+  · ★★ **回得去 / 回不去**（规范 §12.38）：
+    - **回得去**：删之前自动备份了那一个文件，可在「历史」里点「恢复此文件」；
+    - **回不去**：**删掉之前已经抓进来的样本不会消失**（TSDB 里那段时间的数据仍在，
+      受 `retention.time` / `retention.size` 约束）；★ 这正是 T10 的"回不去"落在**数据**上的那一处。

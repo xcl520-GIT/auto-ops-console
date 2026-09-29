@@ -1,0 +1,348 @@
+# ============================================================
+# 配方：K8s 控制面（T8 · S6 + S7 · 第三阶段）
+# ------------------------------------------------------------
+# 一次点击 = 从「这台机器上停着/活着一个上一版集群」到
+#            「控制面起来 + CNI 就位 + 存储类可用 + 节点 Ready」：
+#   运行时就位 → ★ 拆掉旧集群（red · 人确认 · 有守卫）→ kubeadm init → kubeconfig
+#   → Calico 清单 → 应用 → 存储类/PV/PVC → 读写验证 Job → 等 Ready
+#
+# ★ 设计宪法（规范 §12.0）：
+#   ① 本文件只声明"要什么"，**判定与分支一律走平台侧**（没有一处命令、没有一处表达式）
+#   ② 「没变」可断言：平台采集 changed → **第二次跑该清单为空**就是幂等证明
+#   ③ 每个正向步骤都有反向操作（见 uninstall）
+#
+# ★★ 「一键到 Ready」的边界（规范 §12.0 / §12.32.1，本话题修正过一次口径）：
+#   配方**只在一台机器上执行**，而"一个集群"横跨三台 ⇒ 本话题的形态是**两次点击**：
+#     ① 本配方 @ 控制面（`node-01`）—— 控制面一键（含 CNI 与存储）
+#     ② `k8s-join` **批量** @ 两个工作节点
+#   ★ 硬做成"一次"，就得让控制面上的配方去 ssh 另外两台 —— 那等于在**配方层开后门**
+#     （§4 三层契约的第一条）。★ **这是口径修正，不是缩水**（开题单 §10.2.1 修订记录 #6）。
+#   ★★ 而**第三次点击本配方**（幂等复跑）同时兑现验收 #2 与验收 #1 的判据原文
+#     —— 全部步骤判「跳过」、`changed` 为空、集群仍 Ready、控制面 Pod 的 `RESTARTS` 不增。
+# ============================================================
+
+id: k8s-init
+name: K8s 控制面（一键：拆旧 → init → CNI → 存储 → Ready）
+version: "1"
+summary: 控制面一键：运行时就位 → 拆掉旧集群（需手输确认词）→ kubeadm init → kubeconfig → Calico → 存储类 → 等 Ready
+risk: red
+
+note: |
+  ★★ **本配方是 `red` —— 因为它里面有一步 `k8s.kubeadm-reset`（不可逆）**（规范 §12.32.4）。
+  ⇒ 它**禁止批量执行**（闸门挂在 `risk` 上，§12.18），而且正向部署也要**手输确认词**。
+  ★★ 那句确认词不是形式：它要人**当下**确认"**我同意把现在跑着的那个集群拆掉**"。
+  开题单的 **A7** 批的是"**允许做这件事**"，与"**做的时候有人当下知道并同意**"是两回事（总纲铁律 9）。
+
+  ★★ **两步"拆"与"建"是分开的、不可调换的**：
+  · `k8s.kubeadm-reset` 有**幂等守卫**（§12.33）——"没有任何集群态"或"这个集群是我们建的"都判**已达终态**跳过；
+  · `k8s.kubeadm-init` 有**幂等守卫**——"已经是控制面"判**已达终态**跳过。
+  ⇒ 第二次点击本配方：**这两步都跳过**，集群**一个字都不会被动**（验收 #2 的落点）。
+
+  ★★ **为什么 CNI 与存储被并进"控制面一键"**（而不是各做一份配方）：
+  「控制面就绪」这件事在 **CNI 装上之前根本不成立** —— 没有 CNI 的节点**天生就是 `NotReady`**。
+  把它拆成两份，"第一份跑完"会显示一个**看起来像失败**的中间态；合成一份，
+  最后那一步 `k8s.nodes`（等 Ready）才是这条路的**真终点**。
+
+  ★★ **与实物口径的一处有意偏离（逐项说清）**：存储类。
+  旧集群用的是 **NFS**（`nfs-dynamic` 会往导出根目录里新建子目录，而那条根目录是
+  **`/data/nfs`，红线 B1：永远只读**）⇒ 我们**不复制它**，
+  改按旧集群**另一条** `nfs-storage-class` 的**形状**（`no-provisioner` + `Retain` +
+  `WaitForFirstConsumer` 逐项同参）做一条，**只把后端从 NFS 换成节点本地目录**。
+  ★ 访问模式随之由 `RWX` 变成 `ReadWriteOnce` —— **这一项差异如实写明**（规范 §12.19 同族）。
+
+  ★ **"存储类可用"的判据不是"对象建出来了"**：是一个 **Job** ——
+  它把**宿主机预先写进卷里**的那份读出来、写成一张 receipt，再自己写一份文件；
+  ★ 两样都留在 **`{{ storage_path }}`** 里，平台随后用**自己的手**（`file.cat`）在宿主机上读它们
+  ⇒ **两个方向各留一份证**（"Pod 真的读到了" + "Pod 真的写进去了"）。
+  ★ 这也是本配方为什么需要 `k8s.wait`（等那个 Job `complete`）—— 没有它，"交出去"就会被当成"成了"（假绿）。
+
+params:
+  - name: control_plane_endpoint
+    label: 控制面端点（★ IPv4）
+    type: str
+    required: true
+    pattern: '^(\d{1,3}\.){3}\d{1,3}$'
+    default: 192.0.2.11
+    help: '★ 实测 `getent hosts` 第一条给 IPv6 link-local ⇒ 写主机名会让 kubeconfig 里出现一个连不上的地址（硬约束③）。'
+  - name: kubernetes_version
+    label: Kubernetes 版本
+    type: str
+    required: true
+    pattern: '^v1\.[0-9]{1,2}\.[0-9]{1,2}$'
+    default: v1.34.10
+    help: '★ 默认 = 三台已装的 kubeadm/kubelet/kubectl 版本（实测 1.34.10-150500.1.1）。'
+  - name: image_repository
+    label: 组件镜像仓库
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)+$'
+    default: registry.aliyuncs.com/google_containers
+    help: '★ 实测可拉（S5 真拉 rc=0），且旧集群缓存里的组件镜像正是这个前缀（实物口径）。不要写 registry.k8s.io。'
+  - name: sandbox_image
+    label: 沙箱镜像（pause）
+    type: str
+    required: true
+    pattern: '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,180}(:[A-Za-z0-9._-]{1,128})?$'
+    default: registry.aliyuncs.com/google_containers/pause:3.10.1
+    help: '★ 默认值抄自实物（S3 留证的 config.toml 里 pinned_images.sandbox 那一行）。'
+  - name: pod_subnet
+    label: Pod 网段
+    type: str
+    required: true
+    pattern: '^(\d{1,3}\.){3}\d{1,3}/[0-9]{1,2}$'
+    default: 10.244.0.0/16
+    help: '★ 同一个值要同时喂给 `kubeadm --pod-network-cidr` 与 Calico 的 IPPool（不一致 = 装上去但不通）。'
+  - name: service_subnet
+    label: Service 网段
+    type: str
+    required: true
+    pattern: '^(\d{1,3}\.){3}\d{1,3}/[0-9]{1,2}$'
+    default: 10.10.0.0/12
+    help: '★ 实物口径 = 10.10.0.0/12（kubeadm 默认是 10.96.0.0/12）。'
+  - name: storage_node
+    label: ★ 存储卷落点（宿主机名）
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]{0,62}$'
+    default: node-01
+    help: '★ `local` 卷必须钉在**一台**机器上（PV 的 nodeAffinity 用这个值）。默认与控制面同机 ⇒ 本配方**自包含**。'
+  - name: storage_path
+    label: ★ 存储卷目录（宿主机上的）
+    type: str
+    required: true
+    pattern: '^/opt/aoc-k8s(/[A-Za-z0-9._-]+)*$'
+    default: /opt/aoc-k8s/pv01
+    help: '★ 白名单钉在 `/opt/aoc-k8s` 下：那是**本工作台自己的目录**（与 `/data/nfs` 红线无关），可枚举、可删净。'
+  - name: storage_size
+    label: 卷容量
+    type: str
+    required: true
+    pattern: '^[1-9][0-9]{0,3}(Mi|Gi)$'
+    default: 1Gi
+  - name: storage_class
+    label: 存储类名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+    default: aoc-local
+  - name: pv_name
+    label: PV 名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]{0,62}$'
+    default: aoc-local-pv
+  - name: pvc_name
+    label: PVC 名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]{0,62}$'
+    default: aoc-local-pvc
+  - name: job_name
+    label: 读写验证 Job 名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]{0,62}$'
+    default: aoc-storage-rw
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+    default: default
+  - name: storage_image
+    label: 读写验证用的镜像（★ 要本地已有）
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)+(:[A-Za-z0-9._-]{1,128})?$'
+    default: docker.io/library/busybox:1.36
+    help: '★ 默认选的 busybox 在**三台本地镜像库里都有**（旧集群留下的）⇒ 不需要联网，验证不会因为拉镜像而假红。'
+  - name: wait_seconds
+    label: 等 Ready 的超时（秒）
+    type: int
+    required: true
+    min: 1
+    max: 900
+    default: 420
+    help: '★ 首次装 CNI 后节点转 Ready 通常要十几秒；★ 超时不是"再等等就好"：先看是哪个节点、卡在哪一步。'
+
+# ★★ 正向部署**也要手输确认词**（规范 §12.32.4）：
+#   本配方里含 `k8s.kubeadm-reset`（red），而那句"我同意把现在跑着的集群拆掉"
+#   只能由**人当下**输入 —— 与卸载段那句是不同的两句。
+deploy_confirm_text: 我已确认拆掉旧集群并重建
+
+steps:
+  - name: runtime_install
+    title: 安装 containerd.io（已装则不动它）
+    action: pkg.install
+    args: { package: containerd.io }
+    note: >
+      ★ 与 `k8s-containerd` 配方同一步：★ **"已装则不动"是做不到的** —— 源里有更新版本时
+      `dnf install` 会**升级**（T8·S5 实测 2.2.6 → 2.3.6，平台的 `changed` **如实报了 True**）。
+
+  - name: runtime_cri_tools
+    title: 安装 cri-tools（提供 crictl：走 CRI 路的那只手）
+    action: pkg.install
+    args: { package: cri-tools }
+
+  - name: runtime_enable
+    title: 容器运行时设为开机自启
+    action: svc.enable
+    args: { unit: containerd }
+
+  - name: runtime_start
+    title: 启动容器运行时
+    action: svc.start
+    args: { unit: containerd }
+
+  - name: runtime_pull
+    title: ★ 链路最末端：按 CRI 路把沙箱镜像拿到手
+    action: container.pull
+    args: { ref: "{{ sandbox_image }}" }
+    note: >
+      ★★ "能不能拿到"只能由"**真的拿到过一次**"回答（§12.31.3）。
+      ★ 幂等：第二次跑时镜像已在本地 ⇒ `changed=false`。
+
+  - name: reset_old
+    title: ★★ 拆掉这台机器上的上一版集群（red · 需手输确认词 · **有幂等守卫**）
+    action: k8s.kubeadm-reset
+    note: >
+      ★★ 它是本配方里**唯一不可逆**的一步（etcd 数据 / 证书 / kubelet.conf 全删）。
+      ★★ **幂等守卫**（§12.33）：预检判"没有任何集群态"或"这个集群是我们建的" ⇒ **已达终态跳过**。
+      ⇒ 第二次点击本配方时，这一步**什么都不做**。
+      ★ 回不去的东西逐项写在它的结论里（规范 §12.19）。
+
+  - name: init
+    title: ★★ 引导控制面（拉齐镜像 → init → 自证 API 真在应答）
+    action: k8s.kubeadm-init
+    args:
+      control_plane_endpoint: "{{ control_plane_endpoint }}"
+      kubernetes_version: "{{ kubernetes_version }}"
+      image_repository: "{{ image_repository }}"
+      pod_subnet: "{{ pod_subnet }}"
+      service_subnet: "{{ service_subnet }}"
+    note: >
+      ★★ **幂等守卫**：`admin.conf` 已在 ⇒ 判「已达终态」跳过（不会重复 init）。
+      ★ 它内部第一步是 `kubeadm config images pull` —— 拉失败时**集群一个字都还没被碰过**。
+
+  - name: kubeconfig
+    title: 装入 kubeconfig（判据是 `cmp` 的退出码）
+    action: k8s.kubeconfig
+    args: { source: /etc/kubernetes/admin.conf, dest: /root/.kube/config }
+
+  - name: calico_manifest
+    title: 渲染 Calico 清单（官方 v3.25.0 原文，唯一改动 = IPPool 网段）
+    template: k8s-calico/calico.yaml
+    dest: /etc/kubernetes/aoc/calico.yaml
+    mode: "0644"
+    note: >
+      ★★ 唯一一处有意改动：把官方**注释掉的** `CALICO_IPV4POOL_CIDR` 打开、值改成 `{{ pod_subnet }}`。
+      ★ 镜像 `docker.io/calico/{cni,node,kube-controllers}:v3.25.0` **三台本地都有**（旧集群留下的）
+      ⇒ `IfNotPresent` 直接用缓存，**不需要联网**。
+
+  - name: calico_apply
+    title: ★ 应用 Calico（先 `diff` 判"变了没有"，再 `apply`，再 `get` 自证）
+    action: k8s.apply
+    args: { path: /etc/kubernetes/aoc/calico.yaml }
+    note: >
+      ★★ `changed` 看 `kubectl diff` 的退出码（§12.34）；★ **第一次**跑时清单里的自定义资源
+      还没有 CRD 认得它们 ⇒ 那一次 `changed` 记 **unknown**（诚实，不猜）。
+
+  - name: prepare_volume
+    title: 准备存储卷目录（★ 顺手在里面放一份"给 Pod 读"的文件）
+    template: k8s-storage/from-host.txt
+    dest: "{{ storage_path }}/from-host.txt"
+    mode: "0644"
+    note: >
+      ★ 模板写入自带 `mkdir -p`（规范 §12.13.6）⇒ **目录靠写一个正经文件建出来**：
+      `local` 卷的 `path` 必须先存在，否则 PV 永远绑不上。
+      ★ 这份文件是"**读**"的那一端：Job 会把它读出来写成 receipt，平台再在宿主机上核对。
+
+  - name: storage_manifest
+    title: 渲染存储类 + PV + PVC
+    template: k8s-storage/pv-sc-pvc.yaml
+    dest: /etc/kubernetes/aoc/storage.yaml
+    mode: "0644"
+    note: '★ 形状照抄旧集群的 `nfs-storage-class`（no-provisioner / Retain / WaitForFirstConsumer），后端换成节点本地目录 —— 差异写在模板头里。'
+
+  - name: storage_apply
+    title: 应用存储类 + PV + PVC
+    action: k8s.apply
+    args: { path: /etc/kubernetes/aoc/storage.yaml }
+
+  - name: rw_job_manifest
+    title: 渲染读写验证 Job
+    template: k8s-storage/rw-job.yaml
+    dest: /etc/kubernetes/aoc/storage-rw.yaml
+    mode: "0644"
+    note: '★ 它就是「存储类可用」这条验收的**判据本体**：读一次、写一次，两样都留在宿主机能看到的地方。'
+
+  - name: rw_job_apply
+    title: 应用读写验证 Job
+    action: k8s.apply
+    args: { path: /etc/kubernetes/aoc/storage-rw.yaml }
+
+  - name: rw_job_wait
+    title: ★★ 等它 **complete**（`kubectl wait` 的退出码 —— 没等到就是判红，不是"再等等"）
+    action: k8s.wait
+    args:
+      kind: job
+      name: aoc-storage-rw
+      namespace: default
+      condition: complete
+      timeout_seconds: 180
+    note: >
+      ★★ **必须有这一步**：`kubectl apply` 是**异步**的，返回 0 只说明"清单交给了 API server"。
+      没有它，"交出去"就会被当成"成了"（**假绿**，§12.6.5）。
+      ★ 幂等：Job 已经 `Complete` ⇒ `wait` 立刻返回 0。
+
+  - name: wait_ready
+    title: ★★ 等所有节点 Ready（**本配方的真终点**；`kubectl wait` 的退出码就是判据）
+    action: k8s.nodes
+    args: { wait_seconds: "{{ wait_seconds }}" }
+    note: >
+      ★★ 它是"**集群真的可用了吗**"的判据家（规范 §12.32.2 / §12.32.5）。
+      ★ **第一次跑时它只看到一个节点**（控制面自己）—— 那是**正确的**：
+      工作节点还没 join。★ 三节点一起 Ready 的原文，在**第三次点击**（幂等复跑）里给出。
+
+health:
+  # ★★ 判据 = `k8s.nodes` 的动作自证（`kubectl wait --for=condition=Ready nodes --all` 的退出码）。
+  #   ★ 不给算子（§12.11.2 第三种形态）：这里**没有**"参照值"这种概念 ——
+  #     "Ready 了没有"只能由**控制面自己的答案**回答。
+  #   ★ 为什么不用 `first_field`：`kubectl wait` 的输出**行首是节点名**，
+  #     一个 Ready 就够撑起一行，它回答不了"是不是**全都** Ready"（§12.32.5）。
+  - expect:
+      responds: { action: k8s.nodes }
+  # ★ 旁证（不代替上面那条）：运行时真的在应答
+  - expect:
+      responds: { action: container.runtime, first_field: "Server:" }
+
+uninstall:
+  # ★★ 反向操作 = **把集群拆掉**（与 `k8s.kubeadm-reset` 是同一件事）。
+  #   ★ 它本身是 red ⇒ 本配方的「停止」段照样要**手输确认词**（§12.6.1）。
+  stop:
+    - action: k8s.kubeadm-reset
+  disable:
+    - action: svc.disable
+      args: { unit: kubelet }
+    - action: svc.disable
+      args: { unit: containerd }
+  # ★ 本配方自己写出来的清单都在 `/etc/kubernetes/aoc/` 下（reset 会连 `/etc/kubernetes` 一起清），
+  #   所以这里**只列"reset 清不掉"的那一处**：存储卷目录（在 `/opt` 下）。
+  purge_paths:
+    - "{{ storage_path }}"
+    - /etc/kubernetes/aoc
+  # ★★ 「保留数据」是一条**承诺**，必须念出来：这里保留的是**镜像缓存** ——
+  #   它是**资产不是数据**（删了要重拉，而这里的镜像源走得通的那个很慢）。
+  #   ★ 集群对象（PV/PVC/StorageClass/工作负载）**不在保留范围**：它们随 etcd 一起消失，
+  #     数据本身还在上面的目录里 ⇒ **对象要重新声明才接得回来**（规范 §12.19 同族）。
+  keep_data:
+    - /var/lib/containerd
+  # ★ 本配方**不卸任何包**（containerd.io 是运行时，留着才有意义）⇒ 不声明 remove_packages。
+  stop_confirm_text: 我已确认拆掉这个集群
+  purge_confirm_text: 我已确认全删
+  # ★ 「停止 / 保留数据卸载」**之后**应当成立的事实（规范 §12.6.3）：
+  #   ★★ 判据选"**kubelet.conf 不在了**"这种**外部可观测**的东西 ——
+  #     不用 `state: {equals: inactive}`：后者依赖"单元还驻留在 systemd 内存里"。
+  health:
+    - expect:
+        absent: { action: file.stat, args: { path: /etc/kubernetes/kubelet.conf } }

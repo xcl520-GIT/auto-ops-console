@@ -1,0 +1,18 @@
+# ============================================================
+# Valkey 站点定制（由 auto-ops-console「服务目录 → Valkey」渲染）
+# ------------------------------------------------------------
+# ★ 为什么是"这个文件"而不是我们自己的 valkey.conf：
+#   ① valkey 包**没有**配置 drop-in 目录（`/etc/valkey/valkey.conf` 里的 `include`
+#      全是注释，没有一行生效）—— 想加自己的配置，唯一"原生"办法就是改包自带的那份 conf；
+#   ② 改包自带的文件 = T5 踩过的坑：`remove_config` **复原不了**（包里还有几十行默认值），
+#      卸到一半就成了"残缺的包"，而且配方自己修不回来；
+#   ③ 而这个单元**自己就留了钩子**（`/usr/lib/systemd/system/valkey.service`）：
+#        EnvironmentFile=-/etc/sysconfig/valkey
+#        ExecStart=/usr/bin/valkey-server /etc/valkey/valkey.conf --daemonize no --supervised systemd $OPTIONS
+#      `-` 表示"文件不在也不报错"，`$OPTIONS` 会被 systemd 按空白拆成参数 ——
+#      于是这里写下的每一项都等价于"改 valkey.conf 里对应那一行"，却**一个字的包文件都不动**。
+#
+# ★ 生效方式：改完**必须重启**（配方里的 notify 会在内容真的变化时自动重启）。
+# ★ 只在内容变化时才写盘 / 才重启 —— 这是幂等的来源（比较 sha256）。
+# ============================================================
+OPTIONS="--port {{ port }} --bind {{ bind }} --maxmemory {{ maxmemory_mb }}mb"

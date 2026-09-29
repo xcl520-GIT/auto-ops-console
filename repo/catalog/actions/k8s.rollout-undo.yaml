@@ -1,0 +1,239 @@
+# ============================================================
+# 动作：回滚到上一版
+# 来源：T9·S4 —— 规范 §12.37.1 ①、§12.38（★ 有深度限制，要念出来）
+# 形态：**可恢复变更**（yellow）
+# ============================================================
+
+id: k8s.rollout-undo
+title: 回滚到上一版
+summary: 把工作负载退到上一版（按 revision）—— ★ 判据是"镜像真的换回去" ＋ 滚动完成；★ 会念出还能回几步
+domain: J
+risk: yellow
+priority: P0
+tags: [变更, K8s, 工作负载, 回滚]
+
+note: |
+  ★★ **判据两条**（规范 §12.37.1 ①）：① 读回来的镜像**与前一刻不同**（说明真的回退了）；
+  ② `rollout status` 的退出码为 0（回退后的版本真的起来了）。
+  ★ 只听 `rollout undo` 返回 0 **不够** —— 它同样只是"声明被收下了"。
+
+  ★★ **它有一条必须念出来的边界**（规范 §12.38）：**回退有深度限制** ——
+  `revisionHistoryLimit`（K8s 默认 10）之外的旧版本**已经被集群丢掉**，
+  想再往前回**回不去**。⇒ 本动作会**同时给出** `rollout history` 的原文，
+  让人自己看清"现在在第几版、还能回几步"。
+
+  ★ 与 `k8s.set-image` 的分工：本动作**按 revision 回退**（不看镜像名，适合"不知道旧镜像是什么"时）；
+  `k8s.set-image` 是**指名换镜像**（适合"报告里已经给了旧镜像"时）。★ 两条路都在，任选。
+
+params:
+  - name: kind
+    label: 对象类型
+    type: enum
+    required: true
+    choices: [Deployment, StatefulSet, DaemonSet]
+    values: [deployment, statefulset, daemonset]
+    default: Deployment
+  - name: name
+    label: 对象名
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9.-]*$'
+    placeholder: t9-web
+  - name: namespace
+    label: 命名空间
+    type: str
+    required: true
+    pattern: '^[a-z0-9][a-z0-9-]*$'
+    default: default
+  - name: revision
+    label: 回到第几版
+    type: int
+    required: true
+    min: 0
+    max: 1000
+    default: 0
+    help: '★ **0 = 上一版**（K8s 的语义）；要指定具体版本号就填那个号（★ 看报告里 history 那一段）。'
+  - name: wait_seconds
+    label: 等滚动完成超时（秒）
+    type: int
+    required: true
+    min: 10
+    max: 900
+    default: 180
+  - name: kubeconfig
+    label: kubeconfig 路径
+    type: str
+    required: true
+    pattern: '^/etc/kubernetes/[A-Za-z0-9._-]+\.conf$'
+    default: /etc/kubernetes/admin.conf
+
+confirm:
+  title: 确认回滚
+  body: |
+    即将把「{namespace}/{kind}/{name}」回滚到 **{revision}**（0 = 上一版）。
+    · 能不能撤：✅ 能 —— 再回滚一次可以退到更早的版本（★ 但有深度限制，见下面）；
+      ❌ 而"当前这一版"本身**不会被保存**：回滚是**换掉**模板，不是压栈。
+    · ★★ **深度限制**：`revisionHistoryLimit`（默认 10）之外的旧版本**已经被丢掉**，
+      再往前回就**回不去**了 —— 报告里会给出 `rollout history` 原文，先看清还有几版可回。
+    · 影响面：触发一次**滚动更新**（新旧容器短暂并存）。
+    目标机：{host.name}（{host.address}）
+  confirm_text: 我已确认要回滚
+
+precheck:
+  - name: kubectl_present
+    title: 确认这台机器上有 kubectl
+    run: [ls, -l, /usr/bin/kubectl]
+    parser: raw
+    timeout: 20
+  - name: target_exists
+    title: ★ 对象必须存在
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - --no-headers
+    parser: raw
+    timeout: 60
+
+steps:
+  - name: api_alive
+    title: ★ 中枢判据：集群 API 在应答
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - namespaces
+      - --no-headers
+    parser: lines
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: image_before
+    title: 回滚前的镜像（对照用）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.spec.template.spec.containers[*].image}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: history_before
+    title: ★★ 版本历史（**"还能回几步"就在这里**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - rollout
+      - history
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: act
+    title: 提交回滚（★ 只说明"声明被收下了"）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - rollout
+      - undo
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "--to-revision={{ revision }}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: wait
+    title: ★★ 判据②：等回滚后的版本真的起来（`rollout status` 的退出码）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - rollout
+      - status
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "--timeout={{ wait_seconds }}s"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 920
+
+  - name: image_after
+    title: ★★ 判据①：回滚后的镜像（必须与回滚前**不同**）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - get
+      - "{{ kind }}"
+      - "{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+      - "-o"
+      - "jsonpath={.spec.template.spec.containers[*].image}"
+    parser: raw
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: history_after
+    title: ★ 回滚后的版本历史（对照：多了/少了一版）
+    run:
+      - kubectl
+      - --kubeconfig={{ kubeconfig }}
+      - rollout
+      - history
+      - "{{ kind }}/{{ name }}"
+      - "-n"
+      - "{{ namespace }}"
+    parser: raw
+    optional: true
+    ok_exit_codes: [0]
+    timeout: 60
+
+verify:
+  - name: ★★ 集群 API 必须应答
+    from: api_alive
+    on_missing: API server 没在应答（或 kubeconfig 不对），本次没有改任何东西。
+  - name: ★★ 回滚前后必须读得到镜像（拿不到对照数据 = 不能下结论）
+    from: image_after
+    on_missing: >
+      回滚之后读回来的 `image` 是空的 —— 这次拿不到对照数据。
+      ★ **不许**把它当成"回滚成功"（拿不到对照数据 ≠ 已经改好）。
+
+conclusion: |
+  【{host.name}】回滚到上一版 · {namespace}/{kind}/{name} → revision **{revision}**（变更）
+  · 回滚前镜像：{image_before}
+  · 回滚后镜像：{image_after}
+  · `rollout status` 原文：{wait}
+
+  ── ★★ 版本历史（回滚**前**；"还能回几步"就看这里）──
+  {history_before}
+  ── 版本历史（回滚**后**）──
+  {history_after}
+
+  ★★ 回得去 / 回不去（规范 §12.38）：
+    · ✅ **能继续往前回**：再看一次本报告里的 `history` 段，挑一个更早的 revision 再回；
+    · ❌ **回不去**的两种：① **超出 `revisionHistoryLimit`（K8s 默认 10）的旧版本已被丢弃**；
+      ② **"回滚前那一版"没有被保存** —— 回滚是**换掉模板**，不是压栈（想回去就再回滚一次到那个 revision，
+      前提是它还在 history 里）；
+    · ⚠️ 若 `history` 段是空的（（无））= 这个对象**没有历史可回**（从没被更新过）。
+
+  判读：
+    · ★★ 判据是 **① 回滚前后镜像不同** ＋ **② `rollout status` 退出码为 0**；
+    · ★ **`revision` 填 0 = 上一版**（这是 K8s 的语义，不是"第 0 版"）；
+    · ★ 回滚**不会**动副本数、不会动 Service、不会动存储；
+    · ★ 与 `k8s.set-image` 的分工：本动作按 **revision** 回退（适合不知道旧镜像是什么）；
+      `set-image` 按**镜像名**换（适合报告里已经给出了旧镜像）。

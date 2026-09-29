@@ -1,0 +1,194 @@
+# ============================================================
+# 动作：克隆虚拟机（从母机造一台新机器）
+# 来源：设计\05-虚拟化层-架构设计.md §5 · 总纲 §3 T17 行 · 规范 §12.127~§12.130
+# 形态：母机必须关机 → vmrun clone <src> <dst> full → 判据：新的 .vmx **真的出现了**
+# 风险：🔴 red（造出一台新机器：占磁盘、会带来身份串味）｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.clone
+title: 克隆虚拟机（从母机造一台新的）
+summary: 🔴 从母机整盘复制出一台新虚拟机 —— ★ 它**还不是一台"新机器"**，身份重置之后才算
+domain: M
+risk: red
+priority: P0
+channel: local
+tags: [变更, 虚拟化, 造机, 破坏性]
+
+note: |
+  ★★ 本动作的主题句（规范 §12.129）：**克隆给出的是拷贝件 —— 直到身份被换掉，它才算一台新机器。**
+    `vmrun clone` 返回 0 只说明**磁盘上多了几个文件**；它**不**说明：
+      · machine-id / SSH host key / 主机名 / 静态 IP / VMware UUID·MAC 已经是新的
+        （★ 默认**整盘复制** ⇒ 这五项**与母机完全相同**）；
+      · 它能被纳管、能被信任、能被审计。
+    ⇒ 真正的"新机器"要由 **身份重置 ＋ 纳管 ＋ 体检** 共同挣来（配方 `vm-provision`）。
+  ★★ 红线 13：**不直接改 `.vmx`** ⇒ 第 5 项身份（UUID / MAC）能不能换，**由 `vmrun` 说了算**；
+    换不掉就**如实写成平台边界**（规范 §12.133），不许硬改 `.vmx`，也不许把"让人去 GUI 手工改"当自动化。
+  ★ 前置三件（规范 §12.130）：① **母机必须关机** ② **克隆前先给母机打快照**（配方里的前一步）
+    ③ **目标路径已存在 ⇒ 拒绝覆盖**（预检会拦）。①③ 在本动作里落地，②在配方里。
+  ★ 本动作**只做 full 克隆**：`linked` 依赖母机的磁盘链，而靶子机不该带这个耦合（刻意不做）。
+
+confirm:
+  title: 确认克隆虚拟机（🔴 造一台新机器）
+  body: |
+    即将在**宿主机**上，把母机「{vm_name}」（{vm_vmx}）**整盘复制**成一台新虚拟机：
+
+      · 新机 id：{vm_new_id}
+      · 落盘位置：{vm_new_vmx}
+
+    会发生什么：
+      · 宿主机磁盘上多出一台完整的虚拟机（精简置备下约等于母机的实际占用）
+      · ★★ **身份是复制过来的**：machine-id / SSH host key / 主机名 / 静态 IP / UUID·MAC
+        默认与母机**完全相同** —— 这就是"串味"：纳管、SSH 信任与审计会一起失真
+      · ★ 本动作**不开机、不纳管、不改身份** —— 那些是后面几步的事
+
+    能不能撤回：
+      · ★ **平台没有"删虚拟机"的动作**（删除比克隆更不可逆，刻意不做）⇒ 要撤只能**人在 VMware 里删**
+      · 删掉之后回收的就是磁盘上那份拷贝
+
+    判据（做完怎么算成）：
+      · 不是"命令返回 0"，而是**再看一次文件系统**：新的 `.vmx` **真的在**
+  confirm_text: 我知道这是造一台新机器，克隆它
+
+params:
+  - name: vm
+    label: 母机（源虚拟机）
+    type: str
+    required: true
+    default: node-03
+    placeholder: 母机 id 或 vmx 文件名
+    help: ★ 只有"已登记"或"当次点名"的才允许操作（红线 12）；母机必须处于**关机**状态
+
+  - name: new_id
+    label: 新机 id（★ 它同时是目录名与文件名）
+    type: str
+    required: true
+    default: aoc-tpl-01
+    pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{1,38}$'
+    placeholder: aoc-tpl-01
+    help: 只许字母数字与 . _ -；落在 vm.allow_vmx_dirs 的第一项下（本环境 D:\VMs\<新机 id>\<新机 id>.vmx）
+
+  - name: min_free_mb
+    label: 至少留多少 MB 磁盘余量（不够就拒绝）
+    type: int
+    required: true
+    default: 5120
+    min: 512
+    max: 102400
+    help: 规范 §12.130 第 5 条：不够就**拒绝**，不许"写到一半失败"
+
+  - name: timeout_sec
+    label: 最多等多少秒（等新机的 .vmx 真的出现）
+    type: int
+    required: true
+    default: 300
+    min: 30
+    max: 1800
+    help: 整盘复制可能要一两分钟；等不到 ⇒ 判红（如实说"没造出来"）
+
+precheck:
+  - name: src_vmx_ok
+    title: 确认母机的 vmx 打得开（连"它现在关机"这件事都要求先能打开它）
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "listSnapshots", "{{ vm_vmx }}"]
+    parser: raw
+    ok_exit_codes: [0]
+
+  - name: src_stopped
+    title: ★★ 前置：母机必须**关机**（克隆的前提，规范 §12.130 第 1 条）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_vmx }}", "--expect", "stopped"]
+    parser: json
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: target_free
+    title: ★★ 前置：新机落盘位置必须**还不存在**（"不覆盖"是硬规矩，规范 §12.130 第 4 条）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_new_vmx }}", "--expect", "vmx-absent"]
+    parser: json
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: dir_free
+    title: ★ 前置：新机的目录也不该在（否则里面可能已经有别的东西）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_new_vmx }}", "--expect", "dir-absent"]
+    parser: json
+    ok_exit_codes: [0]
+    timeout: 60
+
+  - name: disk_room
+    title: ★ 前置：宿主机磁盘余量够不够（规范 §12.130 第 5 条）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "disk",
+          "--path", "{{ vm_new_vmx }}", "--min-free-mb", "{{ min_free_mb }}"]
+    parser: json
+    ok_exit_codes: [0]
+    timeout: 60
+
+steps:
+  - name: target_before
+    title: 动手前先看一眼：新机的位置现在是什么样（★ changed 的判据来源）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_new_vmx }}", "--expect", "vmx-absent"]
+    parser: json
+    timeout: 60
+    optional: true
+    ok_exit_codes: [0, 3]
+    note: |
+      ★ 这一步**允许两种结果**（0 = 不在 / 3 = 已经在）：它只负责**把动手前的样子记下来**。
+        真正拦"已存在"的是预检那条（那时它是**硬前置**，不成立就中止，`PRECHECK_FAILED`）。
+      ★ 它是 `changed` 的判据来源：动手前不在 ＋ 动手后在 ⇒ 这次**真的造出来了**（规范 §12.117 同源）。
+
+  - name: mkdir_new
+    title: 建新机的落盘目录（VMware 不会替我们建父目录）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "mkdir", "--path", "{{ vm_new_dir }}"]
+    parser: json
+    timeout: 60
+    note: ★ 只建**一个空目录**；★ 幂等（已存在即"已达终态"，不报错）。
+
+  - name: clone
+    title: 整盘复制（★ 这一步只是**收条**）
+    run: ["{{ vmrun }}", "-T", "{{ vm_type }}", "clone", "{{ vm_vmx }}", "{{ vm_new_vmx }}", "full"]
+    parser: raw
+    timeout: 1200
+    optional: true
+    note: |
+      ★ 为什么 optional：`vmrun clone` 在某些情形下会返回非零，而"新机已经在那个位置上"
+        属于**幂等路径**（已达终态），不是失败。★ 但它只是**收条** —— 判据在下一步。
+
+  - name: wait_created
+    title: 判据：新的 .vmx 真的出现了吗（★ 退出码就是结论）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_new_vmx }}", "--expect", "vmx-exists", "--wait", "{{ timeout_sec }}"]
+    parser: json
+    timeout: 1980
+    ok_exit_codes: [0]
+    note: |
+      ★ 0 = 在 · 3 = 等超时也没有（**判红**）· 2 = 读不到。
+      ★ 这一步**不许 optional**：它是本动作唯一的判据 —— 把它设成 optional，等于**把判据取下来**（§12.119）。
+
+verify:
+  - name: 必须读到"动手前"的位置状态（否则 changed 无法判定）
+    from: target_before
+    field: vmx_exists
+    on_missing: 没读到动手前的位置状态 ⇒ 这次到底造出来没有，**无法判定**
+  - name: 必须看到新机的 .vmx（判据本身要有证据）
+    from: wait_created
+    field: vmx_exists
+    on_missing: 判据那一步没有给出"新机的 vmx 在不在" —— 本结论不可用
+
+conclusion: |
+  【{vm_new_id}】克隆结果
+  · 母机：{vm_name}（{vm_vmx}）
+  · 新机落盘：{vm_new_vmx}
+  · 动手前该位置：vmx_exists={target_before.vmx_exists}（false = 本来没有，正是我们要的）
+  · 动手后该位置：vmx_exists={wait_created.vmx_exists} · 大小 {wait_created.size_bytes} 字节
+  · 判据来源：{wait_created.checked}
+
+  ★★ **它现在还不是一台"新机器"**（规范 §12.129）：
+    五项身份（machine-id / SSH host key / 主机名 / 静态 IP / VMware UUID·MAC）**与母机完全相同** ——
+    这时候去纳管它，会把两份一模一样的身份混进 `hosts.yaml`、SSH 信任与审计里。
+  ⇒ 下一步（配方 `vm-provision`）：
+    ① `vm.start` 开机 → ② 等 guest 就绪 → ③ 等 SSH → ④ **身份重置**（五项逐项）→ ⑤ **纳管** → ⑥ **体检**。
+
+  ★ 回不去的（逐项说清，没有也写「无」）：
+  · 无 —— 新机不要了可以删掉回收磁盘；★ 但**平台刻意没有"删虚拟机"的动作**（删除比克隆更不可逆）。

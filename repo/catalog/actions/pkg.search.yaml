@@ -1,0 +1,101 @@
+# ============================================================
+# 动作：包搜索
+# 来源：设计\03-Linux运维命令覆盖地图.md §3 域 H（P0 · 只读）
+# 形态：一次给全结论（按关键字搜包 + "哪个包提供这个命令"）
+# 风险：green
+# ============================================================
+
+id: pkg.search
+title: 包搜索
+summary: 按关键字搜可用包，或查出"哪个包提供某个命令"（要装工具时必备）
+domain: H
+risk: green
+priority: P0
+tags: [只读, 包管理, dnf]
+note: |
+  这是"工具缺失"类问题的**闭环动作**：像 dig / traceroute / mtr 这类命令在 RHEL 10 最小安装里没有，
+  「连通性与路径」会告诉你缺什么，本动作告诉你装哪个包。
+  两个数据源：
+    · `dnf search <关键字>`：按名称/摘要搜索（**需要仓库元数据**，首次可能触发下载，故超时放宽到 90 秒）；
+    · `dnf provides "*/<命令>"`：查哪个包提供该命令/文件（本地已装的会标 @System）。
+  只解析"命中行"，不依赖 dnf 的表格排版（人读格式在 4/5 之间变过，T1 已确认不可假设）。
+
+params:
+  - name: keyword
+    label: 搜索关键字
+    type: str
+    required: true
+    default: curl
+    pattern: '^[A-Za-z0-9._+-]{1,64}$'
+    placeholder: nginx
+    help: 按包名或摘要搜索（支持通配符 *）。默认用 curl 便于先确认搜索链路本身正常。
+  - name: cmd
+    label: 查哪个包提供这个命令
+    type: str
+    required: false
+    pattern: '^[A-Za-z0-9._+-]{1,64}$'
+    default: dig
+    placeholder: dig
+    help: 命令名（如 dig / traceroute / mtr）。默认 dig —— 它是 RHEL 10 最小安装里最常缺的诊断工具。清空则该步跳过。
+
+steps:
+  - name: search
+    title: 按关键字搜索
+    run: ["dnf", "-q", "search", "{{ keyword }}"]
+    parser: lines
+    timeout: 90
+    note: >
+      -q 只保留关键输出（去掉进度条与订阅提示）。
+      仓库元数据不在本地时会自动下载 —— 全 NAT 环境可出网，首次会慢一些。
+
+  - name: provides
+    title: 谁提供这个命令
+    run:
+      - { when: cmd, value: dnf }
+      - { when: cmd, value: "-q" }
+      - { when: cmd, value: provides }
+      - { when: cmd, value: "*/{{ cmd }}" }
+    parser: lines
+    optional: true
+    timeout: 120
+    note: >
+      "*/<命令>" 是 dnf provides 的写法（按文件名匹配，不限定路径）。
+      结果里 `Repo : @System` 表示本机已装，否则给出可安装的仓库。
+
+  - name: tools
+    title: 常用诊断工具是否已装
+    run: ["rpm", "-q", "bind-utils", "traceroute", "mtr", "net-tools", "sysstat", "iproute", "curl", "wget"]
+    parser: lines
+    optional: true
+    ok_exit_codes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    note: >
+      一次性问清"排障常用工具装了没"，输出形如 `package xx is not installed`。
+      ★ 实测：**rpm -q 的退出码 = 没查到的包个数**（本机缺 3 个 → rc=3）。
+      既然这是正常报告，就把 0~9 都声明为可接受；缺了哪些由输出行自己说清。
+      （T2 全量真跑时这里报过 STEP_FAILED: 非零退出码 3 —— 就是踩了这个。）
+
+verify:
+  - name: 必须给出搜索结果
+    from: search
+    on_missing: dnf search 没有任何输出 —— 仓库元数据不可用（离线或未配置仓库）
+  - name: 必须能回答"谁提供这个命令"
+    from: provides
+    severity: warn
+    on_missing: 未查到提供该命令的包（命令名拼写？或需要先 dnf makecache）
+
+conclusion: |
+  【{host.name}】包搜索
+  按关键字「{keyword}」搜索（dnf search）：
+  {search}
+  哪个包提供命令「{cmd}」（dnf provides */{cmd}）：
+  {provides}
+  常用诊断工具安装情况：
+  {tools}
+
+  判读：
+  · 搜索结果显示（无）或报错 → 仓库元数据不可用：先 `dnf makecache`（或检查网络与仓库配置）；
+  · 「谁提供」里 `Repo : @System` = 本机已装；给出仓库名 = 可安装；
+  · 安装命令示例（**属变更动作，T3 才在界面上做**）：`dnf install -y <包名>`；
+  · 常见对应关系：dig/nslookup → bind-utils ｜ traceroute → traceroute ｜ mtr → mtr ｜
+    ifconfig/netstat → net-tools ｜ mpstat/sar/iostat → sysstat（本机已装）；
+  · 本动作只读：不会安装任何包，也不会修改仓库配置。

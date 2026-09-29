@@ -1,0 +1,76 @@
+# ============================================================
+# 动作：等虚拟机的 guest 起来（就绪探针）
+# 来源：设计\05-虚拟化层-架构设计.md §3（编排链）· 规范 §12.117
+# 形态：轮询直到 VMware Tools 报出 guest 的地址；超时判**红**
+# 风险：green（只读轮询）｜ 执行通道：local（规范 §12.115）
+# ============================================================
+
+id: vm.wait-guest
+title: 等虚拟机就绪（guest 起来）
+summary: 等到 guest 真的起来了再往下走 —— ★ 它是"起来了"的判据，不是"能 ssh 进去"的判据
+domain: M
+risk: green
+priority: P0
+channel: local
+tags: [只读, 虚拟化, 就绪, 编排]
+note: |
+  ★★ **这是本话题最值钱的一步**（规范 §12.117）：
+    `vmrun start` 返回 0 只说明 **VMware 收下了这个请求**；
+    真正"**起来了**"要等 guest 里的 VMware Tools 报出地址。
+    ⇒ 这一步**超时就是红**（退出码 3 不在 ok_exit_codes 里），**不许**"跑了就算成功"。
+  ★★ 但它**不证明 ssh 通** —— 「能 ssh 进去」是另一件事，归 ssh 那一步
+    （编排链里紧随其后的「一键体检」会在 ssh 不通时红）。**不许把两个判据合成一句"开机成功"**。
+  ★ 对**已经在跑**的 VM 也一样成立（立刻返回）：所以它可以安全地放在"开机"之后做幂等复核。
+
+params:
+  - name: vm
+    label: 虚拟机
+    type: str
+    required: true
+    default: node-03
+    placeholder: node-03 或 vm-docker-01.vmx
+    help: 可填 hosts.yaml 里的主机 id（推荐）或 vmx 的文件名
+
+  - name: timeout_sec
+    label: 最多等多少秒
+    type: int
+    required: true
+    default: 180
+    min: 10
+    max: 900
+    help: 超过这个时间 guest 仍未就绪 ⇒ **判红**（如实说"等不到"，不给"大概好了"）
+
+steps:
+  - name: ready
+    title: 等 guest 就绪（轮询 + 超时判红）
+    run: ["{{ vm_probe_py }}", "{{ vm_probe_script }}", "--mode", "expect",
+          "--vmx", "{{ vm_vmx }}", "--expect", "guest-ready", "--wait", "{{ timeout_sec }}"]
+    parser: json
+    timeout: 960
+    ok_exit_codes: [0]
+    note: |
+      ★ 退出码就是结论：**0 = 就绪** · **3 = 等到超时也没就绪** · **2 = 读不到**（vmrun 不在等）。
+      ★ 3 不在 ok_exit_codes 里 ⇒ 这一步**判失败** ⇒ 整个任务红。这就是"不许说假话"的落点：
+        等不到就说等不到，而不是"命令返回 0（因为它只是没报错）"。
+
+verify:
+  - name: 必须拿到就绪状态
+    from: ready
+    field: state
+    on_missing: 探针没有给出就绪状态
+  - name: 必须拿到 guest 报的地址（就绪的正面证据）
+    from: ready
+    field: ip
+    on_missing: 没有地址 —— 那就不是"已就绪"，别往下走
+
+conclusion: |
+  【{vm_name}】guest 就绪：**{ready.state}**
+  · guest 报出的地址：{ready.ip}
+  · 等了几秒：{ready.waited_sec}
+  · 判据来源：{ready.checked}
+
+  判读：
+  · 这一步只回答「**它起来了吗**」；★ **不回答「能不能 ssh 进去」**（那是下一步的事，规范 §12.117）；
+  · 如果这里红了：先看 `vm.status` 确认 VMware 那边认为它在跑；
+    VMware 说在跑而 guest 迟迟不报地址 ⇒ 可能是 guest 启动慢、卡在引导、或 Tools 没装。
+  · ★ 「等不到」是一条**结论**，不是"大概好了"。

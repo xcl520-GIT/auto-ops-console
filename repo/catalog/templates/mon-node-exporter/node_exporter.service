@@ -1,0 +1,17 @@
+[Unit]
+Description=AOC Monitoring · node_exporter
+Documentation=https://github.com/prometheus/node_exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aocmon
+Group=aocmon
+ExecStart=/opt/aoc-monitoring/node_exporter/node_exporter --web.listen-address={{ ne_ip }}:{{ ne_port }} --collector.textfile.directory=/opt/aoc-monitoring/_target
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

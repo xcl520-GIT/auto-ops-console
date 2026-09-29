@@ -1,0 +1,17 @@
+[Unit]
+Description=AOC Monitoring · Alertmanager
+Documentation=https://prometheus.io/docs/alerting/latest/alertmanager/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aocmon
+Group=aocmon
+ExecStart=/opt/aoc-monitoring/alertmanager/alertmanager --config.file=/opt/aoc-monitoring/etc/alertmanager.yml --storage.path=/opt/aoc-monitoring/data/alertmanager --web.listen-address={{ am_listen }}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
